@@ -44,11 +44,27 @@
 | CPU hardening | `arch/x86_64/cpu.c` | done |
 | Page-table inspection | `arch/x86_64/paging.c` | query and unmap only |
 | Physical memory | `core/pmm.c` | bitmap allocator |
-| Capabilities | `core/cap.c` | flat cspace; no revocation tree yet |
-| Virtual memory, address spaces | | next |
-| Threads, scheduler | | planned |
-| Syscalls, IPC | | planned |
-| APIC, timers, IRQ delivery | | planned |
+| Capabilities | `core/cap.c` | flat cspace; derivation tree and revocation next |
+| Untyped memory, retype | | next ([ADR 0003](adr/0003-kernel-object-model.md)) |
+| Address spaces, page tables | | planned (ADR 0003) |
+| Threads, scheduler, faults | | planned (ADR 0003) |
+| Syscalls, IPC, notifications | | planned (ADR 0003) |
+| Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
+| SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
+| IOMMU, DMA domains | | planned ([ADR 0001](adr/0001-microkernel.md)) |
+
+## Design records
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](adr/0001-microkernel.md) | Microkernel; DMA ownership through the IOMMU | accepted |
+| [0002](adr/0002-capabilities.md) | Capabilities, no ambient authority | accepted |
+| [0003](adr/0003-kernel-object-model.md) | Kernel object model: capabilities, memory, address spaces, IPC and threads designed together | proposed |
+| [0004](adr/0004-entropy.md) | Entropy pool and ChaCha20 random generator | proposed |
+| [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | proposed |
+
+Security invariants and the tests that prove them are listed in
+[SECURITY.md](SECURITY.md#security-invariants).
 
 ## Conventions
 

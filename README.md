@@ -21,7 +21,8 @@ commit:
 Status: early. The kernel boots, enables CPU hardening, manages physical
 memory and has the capability core. There is no user space yet. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the roadmap and
-[docs/SECURITY.md](docs/SECURITY.md) for the threat model.
+[docs/SECURITY.md](docs/SECURITY.md) for the threat model and the security
+invariants, each with the test that proves it.
 
 ## Building
 

@@ -32,6 +32,8 @@ All authority in Tarka is expressed as capabilities:
 
 ## Not yet implemented
 
+Designed in [ADR 0003](0003-kernel-object-model.md):
+
 - **Derivation tree and revocation.** Revoking a capability must also
   revoke everything derived from it.
 - **Object lifetime.** When the last capability to an object is deleted the
