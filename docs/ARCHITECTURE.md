@@ -31,6 +31,8 @@
    - unmaps the stack guard pages
    - seeds the stack canary from RDRAND
    - initialises the physical frame allocator
+   - hands all usable memory except an 8 MiB kernel reserve to root
+     Untyped capabilities
 4. In `make test` builds, the self-tests then run and the result is reported
    to QEMU through the isa-debug-exit device.
 
@@ -45,8 +47,8 @@
 | Page-table inspection | `arch/x86_64/paging.c` | query and unmap only |
 | Physical memory | `core/pmm.c` | bitmap allocator |
 | Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
-| Untyped memory, retype | | next ([ADR 0003](adr/0003-kernel-object-model.md)) |
-| Address spaces, page tables | | planned (ADR 0003) |
+| Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
+| Address spaces, page tables | | next (ADR 0003) |
 | Threads, scheduler, faults | | planned (ADR 0003) |
 | Syscalls, IPC, notifications | | planned (ADR 0003) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
@@ -62,6 +64,7 @@
 | [0003](adr/0003-kernel-object-model.md) | Kernel object model: capabilities, memory, address spaces, IPC and threads designed together | accepted |
 | [0004](adr/0004-entropy.md) | Entropy pool and ChaCha20 random generator | accepted |
 | [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | accepted |
+| [0006](adr/0006-untyped-retype.md) | Untyped memory, retype, lifetime and reclamation (precise rules O1–O11) | accepted |
 
 Security invariants and the tests that prove them are listed in
 [SECURITY.md](SECURITY.md#security-invariants).

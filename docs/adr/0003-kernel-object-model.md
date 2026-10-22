@@ -205,8 +205,9 @@ before its subsystem is considered done.
 
 ## Implementation order
 
-1. CDT plus `revoke` in the existing flat cspace (testable now).
+1. CDT plus `revoke` in the existing flat cspace. **Done.**
 2. Untyped and `retype`; boot hands all usable memory out as Untyped.
+   **Done**, specified in detail by [ADR 0006](0006-untyped-retype.md).
 3. Page-table management for the kernel half; AddressSpace, PageTable and
    Frame objects; `map` / `unmap`.
 4. Thread objects, context switch, user-mode entry, syscall entry,

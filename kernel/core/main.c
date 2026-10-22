@@ -1,6 +1,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/selftest.h>
+#include <tarka/untyped.h>
 
 #include <limine.h>
 
@@ -70,6 +71,7 @@ __noreturn __no_canary void kmain(void)
     stack_guards_init();
     stack_protector_init(boot_entropy());
     pmm_init(memmap_req.response);
+    untyped_boot();
 
 #ifdef TARKA_SELFTEST
     selftest_run();

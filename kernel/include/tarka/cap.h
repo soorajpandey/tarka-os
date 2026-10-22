@@ -46,7 +46,10 @@ struct cap {
     uint32_t     type;     /* enum cap_type */
     cap_rights_t rights;
     uint64_t     object;   /* kernel object reference (type-specific) */
-    uint64_t     badge;    /* caller-visible tag, set once at derivation */
+    union {
+        uint64_t badge;        /* caller-visible tag, set once at derivation */
+        uint64_t ut_watermark; /* CAP_UNTYPED: bytes handed out (ADR 0006) */
+    };
     struct cap  *prev;     /* CDT pre-order links */
     struct cap  *next;
     uint32_t     depth;    /* CDT depth; children are parent depth + 1 */
@@ -64,6 +67,28 @@ struct cap_info {
 };
 
 _Static_assert(sizeof(struct cap_info) == 16, "struct cap_info must have no padding");
+
+/*
+ * Retyped objects and Untypeds encode their physical range in `object` as
+ * `paddr | size_bits`: every such object is at least 64 bytes and
+ * naturally aligned, so the low 6 bits are free.
+ */
+#define CAP_OBJ_BITS_MASK 0x3Full
+
+static inline uint64_t cap_obj_encode(paddr_t paddr, unsigned bits)
+{
+    return paddr | bits;
+}
+
+static inline paddr_t cap_obj_paddr(const struct cap *c)
+{
+    return c->object & ~CAP_OBJ_BITS_MASK;
+}
+
+static inline unsigned cap_obj_bits(const struct cap *c)
+{
+    return (unsigned)(c->object & CAP_OBJ_BITS_MASK);
+}
 
 struct cspace {
     struct cap *slots;
@@ -84,8 +109,8 @@ void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn);
 void cspace_init(struct cspace *cs, struct cap *storage, uint32_t nslots);
 
 /* Delete every capability in `cs` so that no CDT link points into its
- * storage. Must be called before the storage is freed or goes out of
- * scope. */
+ * storage. Untypeds are revoked first (ADR 0006, O8). Must be called
+ * before the storage is freed or goes out of scope. */
 void cspace_destroy(struct cspace *cs);
 
 /* Install a new root capability. Only the kernel calls this while
@@ -106,7 +131,8 @@ __must_check int cap_identify(const struct cspace *cs, cap_slot_t slot, struct c
 /* Derive a copy of `src` into the empty slot `dst`, possibly in another
  * cspace, with rights narrowed to `src.rights & mask`. Rights can never be
  * widened. Requires CAP_R_GRANT on the source. A non-zero badge may only be
- * set on an unbadged source. The copy becomes a CDT child of the source. */
+ * set on an unbadged source. The copy becomes a CDT child of the source.
+ * Untyped capabilities cannot be copied (ADR 0006, O2): T_EINVAL. */
 __must_check int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
                                struct cspace *dst_cs, cap_slot_t dst,
                                cap_rights_t mask, uint64_t badge);
@@ -118,7 +144,8 @@ static inline __must_check int cap_derive(struct cspace *cs, cap_slot_t src, cap
 }
 
 /* Delete one capability. Its CDT children move up to its parent. If it was
- * the last capability to its object, the type's finaliser runs. */
+ * the last capability to its object, the type's finaliser runs. An Untyped
+ * that still has children cannot be deleted (ADR 0006, O8): T_EBUSY. */
 __must_check int cap_delete(struct cspace *cs, cap_slot_t slot);
 
 /* Delete every capability derived from `slot` (in any cspace), keeping

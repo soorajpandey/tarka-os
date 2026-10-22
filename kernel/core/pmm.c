@@ -134,5 +134,52 @@ int pmm_free(paddr_t frame)
     return T_OK;
 }
 
+/* True if frames [f, f + n) are all managed and free. */
+static bool range_free(uint64_t f, uint64_t n)
+{
+    if (f + n > nframes)
+        return false;
+    for (uint64_t i = f; i < f + n;) {
+        /* Whole 64-frame words at a time where possible. */
+        if (i % 64 == 0 && f + n - i >= 64) {
+            if (used[i / 64] != 0 || managed[i / 64] != ~0ull)
+                return false;
+            i += 64;
+            continue;
+        }
+        if (test_bit(used, i) || !test_bit(managed, i))
+            return false;
+        i++;
+    }
+    return true;
+}
+
+bool pmm_take_block(unsigned max_bits, uint64_t keep, paddr_t *base, unsigned *bits)
+{
+    for (unsigned b = max_bits; b >= 12; b--) {
+        uint64_t n = 1ull << (b - 12);
+
+        if (free_frames < keep || free_frames - keep < n)
+            continue;
+        for (uint64_t f = 0; f + n <= nframes; f += n) {
+            if (!range_free(f, n))
+                continue;
+            for (uint64_t i = f; i < f + n; i++)
+                set_bit(used, i);
+            free_frames -= n;
+            *base = f * PAGE_SIZE;
+            *bits = b;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool pmm_frame_is_free(paddr_t frame)
+{
+    uint64_t f = frame / PAGE_SIZE;
+    return f < nframes && test_bit(managed, f) && !test_bit(used, f);
+}
+
 uint64_t pmm_free_count(void) { return free_frames; }
 uint64_t pmm_total_count(void) { return total_frames; }

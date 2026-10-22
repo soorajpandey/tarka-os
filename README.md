@@ -18,8 +18,10 @@ commit:
   canaries, SMEP/SMAP/UMIP, zeroed memory on allocation and free, all
   verified by boot-time self-tests in CI.
 
-Status: early. The kernel boots, enables CPU hardening, manages physical
-memory and has the capability core. There is no user space yet. See
+Status: early. The kernel boots, enables CPU hardening, hands all memory
+out as Untyped capabilities, and creates kernel objects only by retyping
+memory the caller holds. Capabilities form a derivation tree with
+revocation. There is no user space yet. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the roadmap and
 [docs/SECURITY.md](docs/SECURITY.md) for the threat model and the security
 invariants, each with the test that proves it.

@@ -68,7 +68,8 @@ channels beyond the standard Spectre/Meltdown mitigations.
 
 ## Security invariants
 
-Each invariant is a statement that must always hold. Each one is proven by
+Each invariant is a statement that must always hold. The O-series are
+defined precisely in [ADR 0006](adr/0006-untyped-retype.md). Each one is proven by
 a self-test that runs in CI (`make test`), or is marked as planned until
 the code it depends on exists. Adding a subsystem means adding its
 invariants and tests here.
@@ -93,6 +94,17 @@ invariants and tests here.
 | U2 | A task cannot map kernel memory or another task's memory without a frame capability | | planned (ADR 0003) |
 | U3 | No user mapping is both writable and executable | | planned (ADR 0003) |
 | U4 | A user-space fault never panics the kernel | | planned (ADR 0003) |
+| O1 | Every physical frame has exactly one owner: the kernel allocator or one Untyped; total memory is conserved | self-test `untyped_ownership` | ✅ tested |
+| O2 | Memory authority is never duplicated: Untypeds cannot be copied | self-test `untyped_rules` | ✅ tested |
+| O3 | Retype never creates authority from nothing: it needs an Untyped with WRITE and free space in it | self-test `untyped_rules`, `untyped_exhaustion` | ✅ tested |
+| O4 | A failed retype changes nothing: no capability, no watermark movement | self-test `untyped_rules` | ✅ tested |
+| O5 | Objects created from one Untyped never overlap, are aligned to their size, and lie inside it | self-test `untyped_overlap` (randomised, nested) | ✅ tested |
+| O6 | Every object is zeroed when created | self-test `untyped_exhaustion` | ✅ tested |
+| O7 | Memory is reusable exactly when its Untyped has no children | self-test `untyped_exhaustion` | ✅ tested |
+| O8 | An Untyped with children cannot be deleted | self-test `untyped_exhaustion` | ✅ tested |
+| O9 | Revoking an Untyped destroys everything created from it, however nested, in any cspace | self-test `untyped_revoke` | ✅ tested |
+| O10 | Only capabilities keep objects alive; finalisers remove every internal reference before memory can be reused | self-test `untyped_revoke` (CNode contents) | ⚠️ CNode tested; applies to each new object type |
+| O11 | Revocation stays correct when finalisers delete other capabilities | self-test `untyped_revoke` | ✅ tested |
 | D1 | A device cannot DMA outside its assigned IOMMU domain | | planned (ADR 0001) |
 | R1 | Cryptographic randomness is never returned before the generator is seeded | | planned (ADR 0004) |
 | S1 | No physical frame is reused while any CPU may still cache a translation to it | | planned (ADR 0005) |
@@ -112,6 +124,7 @@ invariants and tests here.
 | Separate IST stacks for #DF and NMI | `gdt.c` | K4 |
 | Stack canaries, random per boot, low byte zero | `core/stack_protector.c` | K5 |
 | Zero on allocation and on free | `core/pmm.c` | M1 |
+| Untyped memory and retype; no kernel allocation on a task's behalf | `core/untyped.c` | O1–O11 |
 | Double-free and foreign-frame rejection | `pmm.c` | M2 |
 | Zero-initialised automatic variables | `-ftrivial-auto-var-init=zero` | M1 |
 | No I/O port access from ring 3 by default | TSS I/O bitmap | |
@@ -132,8 +145,8 @@ invariants and tests here.
 
 ## Roadmap
 
-1. **Kernel object model** (ADR 0003): untyped memory, address spaces,
-   threads, IPC (the derivation tree and revocation are done). Invariants
+1. **Kernel object model** (ADR 0003): address spaces, threads, IPC (the
+   derivation tree, revocation, Untyped and retype are done). Invariants
    C6, U1–U4.
 2. **Entropy** (ADR 0004). Invariant R1.
 3. **SMP** (ADR 0005). Invariant S1.

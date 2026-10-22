@@ -1,10 +1,16 @@
 #include <tarka/cap.h>
 
+#include "cap_internal.h"
+
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/string.h>
 
 static cap_finaliser_t finalisers[CAP_TYPE_COUNT];
+
+/* Incremented on every slot deletion. Lets revocation notice that a
+ * finaliser deleted further capabilities behind its back (ADR 0006, O11). */
+static uint64_t cdt_generation;
 
 void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn)
 {
@@ -19,7 +25,7 @@ void cspace_init(struct cspace *cs, struct cap *storage, uint32_t nslots)
     cs->nslots = nslots;
 }
 
-static struct cap *slot_ptr(const struct cspace *cs, cap_slot_t slot)
+struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot)
 {
     /* Slot indices will arrive straight from user registers: bounds-check
      * before every access. */
@@ -56,8 +62,12 @@ static void cdt_remove(struct cap *c)
         c->next->prev = c->prev;
 }
 
-/* Insert `child` directly after `parent`, as its first child. */
-static void cdt_insert_child(struct cap *parent, struct cap *child)
+bool cap_has_children(const struct cap *c)
+{
+    return c->next && c->next->depth > c->depth;
+}
+
+void cap_insert_child(struct cap *parent, struct cap *child)
 {
     child->depth = parent->depth + 1;
     child->prev = parent;
@@ -74,6 +84,7 @@ static void destroy_slot(struct cap *c)
     uint64_t object = c->object;
 
     cdt_remove(c);
+    cdt_generation++;
     /* Clear the slot before the finaliser runs so nothing can observe or
      * reuse a half-deleted capability. */
     memset(c, 0, sizeof(*c));
@@ -82,11 +93,52 @@ static void destroy_slot(struct cap *c)
         finalisers[type](type, object);
 }
 
+static struct cap *subtree_last(struct cap *c)
+{
+    struct cap *last = c;
+
+    for (struct cap *n = c->next; n && n->depth > c->depth; n = n->next)
+        last = n;
+    return last;
+}
+
+static int revoke(struct cap *c, uint32_t budget)
+{
+    struct cap *last = subtree_last(c);
+
+    /* Delete from the end of the subtree backwards. In pre-order every
+     * node's descendants follow it, so each node is a leaf by the time it
+     * is reached: nothing needs re-parenting, and stopping part-way leaves
+     * a valid tree that the next call continues from. */
+    for (uint32_t done = 0; last != c; done++) {
+        if (budget && done == budget)
+            return T_EAGAIN;
+
+        struct cap *prev = last->prev;
+        uint64_t gen = cdt_generation;
+
+        destroy_slot(last);
+
+        /* A finaliser (e.g. a CNode's) may have deleted more slots,
+         * possibly including `prev` or even `c`. The memory is still not
+         * reusable (no retype can run meanwhile), but the saved pointer
+         * may now name an empty slot: re-find the end of the subtree. */
+        if (c->type == CAP_NULL)
+            return T_OK;
+        last = cdt_generation == gen + 1 ? prev : subtree_last(c);
+    }
+    return T_OK;
+}
+
 void cspace_destroy(struct cspace *cs)
 {
     for (uint32_t i = 0; i < cs->nslots; i++) {
-        if (cs->slots[i].type != CAP_NULL)
-            destroy_slot(&cs->slots[i]);
+        struct cap *c = &cs->slots[i];
+
+        if (c->type == CAP_UNTYPED)
+            (void)revoke(c, 0);
+        if (c->type != CAP_NULL)
+            destroy_slot(c);
     }
     cs->slots = NULL;
     cs->nslots = 0;
@@ -95,7 +147,7 @@ void cspace_destroy(struct cspace *cs)
 int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
                 cap_rights_t rights, uint64_t object)
 {
-    struct cap *c = slot_ptr(cs, slot);
+    struct cap *c = cap_slot(cs, slot);
 
     if (!c)
         return T_ERANGE;
@@ -114,7 +166,7 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
 int cap_lookup(const struct cspace *cs, cap_slot_t slot, enum cap_type type,
                cap_rights_t need, const struct cap **out)
 {
-    const struct cap *c = slot_ptr(cs, slot);
+    const struct cap *c = cap_slot(cs, slot);
 
     if (!c)
         return T_ERANGE;
@@ -129,7 +181,7 @@ int cap_lookup(const struct cspace *cs, cap_slot_t slot, enum cap_type type,
 
 int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
 {
-    const struct cap *c = slot_ptr(cs, slot);
+    const struct cap *c = cap_slot(cs, slot);
 
     if (!c)
         return T_ERANGE;
@@ -139,7 +191,7 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
     memset(out, 0, sizeof(*out));
     out->type = c->type;
     out->rights = c->rights;
-    out->badge = c->badge;
+    out->badge = c->type == CAP_UNTYPED ? 0 : c->badge;
     return T_OK;
 }
 
@@ -147,13 +199,15 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
                   struct cspace *dst_cs, cap_slot_t dst,
                   cap_rights_t mask, uint64_t badge)
 {
-    struct cap *s = slot_ptr(src_cs, src);
-    struct cap *d = slot_ptr(dst_cs, dst);
+    struct cap *s = cap_slot(src_cs, src);
+    struct cap *d = cap_slot(dst_cs, dst);
 
     if (!s || !d)
         return T_ERANGE;
     if (s->type == CAP_NULL)
         return T_EBADCAP;
+    if (s->type == CAP_UNTYPED)
+        return T_EINVAL; /* memory authority is never duplicated */
     if (!(s->rights & CAP_R_GRANT))
         return T_EPERM;
     if (d->type != CAP_NULL)
@@ -168,18 +222,20 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
     d->object = s->object;
     d->rights = s->rights & mask; /* monotonic: rights only ever shrink */
     d->badge = badge ? badge : s->badge;
-    cdt_insert_child(s, d);
+    cap_insert_child(s, d);
     return T_OK;
 }
 
 int cap_delete(struct cspace *cs, cap_slot_t slot)
 {
-    struct cap *c = slot_ptr(cs, slot);
+    struct cap *c = cap_slot(cs, slot);
 
     if (!c)
         return T_ERANGE;
     if (c->type == CAP_NULL)
         return T_EBADCAP;
+    if (c->type == CAP_UNTYPED && cap_has_children(c))
+        return T_EBUSY;
 
     destroy_slot(c);
     return T_OK;
@@ -187,27 +243,12 @@ int cap_delete(struct cspace *cs, cap_slot_t slot)
 
 int cap_revoke(struct cspace *cs, cap_slot_t slot, uint32_t budget)
 {
-    struct cap *c = slot_ptr(cs, slot);
-    struct cap *last = c;
+    struct cap *c = cap_slot(cs, slot);
 
     if (!c)
         return T_ERANGE;
     if (c->type == CAP_NULL)
         return T_EBADCAP;
 
-    for (struct cap *n = c->next; n && n->depth > c->depth; n = n->next)
-        last = n;
-
-    /* Delete from the end of the subtree backwards. In pre-order every
-     * node's descendants follow it, so each node is a leaf by the time it
-     * is reached: nothing needs re-parenting, and stopping part-way leaves
-     * a valid tree that the next call continues from. */
-    for (uint32_t done = 0; last != c; done++) {
-        if (budget && done == budget)
-            return T_EAGAIN;
-        struct cap *prev = last->prev;
-        destroy_slot(last);
-        last = prev;
-    }
-    return T_OK;
+    return revoke(c, budget);
 }
