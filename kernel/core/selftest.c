@@ -154,6 +154,142 @@ static void test_caps(void)
     CHECK(cap_delete(&cs, 1) == T_OK);
     CHECK(cap_delete(&cs, 1) == T_EBADCAP);
     CHECK(cap_lookup(&cs, 1, CAP_FRAME, 0, &c) == T_EBADCAP);
+
+    /* cap_identify exposes type, rights and badge only. */
+    struct cap_info info;
+    memset(&info, 0xEE, sizeof(info));
+    CHECK(cap_identify(&cs, 3, &info) == T_OK);
+    CHECK(info.type == CAP_FRAME && info.rights == (CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT) &&
+          info.badge == 0xB1);
+    CHECK(cap_identify(&cs, 1, &info) == T_EBADCAP);
+
+    cspace_destroy(&cs);
+}
+
+/* Structural check of every CDT link reachable from a cspace: links are
+ * symmetric, depth grows by at most one per step, and empty slots are fully
+ * zeroed (no stale links or data). */
+static bool cdt_consistent(const struct cspace *cs)
+{
+    static const struct cap zero;
+
+    for (uint32_t i = 0; i < cs->nslots; i++) {
+        const struct cap *c = &cs->slots[i];
+        if (c->type == CAP_NULL) {
+            if (memcmp(c, &zero, sizeof(zero)) != 0)
+                return false;
+            continue;
+        }
+        if (c->reserved != 0)
+            return false;
+        if (c->prev && c->prev->next != c)
+            return false;
+        if (c->next && (c->next->prev != c || c->next->depth > c->depth + 1))
+            return false;
+        if (!c->prev && c->depth != 0)
+            return false;
+    }
+    return true;
+}
+
+static bool links_within(const struct cspace *cs, const struct cap *lo, const struct cap *hi)
+{
+    for (uint32_t i = 0; i < cs->nslots; i++) {
+        const struct cap *c = &cs->slots[i];
+        if (c->prev && (c->prev < lo || c->prev >= hi))
+            return false;
+        if (c->next && (c->next < lo || c->next >= hi))
+            return false;
+    }
+    return true;
+}
+
+static unsigned finalised;
+static uint64_t finalised_object;
+
+static void count_finaliser(enum cap_type type, uint64_t object)
+{
+    (void)type;
+    finalised++;
+    finalised_object = object;
+}
+
+static struct cap cdt_store_a[8], cdt_store_b[8];
+
+static void test_cap_revoke(void)
+{
+    struct cspace a, b;
+    const struct cap *c;
+
+    cspace_init(&a, cdt_store_a, ARRAY_SIZE(cdt_store_a));
+    cspace_init(&b, cdt_store_b, ARRAY_SIZE(cdt_store_b));
+    finalised = 0;
+    cap_set_finaliser(CAP_ENDPOINT, count_finaliser);
+
+    /* root(a0) ─┬─ a3
+     *           └─ a1 ─┬─ b0   (delegated into another cspace)
+     *                  └─ a2                                      */
+    CHECK(cap_install(&a, 0, CAP_ENDPOINT, CAP_R_ALL, 0xE1) == T_OK);
+    CHECK(cap_derive(&a, 0, 1, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive(&a, 1, 2, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive_to(&a, 1, &b, 0, CAP_R_READ | CAP_R_GRANT, 0x77) == T_OK);
+    CHECK(cap_derive(&a, 0, 3, CAP_R_READ, 0) == T_OK);
+    CHECK(cdt_consistent(&a) && cdt_consistent(&b));
+    CHECK(cdt_store_a[1].depth == 1 && cdt_store_a[2].depth == 2 && cdt_store_b[0].depth == 2);
+
+    /* Revoking a1 removes its descendants in both cspaces, keeps a1, and
+     * frees nothing because the object is still referenced. */
+    CHECK(cap_revoke(&a, 1, 0) == T_OK);
+    CHECK(cap_lookup(&a, 2, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&b, 0, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 1, CAP_ENDPOINT, CAP_R_ALL, &c) == T_OK);
+    CHECK(cap_lookup(&a, 3, CAP_ENDPOINT, CAP_R_READ, &c) == T_OK);
+    CHECK(finalised == 0);
+    CHECK(cdt_consistent(&a) && cdt_consistent(&b));
+
+    /* Deleting a parent re-parents its children rather than orphaning
+     * them: a later revoke of the grandparent still reaches them. */
+    CHECK(cap_derive(&a, 1, 4, CAP_R_ALL, 0) == T_OK);   /* a0 > a1 > a4 */
+    CHECK(cap_delete(&a, 1) == T_OK);                     /* a0 > a4 */
+    CHECK(cdt_store_a[4].depth == 1);
+    CHECK(cap_revoke(&a, 0, 0) == T_OK);
+    CHECK(cap_lookup(&a, 4, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 3, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(finalised == 0);
+
+    /* Deleting the last capability runs the finaliser exactly once. */
+    CHECK(cap_delete(&a, 0) == T_OK);
+    CHECK(finalised == 1 && finalised_object == 0xE1);
+
+    /* Revocation is resumable: with a budget it makes bounded progress. */
+    CHECK(cap_install(&a, 0, CAP_ENDPOINT, CAP_R_ALL, 0xE2) == T_OK);
+    for (cap_slot_t i = 1; i < 8; i++)
+        CHECK(cap_derive(&a, i - 1, i, CAP_R_ALL, 0) == T_OK);  /* chain of 7 */
+    CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
+    CHECK(cap_lookup(&a, 4, CAP_ENDPOINT, 0, &c) == T_OK);
+    CHECK(cap_lookup(&a, 5, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cdt_consistent(&a));
+    CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
+    CHECK(cap_revoke(&a, 0, 3) == T_OK);
+    CHECK(cap_lookup(&a, 1, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 0, CAP_ENDPOINT, 0, &c) == T_OK);
+    CHECK(finalised == 1);
+
+    /* Destroying a cspace must leave no CDT link pointing into it. */
+    CHECK(cap_derive_to(&a, 0, &b, 1, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive_to(&b, 1, &a, 1, CAP_R_ALL, 0) == T_OK);  /* a0 > b1 > a1 */
+    cspace_destroy(&b);
+    CHECK(links_within(&a, cdt_store_a, cdt_store_a + ARRAY_SIZE(cdt_store_a)));
+    CHECK(cdt_store_a[1].depth == 1 && cdt_store_a[1].prev == &cdt_store_a[0]);
+    CHECK(cdt_consistent(&a));
+    CHECK(finalised == 1);
+
+    cspace_destroy(&a);
+    CHECK(finalised == 2 && finalised_object == 0xE2);
+    for (size_t i = 0; i < ARRAY_SIZE(cdt_store_a); i++)
+        CHECK(cdt_store_a[i].type == CAP_NULL && cdt_store_b[i].type == CAP_NULL);
+
+    cap_set_finaliser(CAP_ENDPOINT, NULL);
 }
 
 extern const char __text_start[], __text_end[];
@@ -230,6 +366,7 @@ static const struct {
     { "overflow_helpers", test_overflow_helpers },
     { "pmm", test_pmm },
     { "capabilities", test_caps },
+    { "cap_revoke", test_cap_revoke },
     { "w^x", test_wx },
     { "stack_guards", test_stack_guards },
     { "cpu_hardening", test_cpu_hardening },

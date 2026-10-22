@@ -44,7 +44,7 @@
 | CPU hardening | `arch/x86_64/cpu.c` | done |
 | Page-table inspection | `arch/x86_64/paging.c` | query and unmap only |
 | Physical memory | `core/pmm.c` | bitmap allocator |
-| Capabilities | `core/cap.c` | flat cspace; derivation tree and revocation next |
+| Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
 | Untyped memory, retype | | next ([ADR 0003](adr/0003-kernel-object-model.md)) |
 | Address spaces, page tables | | planned (ADR 0003) |
 | Threads, scheduler, faults | | planned (ADR 0003) |
@@ -59,9 +59,9 @@
 |---|---|---|
 | [0001](adr/0001-microkernel.md) | Microkernel; DMA ownership through the IOMMU | accepted |
 | [0002](adr/0002-capabilities.md) | Capabilities, no ambient authority | accepted |
-| [0003](adr/0003-kernel-object-model.md) | Kernel object model: capabilities, memory, address spaces, IPC and threads designed together | proposed |
-| [0004](adr/0004-entropy.md) | Entropy pool and ChaCha20 random generator | proposed |
-| [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | proposed |
+| [0003](adr/0003-kernel-object-model.md) | Kernel object model: capabilities, memory, address spaces, IPC and threads designed together | accepted |
+| [0004](adr/0004-entropy.md) | Entropy pool and ChaCha20 random generator | accepted |
+| [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | accepted |
 
 Security invariants and the tests that prove them are listed in
 [SECURITY.md](SECURITY.md#security-invariants).

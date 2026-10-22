@@ -1,6 +1,6 @@
 # ADR 0004: Kernel entropy and random number generation
 
-Status: proposed
+Status: accepted
 
 ## Context
 

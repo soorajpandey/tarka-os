@@ -1,6 +1,6 @@
 # ADR 0003: Kernel object model (capabilities, memory, address spaces, IPC, threads)
 
-Status: proposed. Implementation starts once this is accepted.
+Status: accepted
 
 ## Context
 

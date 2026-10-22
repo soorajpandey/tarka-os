@@ -12,6 +12,7 @@ enum {
     T_ERANGE     = -5,  /* index or address out of range */
     T_EBUSY      = -6,  /* destination slot occupied */
     T_EDOUBLEFREE = -7, /* object already free */
+    T_EAGAIN     = -8,  /* partial progress; call again to continue */
 };
 
 #endif

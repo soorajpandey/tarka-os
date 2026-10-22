@@ -85,9 +85,10 @@ invariants and tests here.
 | C1 | Rights can never increase through derivation | self-test `capabilities` | ✅ tested |
 | C2 | Every capability use is checked for bounds, type and rights | self-test `capabilities` | ✅ unit; syscall path planned |
 | C3 | A badge cannot change once set | self-test `capabilities` | ✅ tested |
-| C4 | Capability records contain no uninitialised bytes | `_Static_assert` in `cap.h` | ✅ compile time |
-| C5 | Revoking a capability removes every capability derived from it | | planned (ADR 0003) |
-| C6 | Deleting the last capability to an object frees the object | | planned (ADR 0003) |
+| C4 | Capability data given to user space contains no kernel pointers and no uninitialised bytes | `struct cap_info` + `_Static_assert`; self-test `capabilities` (`cap_identify`) | ✅ tested |
+| C5 | Revoking a capability removes every capability derived from it, in every cspace, including after intermediate deletions | self-test `cap_revoke` | ✅ tested |
+| C6 | Deleting the last capability to an object finalises the object exactly once, and never earlier | self-test `cap_revoke` (finaliser hook) | ⚠️ hook tested; object types arrive with ADR 0003 steps 2–5 |
+| C7 | No derivation-tree link ever points to a deleted capability or a destroyed cspace | self-test `cap_revoke` (`cdt_consistent`, `links_within`) | ✅ tested |
 | U1 | A task cannot obtain a capability it was not explicitly given | | planned (ADR 0003) |
 | U2 | A task cannot map kernel memory or another task's memory without a frame capability | | planned (ADR 0003) |
 | U3 | No user mapping is both writable and executable | | planned (ADR 0003) |
@@ -131,9 +132,9 @@ invariants and tests here.
 
 ## Roadmap
 
-1. **Kernel object model** (ADR 0003): capability derivation tree and
-   revocation, untyped memory, address spaces, threads, IPC. Invariants
-   C5–C6, U1–U4.
+1. **Kernel object model** (ADR 0003): untyped memory, address spaces,
+   threads, IPC (the derivation tree and revocation are done). Invariants
+   C6, U1–U4.
 2. **Entropy** (ADR 0004). Invariant R1.
 3. **SMP** (ADR 0005). Invariant S1.
 4. **Fuzzing:** machine-readable syscall descriptions, coverage-guided
