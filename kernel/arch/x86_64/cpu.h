@@ -1,0 +1,93 @@
+#ifndef TARKA_X86_64_CPU_H
+#define TARKA_X86_64_CPU_H
+
+#include <tarka/types.h>
+
+#define CR0_WP   (1ull << 16)
+#define CR4_UMIP (1ull << 11)
+#define CR4_SMEP (1ull << 20)
+#define CR4_SMAP (1ull << 21)
+
+#define MSR_EFER  0xC0000080u
+#define EFER_NXE  (1ull << 11)
+
+/* Hardening features the kernel managed to enable at boot. */
+struct cpu_security {
+    bool nx;
+    bool wp;
+    bool smep;
+    bool smap;
+    bool umip;
+    bool rdrand;
+};
+
+extern struct cpu_security cpu_sec;
+
+void cpu_init(void);
+bool cpu_rdrand64(uint64_t *out);
+
+static inline void outb(uint16_t port, uint8_t v)
+{
+    __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port)
+{
+    uint8_t v;
+    __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
+static inline void outl(uint16_t port, uint32_t v)
+{
+    __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static inline uint64_t rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void wrmsr(uint32_t msr, uint64_t v)
+{
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+#define DEFINE_CR(n)                                                    \
+    static inline uint64_t read_cr##n(void)                             \
+    {                                                                   \
+        uint64_t v;                                                     \
+        __asm__ volatile("mov %%cr" #n ", %0" : "=r"(v));               \
+        return v;                                                       \
+    }                                                                   \
+    static inline void write_cr##n(uint64_t v)                          \
+    {                                                                   \
+        __asm__ volatile("mov %0, %%cr" #n : : "r"(v) : "memory");      \
+    }
+DEFINE_CR(0)
+DEFINE_CR(3)
+DEFINE_CR(4)
+#undef DEFINE_CR
+
+static inline void cpuid(uint32_t leaf, uint32_t sub, uint32_t *a, uint32_t *b,
+                         uint32_t *c, uint32_t *d)
+{
+    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
+}
+
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline __noreturn void cpu_halt_forever(void)
+{
+    for (;;)
+        __asm__ volatile("cli; hlt");
+}
+
+#endif
