@@ -2644,7 +2644,7 @@ static void test_ep_ipcbuf_wx(void)
 /* P55, authority conservation: a byte-exact copy of every capability
  * record in a set of tables (the test cspace, and each task's cspace and
  * its thread's binding slots). */
-#define WORLD_TABLES 16
+#define WORLD_TABLES 24
 #define WORLD_MAX    384
 struct world {
     unsigned n;
@@ -2815,7 +2815,12 @@ static void test_ep_xfer_basic(void)
     struct cap *src3[] = { &c10.slots[2], &c10.slots[3], &c10.slots[1] };
     struct cap *dst3[] = { &c40.slots[7], &c40.slots[8], &c40.slots[9] };
     CHECK(world_transferred(&world_a, &world_b, src3, dst3, 3));
-    CHECK(c40.slots[7].badge == 0x40 && c40.slots[9].rights == (RW_ | G_));
+    /* Explicitly: sources unchanged, copies carry the same rights and
+     * badge (world_transferred checks this too). */
+    CHECK(c10.slots[2].badge == 0x40 && c10.slots[2].rights == W_);
+    CHECK(c40.slots[7].badge == 0x40 && c40.slots[7].rights == W_);
+    CHECK(c10.slots[1].rights == (RW_ | G_) && c40.slots[9].rights == (RW_ | G_));
+    CHECK(c40.slots[8].map_state == 0 && c40.slots[8].map_entry == NULL);
     CHECK(test_report_count == 2 && reports_with(T_OK) == 2);
     CHECK(test_reports[1].b == (MSG_INFO(5, 1) | CAPS(3) | (3ull << 8)));  /* P54 */
     CHECK(got(40) == 0xAB && ep_ok(e) && !e->senders.head && !e->receivers.head);
@@ -2836,10 +2841,12 @@ static void test_ep_xfer_basic(void)
     CHECK(ut_setup(20));
     CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
     e = endpoint_of(&ut_store[1]);
-    CHECK(xfer_sender(10, 6, 0xCD, (const uint32_t[]){ 2 }, 1));
+    CHECK(xfer_sender(10, 6, 0xCD, (const uint32_t[]){ 5 }, 1));
+    c10 = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &c10, 5, CAP_R_WRITE | G_, 0x77) == T_OK);  /* badged */
     tbuf(10)->caps[1] = tbuf(10)->caps[2] = 0x55;     /* beyond ncaps: never staged */
     run_user();
-    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->msg.caps[0] == 2 && ep_ok(e));
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->msg.caps[0] == 5 && ep_ok(e));
     CHECK(th(10)->msg.caps[1] == 0 && th(10)->msg.caps[2] == 0);
     CHECK(xfer_receiver(40, (const uint32_t[]){ 3 }, 1));
     c10 = task_cs(10);
@@ -2849,8 +2856,10 @@ static void test_ep_xfer_basic(void)
     test_report_count = 0;
     run_user();
     world_take(&world_b);
-    struct cap *src1[] = { &c10.slots[2] }, *dst1[] = { &c40.slots[3] };
+    struct cap *src1[] = { &c10.slots[5] }, *dst1[] = { &c40.slots[3] };
     CHECK(world_transferred(&world_a, &world_b, src1, dst1, 1));
+    CHECK(c10.slots[5].badge == 0x77 && c40.slots[3].badge == 0x77 &&
+          c40.slots[3].rights == (CAP_R_WRITE | G_));
     CHECK(test_report_count == 2 && reports_with(T_OK) == 2);
     CHECK(test_reports[0].b == (MSG_INFO(6, 1) | CAPS(1) | (1ull << 8)));
     CHECK(got(40) == 0xCD && ep_ok(e));
@@ -2917,6 +2926,15 @@ static void test_ep_xfer_refuse(void)
     struct cap *src[] = { &c10.slots[3], &c10.slots[3], &c10.slots[1] };
     struct cap *dst[] = { &c40.slots[7], &c40.slots[8], &c40.slots[9] };
     CHECK(world_transferred(&world_a, &world_b, src, dst, 3));
+    /* Two independent CDT children of one source, not one deduplicated. */
+    CHECK(cdt_parent(&c40.slots[7]) == &c10.slots[3] && cdt_parent(&c40.slots[8]) == &c10.slots[3]);
+    CHECK(c40.slots[7].type == CAP_FRAME && c40.slots[8].type == CAP_FRAME);
+    CHECK(cap_delete(&c40, 8) == T_OK && c40.slots[7].type == CAP_FRAME);
+    CHECK(cap_derive_to(&c10, 3, &c40, 8, CAP_R_ALL, 0) == T_OK);   /* restore */
+    CHECK(cap_revoke(&c10, 3, 1000) == T_OK);
+    CHECK(c40.slots[7].type == CAP_NULL && c40.slots[8].type == CAP_NULL);
+    CHECK(c10.slots[4].type == CAP_NULL);                       /* also a child */
+    CHECK(cap_derive_to(&c10, 3, &c10, 4, RW, 0) == T_OK);       /* restore */
     CHECK(tstate(40) == THREAD_RUNNABLE && ep_ok(e));
     run_user();
 
@@ -3097,6 +3115,72 @@ static void test_ep_xfer_queued(void)
     ut_teardown();
 }
 
+/* P37, P53, I-E2: many queued senders that can no longer be delivered,
+ * ahead of deliverable ones. One recv fails each of them exactly once,
+ * delivers the first good one, and leaves the rest queued untouched. */
+static void test_ep_xfer_drain(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    /* Labels 1..7 identify the senders in their reports (RSI is kept). */
+    CHECK(xfer_sender(10, 1, 0x1, (const uint32_t[]){ 2, 3 }, 2));   /* too many */
+    CHECK(xfer_sender(20, 2, 0x2, (const uint32_t[]){ 3, 2 }, 2));   /* too many */
+    CHECK(xfer_sender(30, 3, 0x3, (const uint32_t[]){ 2 }, 1));      /* cap deleted */
+    CHECK(xfer_sender(40, 4, 0x4, (const uint32_t[]){ 3 }, 1));      /* cap deleted */
+    CHECK(xfer_sender(50, 5, 0x5, (const uint32_t[]){ 2 }, 1));      /* cap changed */
+    CHECK(xfer_sender(60, 6, 0x6, (const uint32_t[]){ 3 }, 1));      /* deliverable */
+    CHECK(xfer_sender(70, 7, 0x7, (const uint32_t[]){ 2 }, 1));      /* deliverable */
+    run_user();
+    for (cap_slot_t b = 10; b <= 70; b += 10)
+        CHECK(tstate(b) == THREAD_BLOCKED_SEND);
+    struct cspace c30 = task_cs(30), c40 = task_cs(40), c50 = task_cs(50);
+    CHECK(cap_delete(&c30, 2) == T_OK && cap_delete(&c40, 3) == T_OK);
+    CHECK(cap_delete(&c50, 2) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &c50, 2, CAP_R_READ, 0) == T_OK);  /* no GRANT now */
+    struct thread *s7 = th(70);
+    struct ipc_msg m7 = s7->msg;
+
+    CHECK(xfer_receiver(80, (const uint32_t[]){ 9 }, 1));
+    struct cspace c60 = task_cs(60), c80 = task_cs(80);
+    world_tables((const cap_slot_t[]){ 10, 20, 30, 40, 50, 60, 70, 80 }, 8);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    struct cap *src[] = { &c60.slots[3] }, *dst[] = { &c80.slots[9] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 1));
+    CHECK(got(80) == 0x6);
+
+    /* Each failed sender reported exactly one error, with its own reason;
+     * the good one succeeded; S7 is still queued, message intact. */
+    static const int64_t want[] = { T_EINVAL, T_EINVAL, T_EBADCAP, T_EBADCAP, T_EPERM, T_OK };
+    for (unsigned i = 0; i < ARRAY_SIZE(want); i++) {
+        unsigned seen = 0;
+        for (unsigned k = 0; k < test_report_count; k++)
+            /* The sender's own report: its info word, no delivered count. */
+            if (MSG_LABEL(test_reports[k].b) == i + 1 && !(test_reports[k].b & 0x300)) {
+                seen++;
+                CHECK((int64_t)test_reports[k].a == want[i]);
+            }
+        CHECK(seen == 1);
+        CHECK(tstate(10 * (i + 1)) == THREAD_INACTIVE);
+    }
+    CHECK(test_report_count == 7);                      /* + the receiver */
+    CHECK(e->senders.head == s7 && e->senders.tail == s7 && tstate(70) == THREAD_BLOCKED_SEND);
+    CHECK(memcmp(&s7->msg, &m7, sizeof(m7)) == 0 && ep_ok(e));
+
+    /* A second recv takes S7; no failed sender is charged again. */
+    CHECK(xfer_receiver(90, (const uint32_t[]){ 9 }, 1));
+    test_report_count = 0;
+    run_user();
+    CHECK(test_report_count == 2 && reports_with(T_OK) == 2 && got(90) == 0x7);
+    for (unsigned k = 0; k < test_report_count; k++)
+        CHECK(MSG_LABEL(test_reports[k].b) == 7 || MSG_LABEL(test_reports[k].b) == 0);
+    CHECK(ep_ok(e) && !e->senders.head && !e->receivers.head);
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -3164,6 +3248,7 @@ static const struct {
     { "ep_xfer_refuse", test_ep_xfer_refuse },
     { "ep_xfer_collision", test_ep_xfer_collision },
     { "ep_xfer_queued", test_ep_xfer_queued },
+    { "ep_xfer_drain", test_ep_xfer_drain },
     { "cpu_hardening", test_cpu_hardening },
 };
 
