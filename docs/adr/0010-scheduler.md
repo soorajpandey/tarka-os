@@ -1,12 +1,17 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: proposed, revision 3b (step 6). Rule numbers SC1..SC32 are
+Status: proposed, revision 3c (step 6). Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
 - **Revision 1** (`5502c54`): first draft.
 - **Revision 2** (`1fd873c`): idle thread, continuations, counters, W.
-- **Revision 3b** (this one) is the pre-acceptance audit (section
+- **Revision 3c** (this one) specifies the freeze lifecycle (SC22b): the
+  invariant F1 on every CDT mutation; ownership; a second revocation;
+  cancellation and `T_EINTR`; reaper-owned freezes; enclosing
+  revocations; and the carving-chain proof. The freeze design and the
+  removal of the revoke budget were approved in the review of 3b.
+- **Revision 3b** (`8fd04a7`) was the pre-acceptance audit (section
   "Pre-acceptance audit"). It:
   - states the dying-object transition as a transaction (SC23)
   - completes the W table (SC26)
@@ -606,6 +611,128 @@ new record can enter the subtree it is emptying:
   delay other holders' derivations from O, never to stop them for good,
   and never to affect any other object. **Flagged for review.**
 
+**SC22b. The freeze lifecycle.**
+
+**F1. The invariant.** If a record lies in a frozen derivation subtree,
+no successful operation creates a new descendant of it until the freeze
+is released. F1 is a property of CDT mutation, not of any one function.
+Every way a capability record can come into existence is listed here,
+and each enforces it:
+
+| Mutation | Where | Enforcement |
+|---|---|---|
+| derive, IPC transfer, binding | `cap_derive_commit()`, inserting under the source record | `cap_derive_check()` refuses a frozen source (F2) |
+| retype | the retype commit, inserting under the source Untyped | refuses a frozen source Untyped, or one on a frozen chain (F2) |
+| boot install of root Untypeds | `cap_install()` | runs before any thread exists, so no freeze can exist; asserted |
+| deletion, with re-parenting | `cdt_remove()` | **cannot violate F1:** it moves no element. Every remaining record stays inside exactly the intervals it was in (SC20, step 4), so no record enters a frozen subtree |
+
+There is no capability move or other re-parenting operation. **Any future
+operation that creates a capability record must insert through one of
+these two commit functions** (gate SC31.5: a build check that
+`cap_insert_child()` is called from nowhere else).
+
+**F2. Why the check is exact enough, and bounded.** Claim: the
+ancestors of any record of an object O are records of O, followed by the
+Untypeds of O's **carving chain** (the Untyped O was carved from, the
+Untyped that one was carved from, and so on up to a boot root), and
+nothing else. Proof:
+- O's first record is created by retype as a child of the Untyped it was
+  carved from, U1.
+- Every other record of O is derived from a record of O, because
+  derivation copies the object, so its parent is a record of O.
+- Deletion only re-parents a record to its former grandparent, which is
+  again a record of O or U1.
+- U1 itself cannot be deleted while it has descendants (O8).
+- The same argument applied to U1 (an object carved from U2) gives U1's
+  ancestors.
+
+So a record of O lies in the subtree of a frozen root f exactly when f
+is either a record of O, which O's freeze flag covers (over-approximated
+to all of O, as agreed), or an Untyped on O's carving chain. Checking
+"O frozen, or any Untyped on O's chain frozen" therefore catches every
+derivation into any frozen subtree, and nothing outside O and its chain
+is affected.
+
+The check is bounded. Retype requires the new Untyped to be strictly
+smaller than its source (`size_bits < ut_bits`), and no Untyped is
+smaller than `UNTYPED_MIN_BITS`. So a chain has at most `CHAIN_MAX` =
+`UNTYPED_BOOT_MAX_BITS - UNTYPED_MIN_BITS + 1` links, a compile-time
+constant, and each link is one back-pointer read (SC19a locations; an
+Untyped's own record holds its back-pointer).
+
+**F3. Ownership.** Every freeze has exactly one owner, recorded with the
+frozen flag in the object's metadata (SC19a), or in an Untyped's record:
+- **A thread,** for a revocation (SC22). The frozen object records its
+  owner as an internal reference. It is cleared before the thread can
+  be freed, like a wait-queue link (O10). The owning thread's
+  continuation names the frozen object only by value (address and
+  serial, SC16).
+- **The reaper,** for an Untyped torn down inside a dying CNode (SC24).
+
+**F4. One revocation at a time.** A revocation whose root object is
+frozen, or whose root lies under a frozen Untyped on its chain, fails at
+once with `T_EBUSY`, with nothing changed: no second continuation, no
+freeze reference count. In particular:
+- **Same object:** a second `revoke` on any record of an object already
+  being revoked gets `T_EBUSY`.
+- **A descendant of an Untyped being revoked:** the revoke reaches the
+  ancestor's freeze through the chain check and gets `T_EBUSY`.
+- **An ancestor of a running revocation:** for example, revoking U0 while
+  a thread revokes a record r of an object carved under U0. The outer
+  revocation is allowed: U0 itself is not frozen. When it reaches r, it
+  **cancels** the inner revocation (F5) and deletes r. The enclosing
+  revocation wins, and never waits for the enclosed one.
+
+**F5. The root of a revocation stays put, or the revocation is
+cancelled.**
+- `cap_delete` on the root record of a running revocation returns
+  `T_EBUSY`. That root therefore remains for as long as the revocation
+  runs, and a frozen object cannot die (its root is one of its records).
+- The only other ways the root can go are:
+  - an enclosing revocation reaching it (F4)
+  - the reaper deleting it from a dying CNode, when the CNode holding
+    the root itself dies
+
+  Both **cancel** the revocation, in one step: release the freeze, clear
+  the owner reference, and mark the owner's continuation cancelled.
+  Then delete the root. When the owner next runs, its revocation ends
+  with `T_EINTR`. Cancelling is O(1) and never waits.
+
+**F6. Abandonment is a transaction.** Every path that stops or destroys
+the owning thread runs, before the thread can become unreachable or be
+freed, a single step. These are suspension, `exit`, destruction and
+binding loss, through the same funnel as P64's `ipc_detach()`. (A thread
+with a continuation never runs user code, so it cannot fault while it
+holds one.) The step:
+1. locates the frozen object from the continuation's (address, serial).
+   This is safe because a frozen object cannot die (F5), and is checked
+   against the recorded owner.
+2. releases the freeze and clears the owner reference
+3. discards the continuation
+4. leaves `T_EINTR` as the syscall's result for a later resume (not when
+   destroying)
+
+No revocation progress is rolled back: the records already deleted stay
+deleted, each deletion having been committed. **So no freeze outlives its
+owner:** the audit checks that every frozen flag names a live owner (a
+thread whose continuation is that revocation, or the reaper with the
+object listed) and that every revocation continuation owns exactly one
+freeze.
+
+**F7. Reaper-owned freezes.**
+- When the reaper meets an Untyped with descendants in a dying CNode, it
+  freezes that Untyped (owner: the reaper) and deletes its descendants,
+  first child first, one per unit. It then deletes the Untyped, which
+  releases the freeze.
+- The reaper cannot be stopped, so such a freeze has no abandonment
+  path. It is released exactly when the Untyped's record is deleted.
+- The Untyped is unreachable (its CNode is dying), so nobody else can
+  revoke or retype from it. Holders of descendants still cannot derive
+  into it, because of F2.
+- Reaper teardown **only deletes,** never creates records. It never
+  waits for a freeze or for another dying object: if it reaches the root
+  of a thread-owned revocation, it cancels that revocation (F5).
+
 ## Dying objects and the reaper
 
 **SC23. Dying objects.** Some objects cannot be torn down in constant
@@ -737,6 +864,9 @@ Reaper invariants:
   interrupts open in the idle loop.
 - **R6.** Stopping or destroying the thread that caused the death has no
   effect on the teardown.
+- **R9.** The reaper never waits for a freeze. It cancels a thread-owned
+  revocation whose root it must delete (F5), and its own freezes are
+  released when it deletes their Untyped (F7).
 - **R7.** The reaper creates no dependencies:
   - It is not an object, holds no capability, and cannot be named,
     deleted or blocked.
@@ -851,7 +981,13 @@ at most that many steps:
 | Reaper (SC24) | total units of all listed objects: doomed waiters, plus occupied slots of dying CNodes, plus descendants of their frozen Untypeds | doomed queues cannot gain waiters (a count at 0 stays at 0); a dying CNode is unreachable, so nothing can be placed in it; its Untypeds are frozen; a unit that lists a new object adds that object's units behind, not to any earlier object |
 | Receive drain (SC25) | for each queued sender, its position in the queue | each chunk removes senders only at the head, never re-examines a failed sender (I-E2), and new senders join behind |
 
-The receive drain is different, and stated exactly. It ends as soon as a
+**Receive-drain completion is not a scheduler liveness guarantee.** The
+scheduler guarantees CPU fairness and bounded work per boundary. It
+does not guarantee that the environment eventually supplies a
+deliverable message. Revocation is different: its target set is fixed
+by the freeze, so it is guaranteed to finish.
+
+The receive drain, stated exactly: It ends as soon as a
 deliverable sender reaches the head, or the queue is empty. A deliverable
 sender queued at position k is reached within ⌈k/`DRAIN_CHUNK`⌉ chunks.
 If every arriving sender is undeliverable (for example, holders of WRITE
@@ -887,6 +1023,9 @@ implementation order is complete only when its gate passes:
 4. **The revocation pre-scan mutant (stage 1).** With the test subtree of
    SC22 (at least 4·W units), reintroducing an end-of-subtree scan before
    the first deletion must exceed W on the work counter.
+5. **One insertion path (stage 2).** A build check fails if
+   `cap_insert_child()` is called from anywhere except the derivation
+   commit and the retype commit, the two places F1 is enforced (SC22b).
 
 ## Pre-acceptance audit (revision 3b)
 
@@ -899,6 +1038,7 @@ The review's checklist, and what this revision does about each item:
 | 3 | Every counter change in the same commit as its table change | Design: C4, C5. Code: gate SC31.3 |
 | 4 | Dying accounting never half-committed | **Changed:** R0 is now a transaction, with before/after states, plus teardown and authority-loss transactions |
 | 5 | Reaper work bounded by `REAP_CHUNK` | **Changed:** a unit is defined, including the Untyped-in-dying-CNode case (today unbounded), and costs at most `UNIT_MAX` |
+| 6a | Freeze lifecycle (review of 3b) | **Specified in 3c:** SC22b, F1-F7 and R9 |
 | 6 | Every cursor has a progress measure and cannot repeat forever | **Failed for revocation, fixed:** SC22, SC22a, SC30. Reaper and drain measures stated; the drain's behaviour under endless undeliverable senders made explicit |
 | 7 | Every operation's work represented in W | **Changed:** SC26 now lists every syscall, every entry kind and all kernel-owned work, with `CHAIN_MAX` and `UNIT_MAX` |
 | 8 | The revoke pre-scan mutant is caught | Design: test subtree at least 4·W units. Code: gate SC31.4 |
@@ -1018,6 +1158,18 @@ limit:
     changed; other objects are unaffected; the flag clears on completion
     and on abandonment; a second revocation on the same object gets
     `T_EBUSY`.
+15. **The freeze lifecycle (SC22b):**
+    - the revoking thread suspended, destroyed, exiting, or losing its
+      cspace binding mid-revocation: the freeze is released, `T_EINTR`
+      on resume, deleted records stay deleted, and the audit finds no
+      ownerless freeze
+    - `cap_delete` on the root of a running revocation gets `T_EBUSY`
+    - an enclosing Untyped revocation cancels an inner one when it
+      reaches its root, and the inner revocation ends with `T_EINTR`
+    - a revocation on a descendant of a frozen Untyped gets `T_EBUSY`
+    - a dying CNode holding a revocation's root cancels it
+    - a dying CNode holding an Untyped with descendants: the reaper's
+      freeze holds while it runs and is released when the Untyped goes
 
 ### Planned mutants
 
@@ -1061,6 +1213,13 @@ limit:
   - changed by a failed operation or a parentage change
   - overflow not refused
 - Freeze:
+  - not released when the revoking thread is suspended, destroyed or
+    exits, or loses a binding
+  - deletion of a revocation's root allowed
+  - an enclosing revocation waiting for (instead of cancelling) an
+    inner one
+  - a second revocation of a frozen object allowed
+  - a record inserted by a path other than the two commit functions
   - not set by revocation
   - not checked on one of derive, transfer, binding or retype
   - a carving chain not walked
