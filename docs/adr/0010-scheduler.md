@@ -1,12 +1,22 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: proposed, revision 3 (step 6). Rule numbers SC1..SC32 are
+Status: proposed, revision 3a (step 6). Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
 - **Revision 1** (`5502c54`): first draft.
 - **Revision 2** (`1fd873c`): idle thread, continuations, counters, W.
-- **Revision 3** (this one) resolves the second review:
+- **Revision 3a** (this one) resolves the third review:
+  - the CDT proof is a stand-alone induction (SC20)
+  - the contiguity claim is removed: "last capability" is decided by a
+    live-record count (SC19a)
+  - the consequences of 128-byte records are accounted for, with size
+    assertions (SC20a)
+  - the dying-object ordering (R0) and non-interference (R8) are stated
+  - `T_EAGAIN` from retype holds no hidden state
+  - continuations hold no kernel pointers (SC16)
+  - a budget-1 revoke test over a huge subtree is required (SC22)
+- **Revision 3** (`e5e4e3e`) resolved the second review:
   - **The CDT representation (SC19, SC20).** Revision 2 allowed depth
     gaps. A proof attempt found a reachable counterexample (SC19), so
     revision 3 replaces depths with balanced brackets, which have a short
@@ -286,7 +296,18 @@ registers are never rewound.
 | `kind` | the operation, or NONE |
 | captured inputs | every user input, copied once at the first chunk: register arguments and anything read from user memory |
 | target identity | the slot named, plus the identity of the object it named: physical address and serial (SC21) |
-| cursor | where the operation stands, when kernel objects do not already record it |
+| cursor | where the operation stands, as a stable logical position (for example "the head of the send queue"), when kernel objects do not already record it |
+
+**A continuation holds no pointer to any kernel object.** It holds
+values: captured inputs, a slot number, an (address, serial) pair and a
+logical cursor. Every chunk reaches its target only by looking the
+captured slot up again in the thread's current cspace (itself taken
+from the thread's binding) and comparing address and serial. So an
+object deleted between chunks is never dereferenced through the
+continuation (no use-after-free), and an object created later at the
+same address never matches (no ABA). Nothing needs pinning: a
+continuation keeps no object alive and no object waits for a
+continuation.
 
 Rules:
 - **Capture once.** User memory and user registers are read only at the
@@ -344,6 +365,24 @@ in every cspace, CNode and binding slot.
   512 GiB of RAM. The check makes this a deterministic error rather than
   an assumption.
 
+**SC19a. The live-record count.** Every object that can have more than
+one capability record keeps a count of all its live records, whatever
+their rights. Deleting a record is the deletion of the **last**
+capability to its object exactly when the count goes from 1 to 0. Where
+the count lives:
+
+| Object | Location |
+|---|---|
+| Endpoint, Notification | in the object (SC23) |
+| CNode | the slot-property area of its slot 0 (SC20a) |
+| Thread | in the TCB |
+| AddressSpace, PageTable | in the shadow page (ADR 0007) |
+| Frame | the frame metadata table entry of its base page (SC18), alongside the alias counters |
+| Untyped | not needed: an Untyped has exactly one record (O2) |
+| Debug console, test token | no object, no finaliser; not counted |
+
+C1-C6 apply to it as to the rights counters.
+
 **SC19. Counter invariants.**
 - **C1.** A count never exceeds the number of live records to the object.
 - **C2.** A count never underflows; every decrement asserts the count is
@@ -400,57 +439,69 @@ Operations, all O(1):
 | delete x | unlink open(x) and close(x) |
 | p has children | the element after open(p) is not close(p) |
 | p's first child | the record whose open element follows open(p), if any |
-| x is the last capability to its object | see below |
 
-**Proof that the bracket list represents the intended tree.** Let F be
-the abstract derivation forest (each record's parent, or root) and B the
-bracket list. The invariant is **INV: B is well-nested, and the parent
-relation read from B (tightest enclosing pair) equals F's.**
-- **Derive c from p.** Inserting the adjacent pair `()` right after
-  open(p) keeps B well-nested.
-  - c's tightest enclosing pair is p's: any pair that encloses open(p)
-    and is tighter than p's would have to start between open(p) and
-    open(c), and there is nothing there.
-  - c encloses nothing: its brackets are adjacent.
-  - Every other pair encloses exactly what it did, plus c if it encloses
-    p.
+"Is x the last capability to its object?" is **not** a CDT question. It is
+answered by the object's live-record count (SC19a). The CDT represents
+derivation only.
 
-  So B now reads F + {c -> p}, which is F'.
-- **Delete x.** Removing a matched pair from a well-nested sequence
-  leaves it well-nested.
-  - A child y of x was most tightly enclosed by x. Now it is most
-    tightly enclosed by the next pair outward, which is x's parent (or
-    nothing, if x was a root).
-  - For any record not directly under x, the tightest enclosing pair is
-    unchanged: removing x's pair can only remove x itself as a
-    candidate.
+**Proof** (independent of any model check). The invariant is **INV: B is
+a well-nested bracket sequence in which each record contributes exactly
+one open and one matching close element, and the parent relation read
+from B (tightest enclosing pair) equals the abstract forest F.**
 
-  So B now reads F with x removed and x's children re-parented to x's
-  parent. This is exactly the semantics of deletion today (P27a "re-
-  parenting"), now with no renumbering.
-- **Revoke p by first-child deletion.** Each step deletes the record
-  whose open element follows open(p). By the deletion case, its children
-  become p's children and stay inside p's pair. p's pair therefore
-  encloses one record fewer after each step, and p has no descendants
-  exactly when the element after open(p) is close(p). Every intermediate
-  state satisfies INV.
-- **Contiguity of an object's records.** All records to one object form
-  one contiguous region of B, made only of that object's elements:
-  - **Creation:** retype creates the first record of an object as an
-    adjacent pair.
-  - **Derivation:** inserts only right after open(p) for a record p of
-    the same object, which is inside the region.
-  - **Deletion:** shrinks the region and cannot split it, because the
-    elements removed are adjacent to region elements or at its edges.
+1. **Base.** A record created by retype or installed at boot is inserted
+   as an adjacent pair `()`: at boot as a root, by retype immediately
+   after open(Untyped). An adjacent pair is well-nested, encloses
+   nothing, and is enclosed by exactly the pairs that enclose its
+   insertion point. That is the Untyped (and that Untyped's ancestors),
+   or nothing at boot. This matches F, which gets the new record under
+   the Untyped, or as a root.
+2. **Derive.** Deriving c from p inserts a complete pair `()` immediately
+   after open(p), which lies strictly inside p's interval.
+3. **So nesting is preserved.** Inserting a complete adjacent pair
+   anywhere keeps a sequence well-nested. Because it goes right after
+   open(p):
+   - no pair begins between open(p) and open(c), so p's pair is c's
+     tightest enclosing pair
+   - c encloses nothing
+   - every other pair's contents gain c exactly when they contain p
 
-  So x is the last record to its object exactly when the elements just
-  outside its pair (before open(x) and after close(x)) do not belong to
-  the same object, and x has no children of the same object. O(1). This
-  replaces today's `is_final()`.
+   B now reads F + {c -> p}.
+4. **Removal changes nothing else.** Removing a pair x unlinks two
+   elements and moves nothing. The relative order of every remaining
+   element is unchanged, and so is, for every pair of remaining records,
+   whether one encloses the other.
+5. **x's children go to x's parent.** For a remaining record y:
+   - **If x was y's tightest encloser,** the next tightest encloser of y
+     before the deletion is x's tightest encloser, its parent: any pair
+     enclosing y and enclosing x's interval must enclose x. So after the
+     deletion y's parent is x's former parent, or y is a root if x was.
+   - **Otherwise** y's tightest encloser is unchanged, by step 4.
+6. **So the forest stays exactly the CDT.** After deleting x, B reads F
+   with x removed and x's children re-parented to x's parent. That is
+   the deletion semantics of P27a's "re-parenting", with no renumbering.
+   By induction over any sequence of steps 1, 2 and 5, INV always holds.
+
+**Corollary (revocation).** Revoking p deletes, at each step, the record
+whose open element follows open(p): a descendant of p, by INV. By step 5
+its children stay inside p's interval. Each step shrinks p's interval by
+exactly one record, and p has no descendants exactly when the element
+after open(p) is close(p). Every intermediate state satisfies INV.
+
+**No contiguity is assumed.** Records of one object need not be
+adjacent in B, and nothing in the kernel may rely on that. Under today's
+rules they happen to be, because derivation always copies the source's
+object and the only records with children of other objects are
+Untypeds, which cannot be copied (O2). That is a coincidence of the
+current rules, not an invariant. The existing uses of it
+(`is_final()`, `cap_object_first()`) are removed in favour of SC19a.
 
 **SC20a. Record layout.** The two list elements add 16 bytes, and the
 dying-object bookkeeping of a CNode (SC23) needs slot-property space.
-`struct cap` grows from 64 to **128 bytes**, with explicit fields:
+`struct cap` grows from 64 to **128 bytes**. Its size and alignment are
+fixed by compile-time assertions (`sizeof(struct cap) == 128`, and every
+slot array 128-byte aligned), so they cannot change by accident. The
+fields are explicit:
 - type, rights, slot properties
 - object, and the type-specific word
 - the open and close elements
@@ -458,9 +509,17 @@ dying-object bookkeeping of a CNode (SC23) needs slot-property space.
 - a slot-property area kept by `cap_slot_clear` (as `pending_link` is
   today)
 
-CNodes take twice the memory per slot, and slot sizes and alignment are
-updated throughout. Slot numbering is unchanged, so this is not a
-user-visible ABI change.
+Consequences, accounted for:
+
+| What | Effect |
+|---|---|
+| CNode capacity | unchanged in slots: up to 2^12 slots per CNode |
+| CNode memory | doubled: 2^n slots take 2^(n+7) bytes; the largest CNode is 512 KiB (this sets `RETYPE_ZERO_MAX`, SC28) |
+| Boot-time capability memory | the root cspace (256 slots) grows from 16 KiB to 32 KiB of kernel BSS |
+| TCB | four binding slots take 512 bytes; the TCB stays within page 0 of the thread object (about 1.2 KiB plus the continuation; asserted) |
+| CDT storage | inside each record; nothing is allocated per derivation |
+| Kernel stack | none: no kernel function keeps a `struct cap` on the stack (checked by `-fstack-usage` review, T33) |
+| User ABI | slot numbers, capability identities and syscall arguments are unchanged |
 
 **SC21. Object serials.**
 - Every endpoint, notification and CNode carries a 64-bit serial when it
@@ -485,6 +544,12 @@ user-visible ABI change.
 - There is **no preliminary scan**: revocation is O(b), not O(subtree) +
   O(b).
 - `revoke(root, 1)` removes at most one record and leaves a valid tree.
+- Required test: a subtree of thousands of records (deep chains and wide
+  fans), revoked with budget 1. Each call removes exactly one record,
+  leaves the tree valid (checked against a reference forest), and stays
+  within W on the work counter, whatever the subtree's size.
+  Reintroducing a pre-scan is a planned mutant, and the work counter
+  must catch it.
 
 ## Dying objects and the reaper
 
@@ -493,7 +558,8 @@ time:
 - an endpoint or notification with waiters to wake
 - a CNode with occupied slots
 
-When the last capability to such an object is deleted:
+When the last capability to such an object is deleted (its live-record
+count reaches 0, SC19a):
 1. **In the deleter's entry, O(1):**
    - the record is deleted normally; its slot is empty at once and
      reusable
@@ -544,6 +610,46 @@ and not a thread:
 - When an object's teardown is complete, the reaper takes it off the
   list. If it was dying, it decrements its Untyped's dying count, and the
   object's memory may then be reused by the rules above.
+
+**Ordering (R0).** Every dying object has exactly one owning Untyped:
+the one recorded in its back-pointer at retype. Within the single,
+non-preemptible step that deletes its last record, these happen in this
+order:
+1. mark the object dying
+2. increment the owning Untyped's dying count
+3. append the object to the reaper
+4. remove the last record from the CDT and clear the slot (the object
+   is now unreachable, and the slot is reusable)
+
+Later, after the object's teardown is complete:
+
+5. take it off the reaper list
+6. decrement the dying count (only now may the memory be reused or the
+   Untyped reset)
+
+There is never a point where the object is unreachable but its Untyped
+does not count it. The audit checks, for every Untyped, that its dying
+count equals the number of listed dying objects whose back-pointer names
+it.
+
+**`T_EAGAIN` from retype is a plain retryable error.** It creates no
+continuation, queue entry, reservation or other kernel state: nothing
+changed, and the caller decides whether and when to retry. Retype never
+blocks.
+
+**Non-interference (R8).** Only operations authorised by an Untyped's
+own capability can raise that Untyped's dying count:
+- an object carved from U can exist only through a retype that used U's
+  capability
+- its last record can be deleted only by whoever holds that record
+
+So a task that holds neither U's capability nor any capability to an
+object carved from U cannot make a retype on U return `T_EAGAIN`, and
+cannot lengthen the time it keeps doing so. Each dying object of U is
+finished after at most the reaper work ahead of it when it was listed
+(R7). Tasks that hold capabilities to objects carved from U, because U's
+holder gave them, can delay U's reset only by the teardown of those
+objects: work the holder chose to delegate.
 
 Reaper invariants:
 - **R1.** Every dying object, and every live object with a doomed queue,
@@ -671,7 +777,8 @@ limit:
 | I-SC4 | At most W work between scheduling boundaries; long operations never re-read user input and commit only valid states | SC15, SC16, SC22-SC28 |
 | I-SC5 | Counters equal the live rights-bearing records and aliases at every step | SC17-SC19 |
 | I-SC6 | The bracket list is well-nested and represents exactly the derivation forest | SC20 |
-| I-SC7 | Dying objects grant nothing, are owned by exactly one reaper, and their memory is not reused before their teardown completes | SC23, SC24 (R1-R7) |
+| I-SC7 | Dying objects grant nothing, are owned by exactly one reaper and exactly one Untyped, are counted by that Untyped before they become unreachable and until their teardown completes, and their memory is not reused before then | SC23, SC24 (R0-R8) |
+| I-SC8 | "Last capability to an object" is decided by the live-record count, never by CDT position | SC19a, SC20 |
 | I-B1 (closed) | IPC work, message size and queue depth are bounded | P37, SC26, SC29 |
 
 ## Amendments to earlier ADRs (on acceptance)
