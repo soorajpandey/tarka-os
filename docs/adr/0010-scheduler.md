@@ -1,12 +1,23 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: proposed, revision 3a (step 6). Rule numbers SC1..SC32 are
+Status: proposed, revision 3b (step 6). Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
 - **Revision 1** (`5502c54`): first draft.
 - **Revision 2** (`1fd873c`): idle thread, continuations, counters, W.
-- **Revision 3a** (this one) resolves the third review:
+- **Revision 3b** (this one) is the pre-acceptance audit (section
+  "Pre-acceptance audit"). It:
+  - states the dying-object transition as a transaction (SC23)
+  - completes the W table (SC26)
+  - adds progress measures for every long operation (SC30)
+  - adds implementation gates for the checks only code can pass (SC31)
+  - **The audit found one real liveness hole:** a chunked revocation can
+    be outrun forever by holders deriving new records into the subtree.
+    Revocation becomes a thread continuation with a derivation freeze
+    (SC22, SC22a). This changes revision 3's choice of a user-continued
+    API.
+- **Revision 3a** (`8e65a8d`) resolved the third review:
   - the CDT proof is a stand-alone induction (SC20)
   - the contiguity claim is removed: "last capability" is decided by a
     live-record count (SC19a)
@@ -281,8 +292,8 @@ Each long operation states which of the four mechanisms it uses:
 
 | Mechanism | When it fits | Step 6 uses it for |
 |---|---|---|
-| **Thread continuation** (SC16) | the remaining work is part of the caller's result | the receive drain (SC25) |
-| **User-continued API** | the operation has a natural partial result the caller can repeat | revocation, which returns `T_EAGAIN` (SC22) |
+| **Thread continuation** (SC16) | the remaining work is part of the caller's result | the receive drain (SC25), revocation (SC22) |
+| **User-continued API** | the operation has a natural partial result the caller can repeat, and stopping half-way leaves nobody holding authority they should have lost | none in step 6 (revocation fails the second condition, SC22) |
 | **Kernel-owned teardown** (reaper, SC23-SC24) | the remaining work is not part of anyone's result | object death, and wake-all on authority loss |
 | **Refusal above an architectural limit** | splitting the request is the caller's business | retype zeroing (SC28) |
 
@@ -533,23 +544,67 @@ Consequences, accounted for:
   the same address and in the same slot never matches (the ABA test,
   test 8).
 
-**SC22. Revocation is O(budget).**
-- `cap_revoke(slot, budget)` performs at most **b = min(budget,
-  REVOKE_MAX)** steps, with a budget of 0 meaning REVOKE_MAX.
-- A **step** is the deletion of one record: the target's current first
-  child, found in O(1) by SC20. A deletion's own work is O(1): counters,
-  the cleanup hook, and handing a dead object to the reaper (SC23).
-- It returns `T_OK` when the target has no descendants, and `T_EAGAIN`
-  otherwise.
-- There is **no preliminary scan**: revocation is O(b), not O(subtree) +
-  O(b).
-- `revoke(root, 1)` removes at most one record and leaves a valid tree.
-- Required test: a subtree of thousands of records (deep chains and wide
-  fans), revoked with budget 1. Each call removes exactly one record,
-  leaves the tree valid (checked against a reference forest), and stays
-  within W on the work counter, whatever the subtree's size.
-  Reintroducing a pre-scan is a planned mutant, and the work counter
-  must catch it.
+**SC22. Revocation is a thread continuation.**
+- **Why not user-continued.** Revision 3 made revocation user-continued
+  (`T_EAGAIN`). That leaves the subtree open to derivation between calls:
+  any holder of a GRANT-bearing record inside it can derive new children
+  into it. Holders with more threads than `REVOKE_CHUNK` can add records
+  faster than each call removes them, so the revocation never completes
+  and the authority it was meant to remove stays live. A one-pass revoke
+  cannot be interleaved like this; chunking introduced the hole.
+- **The new contract.** `cap_revoke(slot)` runs to completion as a thread
+  continuation (SC16), and the syscall returns `T_OK` only when the
+  target has no descendants:
+  - each chunk deletes at most `REVOKE_CHUNK` records, each being the
+    target's current first child, found in O(1) (SC20)
+  - there is no preliminary scan: a chunk is O(`REVOKE_CHUNK`), never
+    O(subtree) + O(budget)
+  - the syscall's budget argument is removed: the kernel, not the
+    caller, decides the chunk size
+  - abandonment (the revoker is stopped) ends the operation as SC16 says,
+    with the records already deleted staying deleted (each deletion is
+    committed)
+- **Required test.** A subtree of thousands of records, in deep chains
+  and wide fans, at least 4·W units in size (so a reintroduced pre-scan
+  exceeds W in the first chunk). Every chunk deletes exactly
+  `REVOKE_CHUNK` records (fewer only in the last), leaves the tree equal
+  to a reference forest, and stays within W on the work counter. A second
+  test runs many threads deriving into the subtree throughout; the
+  revocation still completes.
+
+**SC22a. The derivation freeze.** While a revocation is in progress, no
+new record can enter the subtree it is emptying:
+- **The flag.** Revoking a record r of object O sets O's **freeze** flag,
+  kept with O's live-record count (SC19a).
+- **The Untyped case.** Revoking an Untyped U sets U's freeze flag
+  instead, in U's own record, which is unique (O2). U's descendants are
+  the objects carved from U, and the Untypeds carved from those.
+- **The check, in `cap_derive_check()`.** That is the one place every
+  derivation passes: derive, transfer, binding and retype. A derivation
+  or retype fails with `T_EBUSY`, nothing changed, if any of these is
+  frozen:
+  - the source object
+  - for retype, the source Untyped
+  - any Untyped on the source's carving chain
+
+  The carving chain is the object's back-pointer to the Untyped it was
+  carved from, then that Untyped's back-pointer, and so on. Each nested
+  Untyped is strictly smaller and at least `UNTYPED_MIN_BITS` in size, so
+  the chain has at most `UNTYPED_BOOT_MAX_BITS - UNTYPED_MIN_BITS` links:
+  a constant. (SC23's back-pointers extend to every object type, at the
+  SC19a locations.)
+- **Lifetime.** The flag is cleared when the revocation completes or is
+  abandoned. A revocation on an object or Untyped already frozen fails
+  with `T_EBUSY`: one revocation at a time per object.
+- **Precision, a deliberate trade-off.** Freezing O blocks derivation
+  from every record of O, not only those inside r's subtree. A precise
+  test ("is the source inside r's interval?") needs order labels on the
+  bracket list, whose relabelling is O(1) only amortised. The
+  over-approximation lasts only while a revocation is running, and that
+  revocation makes progress at every dispatch of its thread, so it is
+  bounded by the subtree's size. A holder of a record of O can use it to
+  delay other holders' derivations from O, never to stop them for good,
+  and never to affect any other object. **Flagged for review.**
 
 ## Dying objects and the reaper
 
@@ -605,32 +660,47 @@ and not a thread:
   its list. A unit is one of:
   - waking one doomed waiter (with `T_EDEAD`; a fault caller becomes
     FAULTED, P72)
-  - deleting one slot of a dying CNode. That is an ordinary O(1)
-    deletion, which may make another object dying, appended to the tail.
+  - deleting one slot of a dying CNode: an ordinary deletion, which may
+    make another object dying, appended to the tail
+  - for a slot holding an Untyped that still has descendants, deleting
+    that Untyped's first child (the Untyped is frozen, SC22a, and
+    deleted as a unit once it has no descendants). Today's
+    `cspace_destroy` does `revoke(c, 0)` here, which is unbounded.
+
+  Each unit costs at most `UNIT_MAX`: the cost of the most expensive
+  single deletion, which is an AddressSpace or PageTable finaliser over
+  its 512 entries (V15).
 - When an object's teardown is complete, the reaper takes it off the
   list. If it was dying, it decrements its Untyped's dying count, and the
   object's memory may then be reused by the rules above.
 
-**Ordering (R0).** Every dying object has exactly one owning Untyped:
-the one recorded in its back-pointer at retype. Within the single,
-non-preemptible step that deletes its last record, these happen in this
-order:
-1. mark the object dying
-2. increment the owning Untyped's dying count
-3. append the object to the reaper
-4. remove the last record from the CDT and clear the slot (the object
-   is now unreachable, and the slot is reusable)
+**R0: the death of an object is one transaction.** Every dying object
+has exactly one owning Untyped, the one named by its back-pointer. The
+deletion of its last record is a single non-preemptible commit step, and
+no kernel observer (another entry, an interrupt handler, the reaper, the
+audit) can see any state in between:
 
-Later, after the object's teardown is complete:
+| | Before the commit | After the commit |
+|---|---|---|
+| Reachability | the object is live; its live-record count is 1 | no capability refers to the object; count 0 |
+| Dying mark | not dying | marked dying |
+| Untyped | dying count = n | dying count = n + 1 |
+| Reaper | not listed (or listed for a doomed direction only) | listed on exactly one reaper |
+| Slot | holds the last record | empty and reusable |
 
-5. take it off the reaper list
-6. decrement the dying count (only now may the memory be reused or the
-   Untyped reset)
+So these states can never be observed:
+- a slot free while its object is not yet counted as dying
+- an object dying while its memory is not pinned by its Untyped's count
 
-There is never a point where the object is unreachable but its Untyped
-does not count it. The audit checks, for every Untyped, that its dying
-count equals the number of listed dying objects whose back-pointer names
-it.
+The other two transitions are transactions too:
+- **Teardown completion**, in one reaper unit: the object leaves its
+  reaper list and its Untyped's dying count drops, together. Only after
+  that commit may the memory be reset (amended O7).
+- **Authority loss**, in one step: the opposite-direction count reaches 0
+  and the live object is listed with its doomed direction.
+
+The audit checks, for every Untyped, that its dying count equals the
+number of listed dying objects whose back-pointer names it.
 
 **`T_EAGAIN` from retype is a plain retryable error.** It creates no
 continuation, queue entry, reservation or other kernel state: nothing
@@ -724,17 +794,28 @@ bound is derived from named constants:
 
 | Operation | Bound (units) |
 |---|---|
+| syscall entry and dispatch, interrupt entry and EOI, exit to user, timer expiry check | `ENTRY_MAX` (const) |
+| yield, exit (`ipc_detach`) | const |
+| identify | const |
+| derive, transfer of one capability, binding (including the SC22a chain check) | `CHAIN_MAX` + const |
+| delete one record (cleanup hook, counters, finaliser or hand-off to the reaper) | `UNIT_MAX` |
+| revocation chunk | `REVOKE_CHUNK`·`UNIT_MAX` |
+| retype | `RETYPE_ZERO_MAX`/64 (zeroing, cache lines) + (`RETYPE_ZERO_MAX`/`MIN_OBJECT`)·const (initialisation and installs) + `CHAIN_MAX` |
+| map, unmap, protect, install, uninstall | const (four table levels; alias counters O(1)) |
+| bind, unbind, resume, suspend, read/write registers, read fault | `TS_COUNT`·`UNIT_MAX` + `sizeof(struct user_regs)` copy |
+| debug write | `DEBUG_WRITE_MAX` copy + output |
 | send, call, reply | `MSG_MAX_WORDS` + `MSG_MAX_CAPS`·(derive) + const |
-| recv drain chunk, `reply_recv` | `DRAIN_CHUNK`·(`MSG_MAX_CAPS`·2) + one send's bound |
+| receive drain chunk, `reply_recv` final chunk | `DRAIN_CHUNK`·(2·`MSG_MAX_CAPS`) + one send's bound |
 | signal, wait, poll | const |
-| derive, delete, identify, binding | const (SC17-SC20) |
-| `cap_revoke` | `REVOKE_MAX`·(deletion) |
-| retype | `RETYPE_ZERO_MAX`/64 (zeroing, in cache lines) + `RETYPE_ZERO_MAX`/`MIN_OBJECT` (initialisation) |
-| map, unmap, protect, install | const (four table levels) |
-| AddressSpace / PageTable teardown | 512 entries per table (V15) |
-| thread operations | `TS_COUNT` bindings + const |
-| debug write | `DEBUG_WRITE_MAX` |
-| scheduler transitions, timer handling | const |
+| fault delivery (P67-P69) | `FAULT_WORDS` + const |
+| scheduler transitions | const |
+| reaper chunk | `REAP_CHUNK`·`UNIT_MAX` |
+
+Where `CHAIN_MAX` = `UNTYPED_BOOT_MAX_BITS - UNTYPED_MIN_BITS`, and
+`UNIT_MAX` = 512 entries plus a constant (the largest finaliser). Every
+syscall of ADR 0008 and 0009, every interrupt and exception entry, and
+both kinds of kernel-owned work (reaper, timer) appear in this table.
+Audit, rescans and `runq_contains` are test-build only and excluded.
 
 P37's two named exceptions become the bounded rows of this table:
 wake-all through the reaper, the drain through SC25. P37 is amended to
@@ -750,11 +831,77 @@ point here. **I-B1 is closed by SC26 and SC29.**
 - **Tests of the worst cases:**
   - largest messages
   - full drains
-  - maximum revoke budgets
+  - full revocation chunks
   - maximum retype spans
   - full reaper chunks
 - **Code review rule.** Every such loop cites the SC26 row that bounds
   it. A loop with no row is a defect.
+
+## Progress
+
+**SC30. Every long operation has a progress measure.** Each operation
+names a non-negative quantity that every non-final step strictly
+decreases, and that nothing outside the operation can increase. So no
+step is repeated over the same state, and the operation finishes after
+at most that many steps:
+
+| Operation | Measure | Why it cannot grow |
+|---|---|---|
+| Revocation (SC22) | records in the target's subtree | the derivation freeze (SC22a): no record enters while it runs |
+| Reaper (SC24) | total units of all listed objects: doomed waiters, plus occupied slots of dying CNodes, plus descendants of their frozen Untypeds | doomed queues cannot gain waiters (a count at 0 stays at 0); a dying CNode is unreachable, so nothing can be placed in it; its Untypeds are frozen; a unit that lists a new object adds that object's units behind, not to any earlier object |
+| Receive drain (SC25) | for each queued sender, its position in the queue | each chunk removes senders only at the head, never re-examines a failed sender (I-E2), and new senders join behind |
+
+The receive drain is different, and stated exactly. It ends as soon as a
+deliverable sender reaches the head, or the queue is empty. A deliverable
+sender queued at position k is reached within ⌈k/`DRAIN_CHUNK`⌉ chunks.
+If every arriving sender is undeliverable (for example, holders of WRITE
+capabilities who keep sending capabilities the receiver does not
+accept), the receive keeps failing them on its own quanta and does not
+complete. That is the same outcome as a one-pass receive that blocks
+waiting for a deliverable message, except that it spends the receiver's
+own time rather than none. It never takes more than one round-robin share
+of the CPU, so no third party is affected (SC14).
+
+## Implementation gates
+
+**SC31. Checks that only code can pass.** Some properties of this ADR
+are about the implementation, not the design. Each stage of the
+implementation order is complete only when its gate passes:
+1. **CDT correspondence (stage 1).** Every CDT function names, in a
+   comment, the proof step of SC20 it implements, and does nothing else
+   to the list. After every CDT operation in the test suite, the bracket
+   list is compared with a reference forest maintained by the test,
+   including the revision-2 counterexample and random sequences.
+2. **No positional finality (stages 1-2).** "Last record" is decided
+   only by the live-record count (SC19a).
+   - A build check script (like `scripts/check-stac.sh`) fails if
+     `is_final`, `cap_object_first`, or a same-object neighbour
+     comparison reappears in kernel sources.
+   - A mutant that decides finality from list position must be caught.
+3. **Counters in the commit (stage 2).** Every counter change sits in the
+   same commit function as its record or mapping change.
+   - The rescan comparison runs after every audited step.
+   - There is one mutant per mutation site (derive, install, binding,
+     map, unmap, delete, hand-off to the reaper), each of which must be
+     caught.
+4. **The revocation pre-scan mutant (stage 1).** With the test subtree of
+   SC22 (at least 4·W units), reintroducing an end-of-subtree scan before
+   the first deletion must exceed W on the work counter.
+
+## Pre-acceptance audit (revision 3b)
+
+The review's checklist, and what this revision does about each item:
+
+| # | Item | Result |
+|---|---|---|
+| 1 | CDT proof matches the list operations | Design: the operations table of SC20 is exactly the proof's steps. Code: gate SC31.1 |
+| 2 | Last capability only by count; no positional logic | Design: SC19a, I-SC8, contiguity removed. Code: gate SC31.2 |
+| 3 | Every counter change in the same commit as its table change | Design: C4, C5. Code: gate SC31.3 |
+| 4 | Dying accounting never half-committed | **Changed:** R0 is now a transaction, with before/after states, plus teardown and authority-loss transactions |
+| 5 | Reaper work bounded by `REAP_CHUNK` | **Changed:** a unit is defined, including the Untyped-in-dying-CNode case (today unbounded), and costs at most `UNIT_MAX` |
+| 6 | Every cursor has a progress measure and cannot repeat forever | **Failed for revocation, fixed:** SC22, SC22a, SC30. Reaper and drain measures stated; the drain's behaviour under endless undeliverable senders made explicit |
+| 7 | Every operation's work represented in W | **Changed:** SC26 now lists every syscall, every entry kind and all kernel-owned work, with `CHAIN_MAX` and `UNIT_MAX` |
+| 8 | The revoke pre-scan mutant is caught | Design: test subtree at least 4·W units. Code: gate SC31.4 |
 
 ## Queue depth
 
@@ -795,7 +942,12 @@ limit:
   - the CDT is a balanced-bracket list (SC20)
   - `struct cap` grows to 128 bytes (SC20a)
   - deletion and revocation are O(1) per record
-- **ADR 0008 T36:** satisfied by SC14 once its tests pass.
+- **ADR 0008:**
+  - T36 is satisfied by SC14 once its tests pass
+  - the syscall table: `SYS_CAP_REVOKE` loses its budget argument and
+    returns only when the revocation is complete (SC22)
+- **ADR 0003:** "revocation is preemptible and restartable" is realised
+  as a thread continuation with a derivation freeze (SC22, SC22a).
 - **ADR 0005:** unchanged; this ADR realises its per-CPU idle thread and
   run queue.
 
@@ -826,11 +978,11 @@ limit:
    - repeated deletion and re-derivation into the same slots
    - deleting a record whose descendants survive
    - derivations across several CNodes and cspaces
-   - revocation by first-child deletion with budget 1, checking the tree
-     after every step
-   - object contiguity and the "last record" test after random derive
-     and delete sequences, compared against a reference forest kept by
-     the test
+   - revocation by first-child deletion, checking the tree after every
+     deletion
+   - the live-record count and the "last record" decision after random
+     derive and delete sequences, compared against a reference forest
+     and reference counts kept by the test
    - all existing CDT, revocation and transfer-conservation tests
 8. **Continuations (SC16, SC25):**
    - drains of more than `DRAIN_CHUNK` undeliverable senders: results
@@ -860,6 +1012,12 @@ limit:
 12. **Queues (SC29):** 0, 1 and many threads.
 13. **Serials (SC21):** a forced near-exhaustion counter makes creation
     fail with `T_ENOMEM` and never reuses a serial.
+14. **The derivation freeze (SC22a):** during a revocation, derive,
+    transfer, binding and retype from the frozen object or from any
+    object on a frozen carving chain return `T_EBUSY` with nothing
+    changed; other objects are unaffected; the flag clears on completion
+    and on abandonment; a second revocation on the same object gets
+    `T_EBUSY`.
 
 ### Planned mutants
 
@@ -902,8 +1060,15 @@ limit:
   - missed on derive, delete, binding, mapping or unmapping
   - changed by a failed operation or a parentage change
   - overflow not refused
+- Freeze:
+  - not set by revocation
+  - not checked on one of derive, transfer, binding or retype
+  - a carving chain not walked
+  - not cleared on abandonment
+- Progress:
+  - the drain re-examining a failed sender
+  - the reaper tearing down an Untyped in a dying CNode in one unit
 - Limits:
-  - a revoke budget of 0 unlimited
   - a retype above `RETYPE_ZERO_MAX` accepted
   - serial wraparound reused
   - any chunk constant removed (caught by the work counter)
@@ -912,17 +1077,21 @@ limit:
 
 Each stage keeps every existing test passing before the next begins.
 1. **`struct cap` to 128 bytes and the bracket-list CDT** (SC20, SC20a),
-   with the proof's tests (test 7). First-child revocation and the
-   revoke budget (SC22). This is the riskiest change, so it goes first,
-   with the scheduler untouched.
-2. **Counters and the frame metadata table** (SC17-SC19), checked against
-   the rescan. Remove every O(copies) walk.
+   with the proof's tests (test 7) and gates SC31.1 and SC31.4.
+   Revocation switches to first-child deletion, still one-pass in this
+   stage: the existing API keeps working until stage 5 replaces it. This
+   is the riskiest change, so it goes first, with the scheduler
+   untouched.
+2. **Counters, the frame metadata table and the carving back-pointers**
+   (SC17-SC19a), checked against the rescan (gates SC31.2, SC31.3).
+   Remove every O(copies) walk. Add the derivation freeze check
+   (SC22a).
 3. **Ownership, transitions and the idle thread** (SC1-SC8, SC29), with
    no timer yet.
 4. **Object serials** (SC21), **dying objects and the reaper** (SC23,
    SC24), and the amended O7/O8.
-5. **Thread continuations and the receive drain** (SC16, SC25); the
-   retype limit (SC28).
+5. **Thread continuations,** then the receive drain (SC25) and revocation
+   as a continuation with the freeze (SC22); the retype limit (SC28).
 6. **Timer preemption and the quantum** (SC9-SC14), with the T36 tests.
    Then the work counter (SC27) across the whole suite.
 7. **Mutation testing, review, documentation,** and the amendments
