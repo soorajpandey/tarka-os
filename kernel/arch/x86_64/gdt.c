@@ -27,7 +27,7 @@ struct gdtr {
 /* Dedicated stacks (entry.S) for faults that may fire on a corrupt or
  * overflowed kernel stack. Running the handler on the faulting stack would
  * just fault again. */
-extern char df_stack_top[], nmi_stack_top[];
+extern char df_stack_top[], nmi_stack_top[], mc_stack_top[], kstack_cpu0_top[];
 
 static struct tss tss;
 static uint64_t gdt[7];
@@ -42,6 +42,9 @@ void gdt_init(void)
     memset(&tss, 0, sizeof(tss));
     tss.ist[IST_DOUBLE_FAULT - 1] = (uint64_t)df_stack_top;
     tss.ist[IST_NMI - 1] = (uint64_t)nmi_stack_top;
+    tss.ist[IST_MC - 1] = (uint64_t)mc_stack_top;
+    /* T8: every entry from user mode lands on the per-CPU kernel stack. */
+    tss.rsp[0] = (uint64_t)kstack_cpu0_top;
     /* An iomap_base beyond the TSS limit means no I/O bitmap: ring 3 gets
      * no I/O port access by default. Port access will be granted only via
      * CAP_IOPORT capabilities. */

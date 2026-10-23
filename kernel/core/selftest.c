@@ -20,7 +20,9 @@
 
 #include "../arch/x86_64/cpu.h"
 #include "../arch/x86_64/paging.h"
+#include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/qemu.h"
+#include "../arch/x86_64/stacks.h"
 
 static unsigned checks, failures;
 
@@ -943,12 +945,12 @@ extern const char __text_start[], __text_end[];
 extern const char __rodata_start[], __rodata_end[];
 extern const char __data_start[], __data_end[];
 
-extern char boot_stack_guard[], df_stack_guard[], nmi_stack_guard[];
-
 static bool is_stack_guard(uintptr_t va)
 {
-    return va == (uintptr_t)boot_stack_guard || va == (uintptr_t)df_stack_guard ||
-           va == (uintptr_t)nmi_stack_guard;
+    for (size_t i = 0; i < kstack_count; i++)
+        if (va == (uintptr_t)kstacks[i].guard)
+            return true;
+    return false;
 }
 
 /* Every page in [start, end) must have exactly the expected W and NX bits;
@@ -977,15 +979,53 @@ static void test_wx(void)
 
 static void test_stack_guards(void)
 {
-    extern char boot_stack_top[];
+    extern char boot_stack[], boot_stack_top[];
     uint64_t f;
     char probe;
 
-    CHECK(paging_query((uintptr_t)boot_stack_guard, &f) == -1);
-    CHECK(paging_query((uintptr_t)df_stack_guard, &f) == -1);
-    CHECK(paging_query((uintptr_t)nmi_stack_guard, &f) == -1);
+    CHECK(kstack_count == 5);
+    for (size_t i = 0; i < kstack_count; i++) {
+        CHECK(paging_query((uintptr_t)kstacks[i].guard, &f) == -1);
+        CHECK(kstacks[i].base == kstacks[i].guard + PAGE_SIZE);
+        CHECK((uintptr_t)kstacks[i].top % 16 == 0);
+        CHECK(kstacks[i].budget <= (size_t)(kstacks[i].top - kstacks[i].base) / 2);
+    }
     /* We are running on the guarded boot stack. */
-    CHECK(&probe > boot_stack_guard + PAGE_SIZE && &probe < boot_stack_top);
+    CHECK(&probe > boot_stack && &probe < boot_stack_top);
+}
+
+/* Per-CPU data and extended state groundwork (ADR 0008, T6-T9). */
+static uint8_t xarea_a[XSAVE_AREA_MAX] __aligned(64);
+static uint8_t xarea_b[XSAVE_AREA_MAX] __aligned(64);
+
+static void test_percpu_fpu(void)
+{
+    extern char kstack_cpu0_top[];
+    struct percpu *p = this_cpu();
+
+    CHECK(p != NULL && p->self == p);
+    CHECK(rdmsr(MSR_GS_BASE) == (uint64_t)p);
+    CHECK(rdmsr(MSR_KERNEL_GS_BASE) == 0);     /* user GS base starts at 0 */
+    CHECK(p->kstack_top == (uint64_t)kstack_cpu0_top);
+    CHECK(p->kstack_top % 16 == 0);
+
+    CHECK(!(read_cr0() & (CR0_EM | CR0_TS)));   /* no lazy FPU switching */
+    CHECK(read_cr4() & CR4_OSXSAVE);
+    CHECK(xsave_size > 512 && xsave_size <= XSAVE_AREA_MAX);
+    CHECK((xcr0 & 3) == 3);                     /* x87 and SSE always */
+
+    /* T7: a fresh area loads the architectural initial state. Dirty the
+     * live state first, then restore a fresh area and save it back. */
+    memset(xarea_b, 0x5A, sizeof(xarea_b));
+    fpu_init_area(xarea_a);
+    fpu_restore(xarea_a);
+    fpu_save(xarea_b);
+    CHECK(*(uint16_t *)(xarea_b + 0) == 0x037F);         /* x87 FCW init */
+    CHECK(*(uint32_t *)(xarea_b + 24) == MXCSR_DEFAULT);  /* MXCSR */
+    bool xmm_zero = true;
+    for (size_t i = 160; i < 160 + 16 * 16; i++)          /* XMM0-15 */
+        xmm_zero &= xarea_b[i] == 0;
+    CHECK(xmm_zero);
 }
 
 static void test_cpu_hardening(void)
@@ -1025,6 +1065,7 @@ static const struct {
     { "vspace_teardown", test_vspace_teardown },
     { "w^x", test_wx },
     { "stack_guards", test_stack_guards },
+    { "percpu_fpu", test_percpu_fpu },
     { "cpu_hardening", test_cpu_hardening },
 };
 
@@ -1036,6 +1077,15 @@ __noreturn void selftest_run(void)
         unsigned before = failures;
         tests[i].fn();
         kprintf("  [%s] %s\n", failures == before ? "PASS" : "FAIL", tests[i].name);
+    }
+
+    /* T33: measured worst-case use of every kernel stack, after the
+     * whole suite has run. */
+    for (size_t i = 0; i < kstack_count; i++) {
+        size_t hw = stack_high_water(&kstacks[i]);
+        kprintf("  stack %-12s high water %5zu / budget %5zu bytes\n", kstacks[i].name, hw,
+                kstacks[i].budget);
+        CHECK(hw <= kstacks[i].budget);
     }
 
     kprintf("selftest: %u checks, %u failures\n", checks, failures);

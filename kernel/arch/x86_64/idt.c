@@ -53,6 +53,7 @@ void idt_init(void)
         set_gate(i, isr_table[i], 0);
     set_gate(2, isr_table[2], IST_NMI);
     set_gate(8, isr_table[8], IST_DOUBLE_FAULT);
+    set_gate(18, isr_table[18], IST_MC);
 
     struct idtr idtr = { .limit = sizeof(idt) - 1, .base = (uint64_t)idt };
     __asm__ volatile("lidt %0" : : "m"(idtr));

@@ -24,7 +24,7 @@ _start:
  * the page size so every guard stays page-aligned.
  */
 .macro GUARDED_STACK name, size
-.global \name\()_guard, \name\()_top
+.global \name, \name\()_guard, \name\()_top
 .align 4096
 \name\()_guard:
     .skip 4096
@@ -35,7 +35,9 @@ _start:
 
 .section .bss
 GUARDED_STACK boot_stack, 32768
+GUARDED_STACK kstack_cpu0, 16384   /* TSS.RSP0: entries from user mode (T8) */
 GUARDED_STACK df_stack, 16384
 GUARDED_STACK nmi_stack, 16384
+GUARDED_STACK mc_stack, 16384
 
 .section .note.GNU-stack,"",@progbits

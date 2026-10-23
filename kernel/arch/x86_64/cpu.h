@@ -3,7 +3,14 @@
 
 #include <tarka/types.h>
 
+#define CR0_MP   (1ull << 1)
+#define CR0_EM   (1ull << 2)
+#define CR0_TS   (1ull << 3)
+#define CR0_NE   (1ull << 5)
 #define CR0_WP   (1ull << 16)
+#define CR4_OSFXSR     (1ull << 9)
+#define CR4_OSXMMEXCPT (1ull << 10)
+#define CR4_OSXSAVE    (1ull << 18)
 #define CR4_UMIP (1ull << 11)
 #define CR4_SMEP (1ull << 20)
 #define CR4_SMAP (1ull << 21)
@@ -24,6 +31,21 @@ struct cpu_security {
 extern struct cpu_security cpu_sec;
 
 void cpu_init(void);
+
+/* Extended (FPU/vector) state, ADR 0008 T6/T7. */
+#define XSAVE_AREA_MAX 4096  /* one page per thread */
+#define MXCSR_DEFAULT  0x1F80u
+
+extern uint64_t xcr0;        /* components enabled at boot */
+extern uint32_t xsave_size;  /* bytes XSAVE writes for them */
+
+void fpu_init(void);
+
+/* Prepare `area` (XSAVE_AREA_MAX bytes, 64-byte aligned) so that XRSTOR
+ * loads the architectural initial state (T7). */
+void fpu_init_area(void *area);
+void fpu_save(void *area);
+void fpu_restore(const void *area);
 bool cpu_rdrand64(uint64_t *out);
 
 static inline void outb(uint16_t port, uint8_t v)

@@ -10,7 +10,9 @@
 #include "../arch/x86_64/gdt.h"
 #include "../arch/x86_64/idt.h"
 #include "../arch/x86_64/paging.h"
+#include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/serial.h"
+#include "../arch/x86_64/stacks.h"
 
 /* Limine boot protocol requests. They live in .data so the bootloader can
  * fill in the response pointers, bracketed by start/end markers. */
@@ -69,7 +71,10 @@ __noreturn __no_canary void kmain(void)
     gdt_init();
     idt_init();
     cpu_init();
+    fpu_init();
+    percpu_init();
     stack_guards_init();
+    stacks_paint();
     stack_protector_init(boot_entropy());
     pmm_init(memmap_req.response);
     untyped_boot();

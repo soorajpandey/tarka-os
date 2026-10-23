@@ -6,6 +6,9 @@ struct cpu_security cpu_sec;
 
 /* CPUID feature bits */
 #define CPUID1_ECX_RDRAND   (1u << 30)
+#define CPUID1_ECX_XSAVE    (1u << 26)
+#define CPUID1_EDX_FXSR     (1u << 24)
+#define CPUID1_EDX_SSE2     (1u << 26)
 #define CPUID7_EBX_SMEP     (1u << 7)
 #define CPUID7_EBX_SMAP     (1u << 20)
 #define CPUID7_ECX_UMIP     (1u << 2)
@@ -86,4 +89,82 @@ bool cpu_rdrand64(uint64_t *out)
         }
     }
     return false;
+}
+
+/* ---- extended state (ADR 0008, T6, T7) ---- */
+
+#define XCR0_X87     (1ull << 0)
+#define XCR0_SSE     (1ull << 1)
+#define XCR0_AVX     (1ull << 2)
+#define XCR0_AVX512  (7ull << 5)  /* opmask, ZMM_Hi256, Hi16_ZMM */
+
+uint64_t xcr0;
+uint32_t xsave_size;
+
+static inline void xsetbv(uint32_t idx, uint64_t v)
+{
+    __asm__ volatile("xsetbv" : : "c"(idx), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+void fpu_init(void)
+{
+    uint32_t a, b, c, d;
+
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(d & CPUID1_EDX_FXSR) || !(d & CPUID1_EDX_SSE2) || !(c & CPUID1_ECX_XSAVE))
+        panic("CPU lacks FXSR/SSE2/XSAVE; refusing to boot without full context switching");
+
+    /* FPU present and owned by whoever runs: no lazy switching (EM, TS
+     * clear), native error reporting (NE). */
+    write_cr0((read_cr0() & ~(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE);
+    write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE);
+
+    cpuid(0xD, 0, &a, &b, &c, &d);
+    uint64_t supported = ((uint64_t)d << 32) | a;
+    uint64_t want = supported & (XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512);
+
+    /* AVX-512 only as a whole, and only if the area still fits in a page. */
+    if ((want & XCR0_AVX512) != XCR0_AVX512)
+        want &= ~XCR0_AVX512;
+    for (;;) {
+        xsetbv(0, want);
+        cpuid(0xD, 0, &a, &b, &c, &d);
+        if (b <= XSAVE_AREA_MAX)
+            break;
+        if (want & XCR0_AVX512)
+            want &= ~XCR0_AVX512;
+        else if (want & XCR0_AVX)
+            want &= ~XCR0_AVX;
+        else
+            panic("XSAVE area for x87+SSE exceeds %u bytes", XSAVE_AREA_MAX);
+    }
+    xcr0 = want;
+    xsave_size = b;
+    kprintf("fpu: xcr0=%#lx (x87 SSE%s%s), xsave area %u bytes, eager switching\n", xcr0,
+            (xcr0 & XCR0_AVX) ? " AVX" : "", (xcr0 & XCR0_AVX512) ? " AVX-512" : "", xsave_size);
+}
+
+void fpu_init_area(void *area)
+{
+    uint8_t *p = area;
+
+    for (size_t i = 0; i < XSAVE_AREA_MAX; i++)
+        p[i] = 0;
+    /* XSTATE_BV = 0 in the header (offset 512) makes XRSTOR load the
+     * initial state of every component. MXCSR (offset 24) is loaded from
+     * the legacy area regardless, so give it its architectural default
+     * rather than 0 (which would unmask every SIMD exception). */
+    *(uint32_t *)(p + 24) = MXCSR_DEFAULT;
+}
+
+void fpu_save(void *area)
+{
+    __asm__ volatile("xsave64 (%0)" : : "r"(area), "a"((uint32_t)xcr0),
+                     "d"((uint32_t)(xcr0 >> 32)) : "memory");
+}
+
+void fpu_restore(const void *area)
+{
+    __asm__ volatile("xrstor64 (%0)" : : "r"(area), "a"((uint32_t)xcr0),
+                     "d"((uint32_t)(xcr0 >> 32)) : "memory");
 }

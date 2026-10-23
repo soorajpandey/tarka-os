@@ -11,6 +11,7 @@
 
 #define IST_DOUBLE_FAULT 1
 #define IST_NMI          2
+#define IST_MC           3
 
 void gdt_init(void);
 

@@ -1,6 +1,7 @@
 #include "paging.h"
 
 #include "cpu.h"
+#include "stacks.h"
 
 #include <tarka/kernel.h>
 
@@ -37,15 +38,11 @@ int paging_unmap_4k(uint64_t va)
     return 0;
 }
 
-extern char boot_stack_guard[], df_stack_guard[], nmi_stack_guard[];
-
 void stack_guards_init(void)
 {
-    char *const guards[] = { boot_stack_guard, df_stack_guard, nmi_stack_guard };
-
-    for (size_t i = 0; i < ARRAY_SIZE(guards); i++) {
-        if (paging_unmap_4k((uint64_t)(uintptr_t)guards[i]) != 0)
-            panic("cannot unmap stack guard page %p", guards[i]);
+    for (size_t i = 0; i < kstack_count; i++) {
+        if (paging_unmap_4k((uint64_t)(uintptr_t)kstacks[i].guard) != 0)
+            panic("cannot unmap guard page of %s", kstacks[i].name);
     }
 }
 
