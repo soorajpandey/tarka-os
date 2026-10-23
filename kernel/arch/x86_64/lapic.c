@@ -24,6 +24,7 @@
 #define R_ICR_HI   0x31
 #define R_LVT_TMR  0x32
 #define R_TMR_INIT 0x38
+#define R_TMR_CUR  0x39
 #define R_TMR_DIV  0x3E
 
 #define ICR_FIXED    0u
@@ -43,6 +44,13 @@ static void wr(unsigned reg, uint64_t v)
         wrmsr(0x800 + reg, v);
     else
         mmio[reg << 2] = (uint32_t)v;
+}
+
+static uint32_t rd(unsigned reg)
+{
+    if (x2)
+        return (uint32_t)rdmsr(0x800 + reg);
+    return mmio[reg << 2];
 }
 
 static void icr(uint32_t lo)
@@ -73,8 +81,6 @@ bool lapic_init(void)
             return false;
     }
     wr(R_SVR, (1u << 8) | VEC_SPURIOUS);   /* software enable */
-    wr(R_TMR_DIV, 0x3);                    /* divide by 16 */
-    wr(R_LVT_TMR, LVT_MASKED | VEC_TIMER);
     present = true;
     kprintf("lapic: %s enabled\n", x2 ? "x2APIC" : "xAPIC (MMIO)");
     return true;
@@ -103,14 +109,35 @@ volatile uint32_t *lapic_icr_lo_mmio(void)
     return x2 ? NULL : &mmio[R_ICR_LO << 2];
 }
 
-void lapic_timer_oneshot(uint32_t count)
+void lapic_timer_setup(void)
 {
-    wr(R_LVT_TMR, VEC_TIMER);       /* unmasked, one-shot */
-    wr(R_TMR_INIT, count);
+    KASSERT(present);
+    wr(R_TMR_DIV, 0x3);                       /* divide by 16 */
+    lapic_timer_stop();
+}
+
+void lapic_timer_arm(uint32_t count)
+{
+    KASSERT(present && count > 0);            /* 0 would mean "stopped" */
+    wr(R_LVT_TMR, VEC_TIMER);                 /* unmasked, one-shot */
+    wr(R_TMR_INIT, count);                    /* starts the count */
 }
 
 void lapic_timer_stop(void)
 {
-    wr(R_TMR_INIT, 0);
+    KASSERT(present);
+    wr(R_TMR_INIT, 0);                        /* stops it; the count reads 0 */
     wr(R_LVT_TMR, LVT_MASKED | VEC_TIMER);
+}
+
+uint32_t lapic_timer_count(void)
+{
+    KASSERT(present);
+    return rd(R_TMR_CUR);
+}
+
+uint32_t lapic_timer_divide(void)
+{
+    KASSERT(present);
+    return rd(R_TMR_DIV) & 0xB;   /* bits 0, 1 and 3 */
 }

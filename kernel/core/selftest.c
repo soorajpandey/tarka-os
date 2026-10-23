@@ -2208,9 +2208,9 @@ static void test_entry_paths(void)
     uint64_t uirqs = entry_obs.user_irqs, viol = entry_obs.violations;
     CHECK(ut_setup(20));
     CHECK(spawn(10, P(spin), false, NULL));
-    lapic_timer_oneshot(20000);
+    CHECK(sched_test_timer_arm(20000) == T_OK);   /* H1: through the timer's owner */
     run_user();
-    lapic_timer_stop();
+    CHECK(sched_test_timer_stop() == T_OK);
     CHECK(entry_obs.user_irqs >= uirqs + 1 && entry_obs.last_user_irq == VEC_TIMER);
     CHECK(test_report_count == 1 && test_reports[0].a == 20000000);
     CHECK(entry_obs.violations == viol);
@@ -6545,13 +6545,15 @@ static void halt_wake_case(uint8_t vector)
     entry_obs.kernel_irq_rip = 0;
     entry_obs.kernel_irq_vector = 0;
     entry_obs.kernel_irq_in_idle = 0;
-    sched_wake_armed = true;
+    if (vector == VEC_TEST_IPI)
+        sched_wake_armed = true;
     if (vector == VEC_TEST_IPI)
         lapic_self_ipi(VEC_TEST_IPI);     /* pending before the halt */
-    else
-        lapic_timer_oneshot(100000);      /* fires after it */
+    else {
+        sched_test_wake(100000);          /* armed by idle, fires after the HLT */
+        CHECK(lapic_timer_count() == 0);  /* ... and not before */
+    }
     run_user();
-    lapic_timer_stop();
     CHECK(!sched_wake_armed && sched_idle_halts == h + 1 && sched_idle_wakes == w + 1);
     CHECK(entry_obs.kernel_irqs == k + 1 && entry_obs.kernel_irq_vector == vector);
     CHECK(entry_obs.kernel_irq_rip == (uint64_t)(uintptr_t)idle_hlt_resume);
@@ -6693,7 +6695,32 @@ static void test_sched_audit_detects(void)
     CHECK(!AUDIT());
     this_cpu()->current = idle;
     CHECK(AUDIT());
+    /* A2 (T36-2): the timer state. */
+    struct sched_timer *tm = sched_timer_raw(), keep = *tm;
+    tm->armed = 1;                        /* a quantum owned by nobody */
+    CHECK(!AUDIT());
+    tm->owner = idle;                     /* ... or by the idle thread */
+    tm->owner_gen = tm->dispatch_gen;
+    CHECK(!AUDIT());
+    *tm = keep;
+    tm->owner = a;                        /* an owner remembered, none running */
+    CHECK(!AUDIT());
+    *tm = keep;
+    tm->owner_gen = tm->dispatch_gen + 1; /* a generation from the future */
+    CHECK(!AUDIT());
+    *tm = keep;
+    CHECK(AUDIT());
     CHECK(sched_dispatch() == a);
+    tm->armed = 1;                        /* owned by current, but an old dispatch */
+    tm->owner = a;
+    tm->owner_gen = tm->dispatch_gen - 1;
+    CHECK(!AUDIT());
+    tm->owner_gen = tm->dispatch_gen;     /* the right owner and generation */
+    CHECK(AUDIT());
+    tm->owner = b;                        /* the wrong thread, right generation */
+    CHECK(!AUDIT());
+    *tm = keep;
+    tm->dispatch_gen++;                   /* (keep the count the dispatch made) */
     this_cpu()->current = idle;           /* RUNNING but not current */
     CHECK(!AUDIT());
     this_cpu()->current = a;
@@ -6703,10 +6730,178 @@ static void test_sched_audit_detects(void)
     ut_teardown();
 }
 
+/* ---- The quantum timer (ADR 0010 revision 3g, stage 6 layer 1) ---- */
+
+static void spin_cycles(uint64_t n)
+{
+    uint64_t end = rdtsc() + n;
+
+    while (rdtsc() < end)
+        __asm__ volatile("pause");
+}
+
+/* Interrupts taken in one bounded window (H6's shape, used as a probe). */
+static uint64_t irq_window(void)
+{
+    uint64_t k = entry_obs.kernel_irqs;
+
+    __asm__ volatile("sti; nop; cli" ::: "memory");
+    return entry_obs.kernel_irqs - k;
+}
+
+/* Open windows until one interrupt arrives or the TSC budget runs out;
+ * how many arrived. */
+static uint64_t irq_wait(uint64_t max_cycles)
+{
+    uint64_t end = rdtsc() + max_cycles, n = 0;
+
+    while (!n && rdtsc() < end)
+        n = irq_window();
+    return n;
+}
+
+static bool count_reaches_zero(uint64_t max_cycles)
+{
+    uint64_t end = rdtsc() + max_cycles;
+
+    while (lapic_timer_count() != 0)
+        if (rdtsc() > end)
+            return false;
+    return true;
+}
+
+#define TMR_LONG  1000000000u   /* never runs out within a test */
+#define TMR_SHORT 1000u
+#define TMR_WAIT  2000000000ull /* TSC cycles: generous upper bound */
+
+/* H1: from boot the timer is the scheduler's, set up and stopped. Runs
+ * first, before any test opens an interrupt window: nothing has had IF set
+ * since boot, so any timer interrupt raised since setup is still pending
+ * and the window shows it. */
+static void test_timer_boot(void)
+{
+    CHECK(lapic_present());
+    if (!lapic_present())
+        return;
+    CHECK(sched_boot_timer_count == 0 && lapic_timer_divide() == 0x3);
+    spin_cycles(2000000);
+    CHECK(lapic_timer_count() == 0 && irq_window() == 0);
+}
+
+/* The hardware semantics A4 depends on, pinned down through the
+ * scheduler's test API (H1). Nothing here may change the scheduler's own
+ * timer state: the hardware tells the scheduler nothing by itself. */
+static void test_timer_hw(void)
+{
+    struct sched_timer before, after;
+
+    CHECK(lapic_present());
+    if (!lapic_present())
+        return;
+    sched_timer_get(&before);
+    CHECK(!before.armed && !before.owner);
+
+    /* The divider is still the boot one: the unit of Q3. */
+    CHECK(lapic_timer_divide() == 0x3);
+
+    /* Stopped: the count reads 0, and nothing is raised. */
+    CHECK(sched_test_timer_stop() == T_OK);
+    CHECK(lapic_timer_count() == 0 && irq_window() == 0);
+
+    /* Armed: the count starts at most at n and only ever goes down. */
+    CHECK(sched_test_timer_arm(TMR_LONG) == T_OK);
+    uint32_t c0 = lapic_timer_count(), prev = c0;
+    CHECK(c0 > 0 && c0 <= TMR_LONG);
+    bool down = true;
+    for (int i = 0; i < 16; i++) {
+        spin_cycles(200000);
+        uint32_t c = lapic_timer_count();
+        down &= c <= prev;
+        prev = c;
+    }
+    CHECK(down && prev < c0 && prev > 0);
+
+    /* Armed again: the count restarts from the new n. */
+    CHECK(sched_test_timer_arm(TMR_LONG) == T_OK);
+    uint32_t c2 = lapic_timer_count();
+    CHECK(c2 > prev && c2 <= TMR_LONG);
+
+    /* Stopped mid-count: reads 0, stays 0, and never raises. */
+    CHECK(sched_test_timer_stop() == T_OK);
+    CHECK(lapic_timer_count() == 0);
+    spin_cycles(2000000);
+    CHECK(lapic_timer_count() == 0 && irq_window() == 0);
+
+    /* Run out: one interrupt, on the timer vector; the count stays at 0
+     * and is not reloaded (one-shot). */
+    CHECK(sched_test_timer_arm(TMR_SHORT) == T_OK);
+    CHECK(count_reaches_zero(TMR_WAIT));
+    CHECK(irq_wait(TMR_WAIT) == 1 && entry_obs.kernel_irq_vector == VEC_TIMER);
+    spin_cycles(2000000);
+    CHECK(lapic_timer_count() == 0 && irq_window() == 0);
+
+    /* Stopping does not withdraw an interrupt already raised. */
+    CHECK(sched_test_timer_arm(TMR_SHORT) == T_OK);
+    CHECK(count_reaches_zero(TMR_WAIT));
+    spin_cycles(2000000);                 /* raised by now */
+    CHECK(sched_test_timer_stop() == T_OK);
+    CHECK(lapic_timer_count() == 0);
+    CHECK(irq_wait(TMR_WAIT) == 1 && entry_obs.kernel_irq_vector == VEC_TIMER);
+
+    /* The stale case A4 rests on: an interrupt raised by an earlier arming
+     * is delivered after a new arming, and finds a nonzero count. */
+    CHECK(sched_test_timer_arm(TMR_SHORT) == T_OK);
+    CHECK(count_reaches_zero(TMR_WAIT));
+    spin_cycles(2000000);
+    CHECK(sched_test_timer_arm(TMR_LONG) == T_OK);
+    CHECK(irq_wait(TMR_WAIT) == 1 && entry_obs.kernel_irq_vector == VEC_TIMER);
+    CHECK(lapic_timer_count() > 0);
+    CHECK(sched_test_timer_stop() == T_OK);
+    CHECK(irq_window() == 0);
+
+    /* While a quantum runs, the tests may not program the timer: refused,
+     * and the hardware untouched. */
+    struct sched_timer *tm = sched_timer_raw();
+    tm->armed = 1;
+    CHECK(sched_test_timer_arm(TMR_LONG) == T_EBUSY && lapic_timer_count() == 0);
+    CHECK(sched_test_timer_stop() == T_EBUSY);
+    tm->armed = 0;
+    CHECK(sched_test_timer_arm(0) == T_EINVAL && lapic_timer_count() == 0);
+
+    /* None of this touched the scheduler's state: armed is authoritative,
+     * the count is not. */
+    sched_timer_get(&after);
+    CHECK(memcmp(&before, &after, sizeof(after)) == 0);
+}
+
+/* A2: dispatch_gen counts non-idle dispatches, and only those; no layer-1
+ * path arms a quantum. */
+static void test_timer_state(void)
+{
+    struct sched_timer a, b;
+
+    sched_timer_get(&a);
+    run_user();   /* nothing to run: idle dispatches only */
+    sched_timer_get(&b);
+    CHECK(b.dispatch_gen == a.dispatch_gen && !b.armed && AUDIT());
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL) && spawn(20, P(hello), false, NULL));
+    unsigned n0 = sched_trace_n;
+    sched_timer_get(&a);
+    run_user();
+    sched_timer_get(&b);
+    CHECK(sched_trace_n - n0 >= 2);
+    CHECK(b.dispatch_gen - a.dispatch_gen == sched_trace_n - n0);
+    CHECK(!b.armed && !b.owner && b.owner_gen == 0 && AUDIT());
+    ut_teardown();
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
 } tests[] = {
+    { "timer_boot", test_timer_boot },   /* first: before any interrupt window */
     { "printf", test_printf },
     { "string", test_string },
     { "overflow_helpers", test_overflow_helpers },
@@ -6798,6 +6993,8 @@ static const struct {
     { "sched_idle_reap", test_sched_idle_reap },
     { "sched_fair_cont", test_sched_fair_cont },
     { "sched_audit_detects", test_sched_audit_detects },
+    { "timer_hw", test_timer_hw },
+    { "timer_state", test_timer_state },
     { "cpu_hardening", test_cpu_hardening },
 };
 

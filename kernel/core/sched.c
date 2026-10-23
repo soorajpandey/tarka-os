@@ -14,11 +14,13 @@
 #include <tarka/string.h>
 #include <tarka/vspace.h>
 
+#include "../arch/x86_64/lapic.h"
 #include "../arch/x86_64/percpu.h"
 
 /* Per-CPU scheduling data: the run queue (FIFO, intrusive through the
  * TCB's rq links) and the idle thread. */
 #ifdef TARKA_SELFTEST
+uint32_t sched_boot_timer_count = UINT32_MAX;
 const struct thread *sched_trace[SCHED_TRACE_MAX];
 unsigned sched_trace_n;
 #endif
@@ -27,6 +29,11 @@ struct sched_cpu {
     struct thread *rq_head, *rq_tail;
     uint32_t       rq_len;
     uint32_t       reserved;
+    struct sched_timer timer;   /* A2: the quantum timer's owner */
+#ifdef TARKA_SELFTEST
+    uint32_t       test_wake;   /* ticks for the idle thread's next halt */
+    uint32_t       test_reserved;
+#endif
     struct thread  idle;   /* SC5: kernel-owned, never addressable */
 };
 
@@ -103,6 +110,15 @@ void sched_boot(void)
     c->idle.state = THREAD_IDLE;
     c->idle.home_cpu = this_cpu()->cpu_id;
     this_cpu()->current = &c->idle;   /* SC2: never NULL from here on */
+    /* H1: the scheduler owns the timer from boot: set up, stopped, and no
+     * quantum running. */
+    memset(&c->timer, 0, sizeof(c->timer));
+    if (lapic_present()) {
+        lapic_timer_setup();
+#ifdef TARKA_SELFTEST
+        sched_boot_timer_count = lapic_timer_count();
+#endif
+    }
 }
 
 void sched_thread_init(struct thread *t)
@@ -254,6 +270,7 @@ struct thread *sched_dispatch(void)
     rq_remove(t);
     t->state = THREAD_RUNNING;
     this_cpu()->current = t;
+    c->timer.dispatch_gen++;   /* A2: counts non-idle dispatches only */
 #ifdef TARKA_SELFTEST
     if (sched_trace_n < SCHED_TRACE_MAX)
         sched_trace[sched_trace_n] = t;
@@ -279,6 +296,53 @@ bool runq_contains(const struct thread *t)
 const struct thread *runq_first(void)
 {
     return this_sched()->rq_head;
+}
+
+void sched_timer_get(struct sched_timer *out)
+{
+    *out = this_sched()->timer;
+}
+
+struct sched_timer *sched_timer_raw(void)
+{
+    return &this_sched()->timer;
+}
+
+/* The hardware is a quantum's while one runs: the tests may not touch it. */
+int sched_test_timer_arm(uint32_t count)
+{
+    if (this_sched()->timer.armed)
+        return T_EBUSY;
+    if (count == 0)
+        return T_EINVAL;
+    lapic_timer_arm(count);
+    return T_OK;
+}
+
+int sched_test_timer_stop(void)
+{
+    if (this_sched()->timer.armed)
+        return T_EBUSY;
+    lapic_timer_stop();
+    return T_OK;
+}
+
+void sched_test_wake(uint32_t ticks)
+{
+    KASSERT(ticks > 0);
+    this_sched()->test_wake = ticks;
+    sched_wake_armed = true;
+}
+
+void sched_idle_arm_test_wake(void)
+{
+    struct sched_cpu *c = this_sched();
+
+    KASSERT(sched_current() == &c->idle && !c->timer.armed);
+    if (c->test_wake) {
+        lapic_timer_arm(c->test_wake);
+        c->test_wake = 0;
+    }
 }
 
 const struct thread *runq_last(void)

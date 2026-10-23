@@ -1680,10 +1680,15 @@ item and an amendment differ, the amendment holds.
   The pending interrupt is then delivered at the next ring-3 or idle
   window, and is stale: it is ignored under A4.
 - **If the thread is still RUNNING,** it returns to ring 3 without a
-  dispatch. IRETQ and SYSRET set IF with no interrupt shadow, so the
-  pending interrupt is taken before any ring-3 instruction runs. The
-  thread is preempted by A4 having run no user instructions in the
-  expired quantum.
+  dispatch.
+  - **The invariant:** an expired quantum executes no further user
+    instruction before the scheduling boundary.
+  - **On x86-64** this follows from IRETQ and SYSRET setting IF with no
+    interrupt shadow: the pending interrupt is taken before the first
+    ring-3 instruction, and A4 preempts the thread. That is an
+    architectural consequence, so stage 6 tests it (layer 3: a user
+    counter that must not advance after an in-kernel expiry), and does
+    not assume it.
 - **A thread with a continuation** never reaches ring 3 while its
   continuation is pending. Each chunk ends with `sched_yield` (G6), so
   the case above applies only after its final chunk.
@@ -2970,3 +2975,69 @@ wake, then the transition tests and the mutation audit.
   - The release build is checked separately: `make test` builds only
     the test kernel, and a test-only variable broke the release build
     once during the stage.
+
+**Stage 6 (in progress).** Revision 3g, in the layers of H9; each layer
+is reviewed before the next begins.
+- **Layer 1: the timer interface and its ownership (H1, A2).** No
+  quantum is armed yet, and nothing preempts.
+  - **The arch layer** (`lapic.c`) is mechanics only:
+    `lapic_timer_setup`, `_arm(n > 0)`, `_stop`, `_count` and `_divide`.
+    `lapic.h` states the semantics:
+    - arming is one-shot from n down to 0, raising one interrupt there
+    - re-arming restarts the count
+    - stopping reads 0 and raises nothing more, but does not withdraw an
+      interrupt already raised
+    - a count of 0 is the same whether the timer ran out or was stopped
+
+    The arch layer knows nothing of threads, quanta or owners.
+  - **`sched.c` holds the per-CPU A2 state:** `armed`, `owner`,
+    `owner_gen`, `dispatch_gen`.
+    - `sched_boot` sets the timer up stopped, dividing by 16.
+    - `dispatch_gen` counts non-idle dispatches.
+    - The test API (`sched_test_timer_arm`/`_stop`) returns `T_EBUSY`
+      while a quantum is running.
+    - A test timer wake (`sched_test_wake`) is armed by the idle thread
+      itself, immediately before it halts.
+  - **The gate** (`check-sched.sh`): programming the timer (setup, arm,
+    stop) is allowed only in `sched.c`, and the self-tests are not
+    exempt. Reading the count or divider is allowed only in `sched.c`
+    and the self-tests. It was shown to catch programming from core,
+    arch and test code, and to allow the permitted reads.
+  - **The audit (T36-2):**
+    - with a quantum armed, the owner is `current`, RUNNING, non-idle,
+      for the latest dispatch generation
+    - with none armed, no owner or generation is remembered, so no
+      stale owner pointer survives
+  - **Tests:**
+    - `timer_boot` runs first, before any interrupt window: stopped
+      since boot, dividing by 16, nothing pending
+    - `timer_hw` pins the semantics A4 relies on: a count that only
+      decreases; re-arming restarts it; stopping reads 0 and raises
+      nothing; running out raises exactly one interrupt and is not
+      reloaded; stopping does not withdraw a raised interrupt; and the
+      stale case, where a raised interrupt is delivered after a re-arm
+      and finds a nonzero count. It also checks that the scheduler's
+      state is untouched: `armed` is authoritative, the count is not.
+    - `timer_state`: `dispatch_gen` counts exactly the non-idle
+      dispatches
+    - `sched_audit_detects`: six timer-state corruptions
+    - the two old users of the timer (`entry_paths`, `sched_halt_wake`)
+      now go through the scheduler
+  - **Mutation testing (SC31.6), 22 mutants,** as built and with the
+    `sched.c` and `lapic.c` assertions disabled. 21 are caught both
+    times.
+    - **`stop_no_mask` is equivalent:** the SDM defines a zero initial
+      count as stopping the timer in every mode, so the LVT mask in
+      `lapic_timer_stop` is defence in depth.
+    - **The first run left seven survivors.** One had a stale pattern.
+      Four exposed missing tests, now added:
+      - the divider was never checked
+      - a timer running from boot went unnoticed
+      - the test API's owner check was untestable as an assertion
+      - a test wake armed by the caller rather than by the idle thread
+        went unnoticed
+      One was a redundant audit clause, now removed. One was a mutant
+      that forged the divider readback, equivalent by construction, now
+      dropped.
+    - The 31 stage 5 mutants were re-run against layer 1: all caught in
+      both modes.

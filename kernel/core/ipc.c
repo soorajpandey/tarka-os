@@ -344,6 +344,17 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
         return false;
     if (!runq_ok(nlive))
         return false;
+    /* A2 (T36-2): a running quantum belongs to `current`, RUNNING, for the
+     * latest dispatch; with none running, no owner is remembered. */
+    struct sched_timer tm;
+    sched_timer_get(&tm);
+    if (tm.reserved)
+        return false;
+    if (tm.armed ? (tm.armed != 1 || tm.owner != cur || cur == idle ||
+                    cur->state != THREAD_RUNNING || tm.owner_gen != tm.dispatch_gen ||
+                    tm.owner_gen == 0)
+                 : (tm.owner != NULL || tm.owner_gen != 0))
+        return false;
 
     for (const struct thread *t = registry; t; t = t->reg_next) {
         /* SC3: a home CPU that exists; runnable or running only there. */

@@ -144,6 +144,7 @@ static __attribute__((noinline)) void idle_wait(void)
         kcont_resume(&idle_cont);   /* to the self-test driver */
     sched_wake_armed = false;
     sched_idle_halts++;
+    sched_idle_arm_test_wake();     /* H1: a timer wake, armed by idle itself */
 #endif
     /* An interrupt taken here returns to idle_hlt_resume. */
     __asm__ volatile("sti\n\thlt\n"

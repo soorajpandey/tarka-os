@@ -56,6 +56,18 @@ struct thread *sched_current(void);
 
 bool runq_empty(void);
 
+/* Per-CPU quantum timer state (ADR 0010 revision 3g A2), kept by sched.c
+ * alone. `armed` is authoritative: the hardware count reads 0 both when a
+ * quantum ran out and when the timer is stopped. A quantum's owner is the
+ * thread together with the generation of the dispatch that armed it. */
+struct sched_timer {
+    uint32_t             armed;          /* a quantum is running */
+    uint32_t             reserved;
+    const struct thread *owner;          /* NULL unless armed */
+    uint64_t             owner_gen;      /* 0 unless armed */
+    uint64_t             dispatch_gen;   /* non-idle dispatches; never reset */
+};
+
 #ifdef TARKA_SELFTEST
 bool runq_contains(const struct thread *t);
 const struct thread *runq_first(void);     /* read-only walk via rq_next */
@@ -74,6 +86,19 @@ extern const struct thread *sched_trace[SCHED_TRACE_MAX];
 extern unsigned sched_trace_n;
 /* `current` handed to the idle thread by sched_release_current(). */
 extern uint64_t sched_handoffs;
+/* The timer state, read-only copy and (for corruption tests) the raw one. */
+void sched_timer_get(struct sched_timer *out);
+struct sched_timer *sched_timer_raw(void);
+/* H1: tests program the timer only through the scheduler, and only while
+ * no quantum is running. */
+__must_check int sched_test_timer_arm(uint32_t count);   /* T_EBUSY, T_EINVAL */
+__must_check int sched_test_timer_stop(void);           /* T_EBUSY */
+/* The count read immediately after the boot-time setup (H1: stopped). */
+extern uint32_t sched_boot_timer_count;
+/* G4, H1: a timer wake for the idle thread. It is armed by the idle
+ * thread itself, immediately before it halts. */
+void sched_test_wake(uint32_t ticks);
+void sched_idle_arm_test_wake(void);
 /* The instruction after the idle loop's HLT (G4). */
 extern const char idle_hlt_resume[];
 /* The reaper's unit count when sched_stop() stopped `sched_stop_watch`

@@ -23,4 +23,19 @@ if [ -n "$hits" ]; then
     echo "$hits" >&2
     exit 1
 fi
-echo "sched: thread state, run queue, home CPU and current written only by sched.c"
+# Revision 3g H1, A2: the quantum timer is scheduler state. Programming
+# the LAPIC timer (setup, arm, stop) is allowed only in sched.c, and the
+# self-tests are not exempt: they go through the scheduler. Reading the
+# count is allowed in sched.c and, to test the hardware's semantics, in
+# the self-tests. lapic.c and lapic.h define them.
+all=$(find kernel -name '*.c' -o -name '*.h' -o -name '*.S' |
+      grep -vE '^kernel/arch/x86_64/lapic\.[ch]$' | sort)
+prog=$(grep -nwE 'lapic_timer_(setup|arm|stop)' $all | grep -v '^kernel/core/sched\.c:' || true)
+readc=$(grep -nwE 'lapic_timer_(count|divide)' $all | grep -vE '^kernel/core/(sched|selftest)\.c:' || true)
+if [ -n "$prog$readc" ]; then
+    echo "H1: the LAPIC timer used outside kernel/core/sched.c:" >&2
+    [ -n "$prog" ] && echo "$prog" >&2
+    [ -n "$readc" ] && echo "$readc" >&2
+    exit 1
+fi
+echo "sched: thread state, run queue, home CPU, current and the timer owned by sched.c"
