@@ -106,8 +106,11 @@ static void destroy_slot(struct cap *c)
     cdt_remove(c);
     cdt_generation++;
     /* Clear the slot before the finaliser runs so nothing can observe or
-     * reuse a half-deleted capability. */
+     * reuse a half-deleted capability. The pending-drain link is not part
+     * of the capability: it belongs to the CNode the slot lives in. */
+    uint64_t link = c->pending_link;
     memset(c, 0, sizeof(*c));
+    c->pending_link = link;
 
     if (final && finalisers[type])
         finalisers[type](type, object);
@@ -176,6 +179,7 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
     if (c->type != CAP_NULL)
         return T_EBUSY;
 
+    KASSERT(c->pending_link == 0);
     memset(c, 0, sizeof(*c));
     c->type = type;
     c->rights = rights;
@@ -240,6 +244,7 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
         return T_EPERM;
 
 
+    KASSERT(d->pending_link == 0);
     memset(d, 0, sizeof(*d));
     d->type = s->type;
     d->object = s->object;

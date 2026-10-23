@@ -615,6 +615,51 @@ static void test_untyped_revoke(void)
     CHECK(frames_conserved());
 }
 
+/* T33: deleting nested CNodes uses constant kernel stack. */
+static void test_cnode_chain(void)
+{
+    struct cspace cur;
+
+    CHECK(ut_setup(18));
+
+    /* A chain of 1000 CNodes, each holding the only capability to the
+     * next. The old recursive finaliser needed ~300 bytes of stack per
+     * level and would run off the 32 KiB boot stack. */
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 1, &uts, 1, 1) == T_OK);
+    CHECK(cnode_view(&uts, 1, &cur) == T_OK);
+    int built = 1;
+    for (; built < 1000; built++) {
+        if (cap_retype(&uts, 0, CAP_CNODE, 1, &cur, 0, 1) != T_OK ||
+            cnode_view(&cur, 0, &cur) != T_OK)
+            break;
+    }
+    CHECK(built == 1000);
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(!cap_has_children(&ut_store[0])); /* all 1000 drained */
+    CHECK(cdt_consistent(&uts));
+
+    /* A revocation during the drain deletes the capability held in slot 0
+     * of a CNode that is itself still waiting to be drained. Its list link
+     * must survive, or the CNodes behind it are never drained (and the
+     * endpoint below leaks: the Untyped would keep a child). */
+    struct cspace a, b, c;
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 2, &uts, 1, 1) == T_OK);       /* A */
+    CHECK(cnode_view(&uts, 1, &a) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 1, &a, 1, 1) == T_OK);         /* B in A[1] */
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 1, &a, 2, 1) == T_OK);         /* C in A[2] */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 12, &a, 3, 1) == T_OK);      /* U2 in A[3] */
+    CHECK(cnode_view(&a, 1, &b) == T_OK && cnode_view(&a, 2, &c) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &b, 1, 1) == T_OK);      /* leak detector */
+    CHECK(cap_retype(&a, 3, CAP_FRAME, 0, &c, 0, 1) == T_OK);           /* C[0] from U2 */
+    /* Draining A pushes B, then C (C's link -> B), then revoking U2
+     * deletes C[0]. */
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(!cap_has_children(&ut_store[0]));
+    CHECK(cdt_consistent(&uts));
+
+    ut_teardown();
+}
+
 /* ---- Address spaces (docs/adr/0007-address-spaces.md) ---- */
 
 #define VA0 0x0000008000000000ull /* aligned for every table depth */
@@ -1059,6 +1104,7 @@ static const struct {
     { "untyped_exhaustion", test_untyped_exhaustion },
     { "untyped_overlap", test_untyped_overlap },
     { "untyped_revoke", test_untyped_revoke },
+    { "cnode_chain", test_cnode_chain },
     { "vspace_perms", test_vspace_perms },
     { "vspace_alias", test_vspace_alias },
     { "vspace_deputy", test_vspace_deputy },

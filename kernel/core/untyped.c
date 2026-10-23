@@ -30,15 +30,48 @@ static struct cspace cnode_of(paddr_t paddr, unsigned obj_bits)
     };
 }
 
-/* Last capability to a CNode deleted: delete everything stored in it so
+/*
+ * Last capability to a CNode deleted: delete everything stored in it so
  * no capability (and no CDT link) survives in memory that is about to
- * become reusable (O10). */
+ * become reusable (O10).
+ *
+ * Without recursion (ADR 0008, T33): deleting a CNode's contents can make
+ * other CNodes final, to any depth a user cares to build. Instead of
+ * recursing, a final CNode is pushed onto a pending list and a single loop
+ * drains the list, so kernel stack use is the same for one CNode or a
+ * chain of a million. The list is intrusive: the link lives in slot 0's
+ * `pending_link`, tagged with the CNode's size in its low 6 bits (slots
+ * are 64-byte aligned). Clearing a slot preserves that word, so a
+ * revocation that deletes the capability in a pending CNode's slot 0
+ * cannot cut the list.
+ */
+static uint64_t pending_cnodes;   /* tagged pointer to slot 0, or 0 */
+static bool draining;
+
 static void cnode_finalise(enum cap_type type, uint64_t object)
 {
     (void)type;
-    struct cspace cs = cnode_of(pa(object & ~CAP_OBJ_BITS_MASK),
+    struct cspace cn = cnode_of(pa(object & ~CAP_OBJ_BITS_MASK),
                                 (unsigned)(object & CAP_OBJ_BITS_MASK));
-    cspace_destroy(&cs);
+
+    KASSERT(cn.slots[0].pending_link == 0);
+    cn.slots[0].pending_link = pending_cnodes;
+    pending_cnodes = (uint64_t)(uintptr_t)cn.slots | (object & CAP_OBJ_BITS_MASK);
+    if (draining)
+        return; /* the loop below, further up the stack, will get to it */
+
+    draining = true;
+    while (pending_cnodes) {
+        struct cap *slots = (struct cap *)(uintptr_t)(pending_cnodes & ~CAP_OBJ_BITS_MASK);
+        unsigned bits = (unsigned)(pending_cnodes & CAP_OBJ_BITS_MASK);
+
+        pending_cnodes = slots[0].pending_link;   /* pop before emptying */
+        slots[0].pending_link = 0;
+
+        struct cspace view = { .slots = slots, .nslots = 1u << (bits - CAP_SLOT_BITS) };
+        cspace_destroy(&view);                     /* may push more */
+    }
+    draining = false;
 }
 
 void untyped_boot(void)
@@ -151,6 +184,7 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     for (uint32_t i = 0; i < count; i++) {
         struct cap *c = &dst_cs->slots[dst + i];
 
+        KASSERT(c->pending_link == 0);
         memset(c, 0, sizeof(*c));
         c->type = type;
         c->rights = rights;

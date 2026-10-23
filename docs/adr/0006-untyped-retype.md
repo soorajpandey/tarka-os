@@ -144,13 +144,11 @@ The root cspace is handed to the first user task once threads exist
 
 ## Known limitations
 
-- **CNode finalisers recurse.** If CNode A holds the last capability to
-  CNode B, which holds the last capability to C, and so on, deleting A
-  recurses once per level. A deep enough chain would overflow the kernel
-  stack. The guard page turns that into a clean panic, not memory
-  corruption, but it is still a denial of service. Fix before user space
-  can build CNode chains: iterative deletion with zombie capabilities
-  (seL4).
+- ~~CNode finalisers recurse.~~ Fixed (ADR 0008, T33): final CNodes go
+  onto an intrusive pending list drained by a single loop, so deleting a
+  chain of any depth uses constant kernel stack. Draining a huge tree
+  still runs to completion in one kernel entry; making it preemptible
+  (zombie capabilities, as in seL4) is part of the scheduler step.
 - **Cycles:** a CNode holding a capability to itself is never finalised by
   ordinary deletes. It is still reclaimed when its Untyped is revoked
   (O9), so memory is never permanently lost.

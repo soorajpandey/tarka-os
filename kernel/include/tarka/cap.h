@@ -60,7 +60,9 @@ struct cap {
     uint32_t     reserved; /* explicit padding, always zero */
     uint64_t    *map_entry; /* CAP_FRAME / CAP_PAGE_TABLE: the hardware entry
                              * this capability filled, or NULL */
-    uint64_t     reserved2; /* explicit padding, always zero */
+    uint64_t     pending_link; /* zero, except in slot 0 of a CNode waiting to be
+                                * drained (ADR 0008, T33): survives the slot
+                                * being cleared, see cnode_finalise() */
 };
 
 _Static_assert(sizeof(struct cap) == 64, "struct cap must have no implicit padding");
