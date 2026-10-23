@@ -13,6 +13,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/string.h>
+#include <tarka/thread.h>
 #include <tarka/untyped.h>
 #include <tarka/vspace.h>
 
@@ -187,7 +188,7 @@ static bool cdt_consistent(const struct cspace *cs)
                 return false;
             continue;
         }
-        if (c->reserved != 0)
+        if (c->slot_flags != 0 || c->pending_link != 0)
             return false;
         if (c->prev && c->prev->next != c)
             return false;
@@ -403,7 +404,7 @@ static void test_untyped_rules(void)
 
     /* Invalid requests. */
     CHECK(cap_retype(&uts, 0, CAP_NULL, 0, &uts, 1, 1) == T_EINVAL);
-    CHECK(cap_retype(&uts, 0, CAP_THREAD, 0, &uts, 1, 1) == T_EINVAL);
+    CHECK(cap_retype(&uts, 0, CAP_IRQ, 0, &uts, 1, 1) == T_EINVAL);   /* not retypeable */
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 1, &uts, 1, 1) == T_EINVAL);
     CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 1, 1) == T_EINVAL); /* same size */
     CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 17, &uts, 1, 1) == T_EINVAL);
@@ -1073,6 +1074,155 @@ static void test_percpu_fpu(void)
     CHECK(xmm_zero);
 }
 
+/* ---- Threads (docs/adr/0008-threads-user-entry-syscalls.md) ---- */
+
+static bool regs_equal(const struct user_regs *a, const struct user_regs *b)
+{
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+/* T6, T7, T11-T15: a new thread's state, and hostile register values. */
+static void test_thread_regs(void)
+{
+    struct user_regs r, before;
+    uint32_t st;
+
+    CHECK(ut_setup(18));
+    CHECK(cap_retype(&uts, 0, CAP_THREAD, 0, &uts, 1, 1) == T_OK);
+    struct thread *t = thread_of(&ut_store[1]);
+
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_INACTIVE);
+    CHECK(thread_read_regs(&uts, 1, &r) == T_OK);
+    static const struct user_regs zero;
+    CHECK(regs_equal(&r, &zero));                               /* T7 */
+    CHECK(*(uint32_t *)((uint8_t *)thread_xsave_area(t) + 24) == MXCSR_DEFAULT);
+    for (unsigned i = 0; i < TS_COUNT; i++)
+        CHECK(t->bind[i].slot_flags == (SLOT_BINDING | i) && t->bind[i].type == CAP_NULL);
+
+    r.rip = 0x400000;
+    r.rsp = 0x7FFFFFFFF000ull;
+    r.rflags = RFLAGS_USER_MASK;
+    r.rax = 1; r.r15 = 15;
+    r.fs_base = 0x1000; r.gs_base = USER_TOP - 1;
+    CHECK(thread_write_regs(&uts, 1, &r) == T_OK);
+    CHECK(thread_read_regs(&uts, 1, &before) == T_OK && regs_equal(&r, &before));
+
+    /* Every hostile value is refused and changes nothing. */
+    static const struct { int field; uint64_t v; } bad[] = {
+        { 0, USER_TOP }, { 0, 0xFFFF800000000000ull }, { 0, 0xFFFFFFFF80000000ull },
+        { 0, 0x0000800000000001ull }, { 0, 0x8000000000000000ull }, { 0, ~0ull },
+        { 1, USER_TOP }, { 1, 0xFFFFFFFF80001000ull }, { 1, 0x00FF000000000000ull },
+        { 2, 1u << 12 },  /* IOPL */ { 2, 3u << 12 }, { 2, 1u << 8 },  /* TF */
+        { 2, 1u << 14 },  /* NT */   { 2, 1u << 16 }, /* RF */ { 2, 1u << 17 }, /* VM */
+        { 2, 1u << 19 },  /* VIF */  { 2, 1u << 20 }, /* VIP */ { 2, RFLAGS_IF },
+        { 2, 1ull << 40 },
+        { 3, USER_TOP }, { 3, 0xFFFF800000000000ull },
+        { 4, 0x8000000000000000ull }, { 4, 0xFFFFFFFFFFFFF000ull },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(bad); i++) {
+        struct user_regs h = r;
+        switch (bad[i].field) {
+        case 0: h.rip = bad[i].v; break;
+        case 1: h.rsp = bad[i].v; break;
+        case 2: h.rflags = bad[i].v; break;
+        case 3: h.fs_base = bad[i].v; break;
+        default: h.gs_base = bad[i].v; break;
+        }
+        CHECK(thread_write_regs(&uts, 1, &h) == T_EINVAL);
+    }
+    CHECK(thread_read_regs(&uts, 1, &r) == T_OK && regs_equal(&r, &before));
+
+    ut_teardown();
+}
+
+/* T1-T5: authority, binding, runnability, and losing bindings. */
+static void test_thread_lifecycle(void)
+{
+    struct user_regs r;
+    uint32_t st;
+
+    CHECK(ut_setup(18));
+    CHECK(cap_retype(&uts, 0, CAP_THREAD, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, 2, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 4, &uts, 3, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 4, 1) == T_OK);
+    struct thread *t = thread_of(&ut_store[1]);
+
+    /* T4: no bindings, not runnable. */
+    CHECK(thread_resume(&uts, 1) == T_EPERM);
+
+    /* T1: binding needs WRITE on the thread, GRANT on the source, and the
+     * right type for the slot. */
+    CHECK(cap_derive(&uts, 2, 10, CAP_R_READ | CAP_R_WRITE, 0) == T_OK); /* no GRANT */
+    CHECK(thread_bind(&uts, 1, TS_ASPACE, &uts, 10) == T_EPERM);
+    CHECK(thread_bind(&uts, 1, TS_ASPACE, &uts, 3) == T_EBADCAP);         /* CNode */
+    CHECK(thread_bind(&uts, 1, TS_COUNT, &uts, 2) == T_EINVAL);
+    CHECK(thread_bind(&uts, 1, TS_ASPACE, &uts, 2) == T_OK);
+    CHECK(thread_bind(&uts, 1, TS_ASPACE, &uts, 2) == T_EBUSY);
+    CHECK(thread_resume(&uts, 1) == T_EPERM);                              /* no cspace yet */
+    CHECK(thread_bind(&uts, 1, TS_CSPACE, &uts, 3) == T_OK);
+    CHECK(thread_bind(&uts, 1, TS_IPCBUF, &uts, 4) == T_OK);
+
+    /* T3: another task's view. */
+    cspace_init(&bcs, b_store, ARRAY_SIZE(b_store));
+    CHECK(cap_derive_to(&uts, 1, &bcs, 0, CAP_R_READ, 0) == T_OK);   /* read-only */
+    CHECK(cap_derive_to(&uts, 1, &bcs, 1, CAP_R_GRANT, 0) == T_OK);  /* neither */
+    CHECK(thread_read_regs(&bcs, 0, &r) == T_OK);
+    CHECK(thread_write_regs(&bcs, 0, &r) == T_EPERM);
+    CHECK(thread_resume(&bcs, 0) == T_EPERM);
+    CHECK(thread_suspend(&bcs, 0) == T_EPERM);
+    CHECK(thread_bind(&bcs, 0, TS_FAULT, &uts, 4) == T_EPERM);
+    CHECK(thread_unbind(&bcs, 0, TS_ASPACE) == T_EPERM);
+    CHECK(thread_read_regs(&bcs, 1, &r) == T_EPERM);
+    CHECK(thread_get_state(&bcs, 1, &st) == T_EPERM);
+    CHECK(thread_read_regs(&bcs, 5, &r) == T_EBADCAP);                 /* not held */
+    cspace_destroy(&bcs);
+
+    /* Resume, suspend, resume. */
+    CHECK(thread_resume(&uts, 1) == T_OK);
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_RUNNABLE && !runq_empty());
+    CHECK(thread_resume(&uts, 1) == T_EBUSY);
+    CHECK(thread_suspend(&uts, 1) == T_OK);
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_INACTIVE && runq_empty());
+    CHECK(thread_resume(&uts, 1) == T_OK);
+
+    /* T2: deleting the AS's original capability leaves the binding (a
+     * copy) and the object alive; revoking it removes the binding, and
+     * the thread stops before the deletion completes. */
+    CHECK(cap_delete(&uts, 10) == T_OK);
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_RUNNABLE);
+    CHECK(cap_revoke(&uts, 2, 0) == T_OK);
+    CHECK(t->bind[TS_ASPACE].type == CAP_NULL);
+    CHECK(t->bind[TS_ASPACE].slot_flags == (SLOT_BINDING | TS_ASPACE)); /* slot stays a binding slot */
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_INACTIVE && runq_empty());
+    CHECK(thread_resume(&uts, 1) == T_EPERM);
+
+    /* Losing an optional binding does not stop the thread... */
+    CHECK(thread_bind(&uts, 1, TS_ASPACE, &uts, 2) == T_OK);
+    CHECK(thread_resume(&uts, 1) == T_OK);
+    CHECK(cap_revoke(&uts, 4, 0) == T_OK);                  /* IPC buffer */
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_RUNNABLE);
+    /* ...losing the cspace does, by unbind or by destroying the CNode. */
+    CHECK(thread_unbind(&uts, 1, TS_CSPACE) == T_OK);
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_INACTIVE && runq_empty());
+    CHECK(thread_bind(&uts, 1, TS_CSPACE, &uts, 3) == T_OK);
+    CHECK(thread_resume(&uts, 1) == T_OK);
+    CHECK(cap_revoke(&uts, 3, 0) == T_OK);
+    CHECK(thread_get_state(&uts, 1, &st) == T_OK && st == THREAD_INACTIVE && runq_empty());
+
+    /* T5: destroying a runnable thread leaves no queue entry and no
+     * binding copies behind. */
+    CHECK(thread_bind(&uts, 1, TS_CSPACE, &uts, 3) == T_OK);
+    CHECK(thread_resume(&uts, 1) == T_OK);
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(runq_empty());
+    CHECK(!cap_has_children(&ut_store[2]) && !cap_has_children(&ut_store[3]));
+    CHECK(cdt_consistent(&uts));
+
+    ut_teardown();
+    CHECK(runq_empty());
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1112,6 +1262,8 @@ static const struct {
     { "w^x", test_wx },
     { "stack_guards", test_stack_guards },
     { "percpu_fpu", test_percpu_fpu },
+    { "thread_regs", test_thread_regs },
+    { "thread_lifecycle", test_thread_lifecycle },
     { "cpu_hardening", test_cpu_hardening },
 };
 

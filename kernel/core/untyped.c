@@ -11,6 +11,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/string.h>
+#include <tarka/thread.h>
 #include <tarka/vspace.h>
 
 _Static_assert(sizeof(struct cap) <= (1u << CAP_SLOT_BITS), "CNode slot size too small");
@@ -110,6 +111,8 @@ static unsigned object_bits(enum cap_type type, unsigned size_bits, unsigned ut_
     case CAP_ADDRESS_SPACE:
     case CAP_PAGE_TABLE:
         return size_bits == 0 ? VSPACE_OBJ_BITS : 0;
+    case CAP_THREAD:
+        return size_bits == 0 ? THREAD_OBJ_BITS : 0;
     case CAP_UNTYPED:
         /* Strictly smaller: a child must never denote the same range as
          * its parent. */
@@ -172,9 +175,11 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
         memset(phys_to_virt(base), 0, span);
 
     /* Type-specific initialisation of the zeroed objects. */
-    if (type == CAP_ADDRESS_SPACE) {
-        for (uint32_t i = 0; i < count; i++)
+    for (uint32_t i = 0; i < count; i++) {
+        if (type == CAP_ADDRESS_SPACE)
             vspace_as_init(pa_add(base, i * obj_size));
+        else if (type == CAP_THREAD)
+            thread_obj_init(pa_add(base, i * obj_size));
     }
 
     /* 9. capabilities, as children of the Untyped. Untyped and PageTable
@@ -185,7 +190,7 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
         struct cap *c = &dst_cs->slots[dst + i];
 
         KASSERT(c->pending_link == 0);
-        memset(c, 0, sizeof(*c));
+        cap_slot_clear(c);
         c->type = type;
         c->rights = rights;
         c->object = cap_obj_encode(pa_add(base, i * obj_size), obj_bits);

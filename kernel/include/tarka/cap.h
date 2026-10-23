@@ -57,15 +57,20 @@ struct cap {
     struct cap  *prev;     /* CDT pre-order links */
     struct cap  *next;
     uint32_t     depth;    /* CDT depth; children are parent depth + 1 */
-    uint32_t     reserved; /* explicit padding, always zero */
+    uint32_t     slot_flags; /* property of the slot, not of the capability in
+                              * it: 0 for ordinary slots; SLOT_BINDING | index
+                              * for a thread's binding slots (ADR 0008, T2) */
     uint64_t    *map_entry; /* CAP_FRAME / CAP_PAGE_TABLE: the hardware entry
                              * this capability filled, or NULL */
-    uint64_t     pending_link; /* zero, except in slot 0 of a CNode waiting to be
-                                * drained (ADR 0008, T33): survives the slot
-                                * being cleared, see cnode_finalise() */
+    uint64_t     pending_link; /* property of the slot: zero, except in slot 0 of
+                                * a CNode waiting to be drained (ADR 0008,
+                                * T33), see cnode_finalise() */
 };
 
 _Static_assert(sizeof(struct cap) == 64, "struct cap must have no implicit padding");
+
+#define SLOT_BINDING     0x80000000u
+#define SLOT_BINDING_IDX 0x000000FFu
 
 /* What user space may learn about a capability. Contains no kernel
  * pointers and no padding, so it is safe to copy out. */

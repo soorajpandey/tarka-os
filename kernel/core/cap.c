@@ -8,6 +8,22 @@
 
 static cap_finaliser_t finalisers[CAP_TYPE_COUNT];
 static cap_cleanup_t cleanups[CAP_TYPE_COUNT];
+static cap_binding_hook_t binding_hook;
+
+void cap_set_binding_hook(cap_binding_hook_t fn)
+{
+    binding_hook = fn;
+}
+
+void cap_slot_clear(struct cap *c)
+{
+    uint32_t flags = c->slot_flags;
+    uint64_t link = c->pending_link;
+
+    memset(c, 0, sizeof(*c));
+    c->slot_flags = flags;
+    c->pending_link = link;
+}
 
 /* Incremented on every slot deletion. Lets revocation notice that a
  * finaliser deleted further capabilities behind its back (ADR 0006, O11). */
@@ -95,6 +111,10 @@ static void destroy_slot(struct cap *c)
 {
     enum cap_type type = c->type;
 
+    /* A thread is about to lose a binding: stop it first (ADR 0008, T2). */
+    if ((c->slot_flags & SLOT_BINDING) && binding_hook)
+        binding_hook(c);
+
     /* Undo per-capability state (e.g. a mapping) while the capability is
      * still intact. */
     if (cleanups[type])
@@ -106,11 +126,8 @@ static void destroy_slot(struct cap *c)
     cdt_remove(c);
     cdt_generation++;
     /* Clear the slot before the finaliser runs so nothing can observe or
-     * reuse a half-deleted capability. The pending-drain link is not part
-     * of the capability: it belongs to the CNode the slot lives in. */
-    uint64_t link = c->pending_link;
-    memset(c, 0, sizeof(*c));
-    c->pending_link = link;
+     * reuse a half-deleted capability. */
+    cap_slot_clear(c);
 
     if (final && finalisers[type])
         finalisers[type](type, object);
@@ -180,7 +197,7 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
         return T_EBUSY;
 
     KASSERT(c->pending_link == 0);
-    memset(c, 0, sizeof(*c));
+    cap_slot_clear(c);
     c->type = type;
     c->rights = rights;
     c->object = object;
@@ -219,15 +236,8 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
     return T_OK;
 }
 
-int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
-                  struct cspace *dst_cs, cap_slot_t dst,
-                  cap_rights_t mask, uint64_t badge)
+static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
 {
-    struct cap *s = cap_slot(src_cs, src);
-    struct cap *d = cap_slot(dst_cs, dst);
-
-    if (!s || !d)
-        return T_ERANGE;
     if (s->type == CAP_NULL)
         return T_EBADCAP;
     if (s->type == CAP_UNTYPED || s->type == CAP_PAGE_TABLE)
@@ -243,9 +253,8 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
     if (badge && s->badge)
         return T_EPERM;
 
-
     KASSERT(d->pending_link == 0);
-    memset(d, 0, sizeof(*d));
+    cap_slot_clear(d);
     d->type = s->type;
     d->object = s->object;
     d->rights = s->rights & mask; /* monotonic: rights only ever shrink */
@@ -255,6 +264,29 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
      * authority, not the source's mappings. */
     cap_insert_child(s, d);
     return T_OK;
+}
+
+int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
+                  struct cspace *dst_cs, cap_slot_t dst,
+                  cap_rights_t mask, uint64_t badge)
+{
+    struct cap *s = cap_slot(src_cs, src);
+    struct cap *d = cap_slot(dst_cs, dst);
+
+    if (!s || !d)
+        return T_ERANGE;
+    return derive(s, d, mask, badge);
+}
+
+int cap_derive_into(struct cap *src, struct cap *dst, cap_rights_t mask)
+{
+    return derive(src, dst, mask, 0);
+}
+
+void cap_slot_delete(struct cap *c)
+{
+    if (c->type != CAP_NULL)
+        destroy_slot(c);
 }
 
 int cap_delete(struct cspace *cs, cap_slot_t slot)

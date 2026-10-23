@@ -2,6 +2,7 @@
 #include <tarka/pmm.h>
 #include <tarka/selftest.h>
 #include <tarka/untyped.h>
+#include <tarka/thread.h>
 #include <tarka/vspace.h>
 
 #include <limine.h>
@@ -79,6 +80,7 @@ __noreturn __no_canary void kmain(void)
     pmm_init(memmap_req.response);
     untyped_boot();
     vspace_boot();
+    thread_boot();
 
 #ifdef TARKA_SELFTEST
     selftest_run();
