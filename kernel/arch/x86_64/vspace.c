@@ -232,7 +232,7 @@ static bool ipcbuf_binding(const struct cap *c)
  * mapping included. */
 static bool alias_conflict(struct cap *frame, const struct cap *skip, cap_rights_t want)
 {
-    for (struct cap *c = cap_object_first(frame); cap_same_object(c, frame); c = c->next) {
+    for (struct cap *c = cap_object_first(frame); c; c = cap_object_next(c)) {
         if (c == skip)
             continue;
         bool w = ((c->map_state & MS_MAPPED) && (c->map_state & CAP_R_WRITE)) || ipcbuf_binding(c);

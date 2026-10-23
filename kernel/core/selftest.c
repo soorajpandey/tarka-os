@@ -129,13 +129,15 @@ static void test_pmm(void)
     CHECK(pmm_free_count() == before);
 }
 
+static struct cap caps_store[8];   /* 1 KiB: not on the stack (T33) */
+
 static void test_caps(void)
 {
-    struct cap storage[8];
+    struct cap *storage = caps_store;
     struct cspace cs;
     const struct cap *c;
 
-    cspace_init(&cs, storage, ARRAY_SIZE(storage));
+    cspace_init(&cs, storage, ARRAY_SIZE(caps_store));
 
     CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT, 0x1000) == T_OK);
     CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_READ, 0x2000) == T_EBUSY);
@@ -182,9 +184,62 @@ static void test_caps(void)
     cspace_destroy(&cs);
 }
 
-/* Structural check of every CDT link reachable from a cspace: links are
- * symmetric, depth grows by at most one per step, and empty slots are fully
- * zeroed (no stale links or data). */
+/* ---- CDT helpers for tests (ADR 0010, SC20) ---- */
+
+/* The parent of c: the record whose bracket pair most tightly encloses
+ * c's (NULL for a root). Walks backwards, skipping complete pairs. */
+static const struct cap *cdt_parent_of(const struct cap *c)
+{
+    unsigned skip = 0;
+
+    for (const struct cdt_elem *e = c->open.prev; e; e = e->prev) {
+        if (!cdt_elem_is_open(e))
+            skip++;
+        else if (skip)
+            skip--;
+        else
+            return cdt_elem_cap(e);
+    }
+    return NULL;
+}
+
+static const struct cdt_elem *cdt_list_head(const struct cap *c)
+{
+    const struct cdt_elem *e = &c->open;
+
+    while (e->prev)
+        e = e->prev;
+    return e;
+}
+
+/* One whole list is a well-nested bracket sequence: links symmetric, every
+ * element belongs to a live record, every close matches the innermost
+ * open, nothing left open at the end. */
+#define CDT_WALK_MAX 8192
+static const struct cap *cdt_stack[CDT_WALK_MAX];
+
+static bool cdt_list_ok(const struct cdt_elem *head)
+{
+    const struct cdt_elem *prev = NULL;
+    unsigned depth = 0, n = 0;
+
+    for (const struct cdt_elem *e = head; e; prev = e, e = e->next) {
+        const struct cap *c = cdt_elem_cap(e);
+        if (e->prev != prev || ++n > 2 * CDT_WALK_MAX || c->type == CAP_NULL)
+            return false;
+        if (cdt_elem_is_open(e)) {
+            if (depth == CDT_WALK_MAX)
+                return false;
+            cdt_stack[depth++] = c;
+        } else if (!depth || cdt_stack[--depth] != c) {
+            return false;
+        }
+    }
+    return depth == 0;
+}
+
+/* Every record in a cspace: empty slots fully zeroed (no stale links or
+ * data), reserved fields zero, and its list well-nested. */
 static bool cdt_consistent(const struct cspace *cs)
 {
     static const struct cap zero;
@@ -196,25 +251,31 @@ static bool cdt_consistent(const struct cspace *cs)
                 return false;
             continue;
         }
-        if (c->slot_flags != 0 || c->pending_link != 0)
+        if (c->slot_flags != 0 || c->pending_link != 0 || c->reserved0)
             return false;
-        if (c->prev && c->prev->next != c)
-            return false;
-        if (c->next && (c->next->prev != c || c->next->depth > c->depth + 1))
-            return false;
-        if (!c->prev && c->depth != 0)
+        for (size_t k = 0; k < ARRAY_SIZE(c->reserved); k++)
+            if (c->reserved[k])
+                return false;
+        if (!cdt_list_ok(cdt_list_head(c)))
             return false;
     }
     return true;
 }
 
+static bool elem_within(const struct cdt_elem *e, const struct cap *lo, const struct cap *hi)
+{
+    return !e || (cdt_elem_cap(e) >= lo && cdt_elem_cap(e) < hi);
+}
+
+/* No CDT link of a record in `cs` leads outside [lo, hi). */
 static bool links_within(const struct cspace *cs, const struct cap *lo, const struct cap *hi)
 {
     for (uint32_t i = 0; i < cs->nslots; i++) {
         const struct cap *c = &cs->slots[i];
-        if (c->prev && (c->prev < lo || c->prev >= hi))
-            return false;
-        if (c->next && (c->next < lo || c->next >= hi))
+        if (c->type == CAP_NULL)
+            continue;
+        if (!elem_within(c->open.prev, lo, hi) || !elem_within(c->open.next, lo, hi) ||
+            !elem_within(c->close.prev, lo, hi) || !elem_within(c->close.next, lo, hi))
             return false;
     }
     return true;
@@ -251,7 +312,10 @@ static void test_cap_revoke(void)
     CHECK(cap_derive_to(&a, 1, &b, 0, CAP_R_READ | CAP_R_GRANT, 0x77) == T_OK);
     CHECK(cap_derive(&a, 0, 3, CAP_R_READ, 0) == T_OK);
     CHECK(cdt_consistent(&a) && cdt_consistent(&b));
-    CHECK(cdt_store_a[1].depth == 1 && cdt_store_a[2].depth == 2 && cdt_store_b[0].depth == 2);
+    CHECK(cdt_parent_of(&cdt_store_a[1]) == &cdt_store_a[0] &&
+          cdt_parent_of(&cdt_store_a[2]) == &cdt_store_a[1] &&
+          cdt_parent_of(&cdt_store_b[0]) == &cdt_store_a[1] &&
+          cdt_parent_of(&cdt_store_a[3]) == &cdt_store_a[0]);
 
     /* Revoking a1 removes its descendants in both cspaces, keeps a1, and
      * frees nothing because the object is still referenced. */
@@ -267,7 +331,7 @@ static void test_cap_revoke(void)
      * them: a later revoke of the grandparent still reaches them. */
     CHECK(cap_derive(&a, 1, 4, CAP_R_ALL, 0) == T_OK);   /* a0 > a1 > a4 */
     CHECK(cap_delete(&a, 1) == T_OK);                     /* a0 > a4 */
-    CHECK(cdt_store_a[4].depth == 1);
+    CHECK(cdt_parent_of(&cdt_store_a[4]) == &cdt_store_a[0]);
     CHECK(cap_revoke(&a, 0, 0) == T_OK);
     CHECK(cap_lookup(&a, 4, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
     CHECK(cap_lookup(&a, 3, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
@@ -277,13 +341,19 @@ static void test_cap_revoke(void)
     CHECK(cap_delete(&a, 0) == T_OK);
     CHECK(finalised == 1 && finalised_object == 0xE1);
 
-    /* Revocation is resumable: with a budget it makes bounded progress. */
+    /* Revocation is resumable: with a budget it makes bounded progress.
+     * It deletes the first child each step (ADR 0010, SC22), so the top
+     * of the chain goes first and the rest re-parents to the root. */
     CHECK(cap_install(&a, 0, CAP_TEST_TOKEN, CAP_R_ALL, 0xE2) == T_OK);
     for (cap_slot_t i = 1; i < 8; i++)
         CHECK(cap_derive(&a, i - 1, i, CAP_R_ALL, 0) == T_OK);  /* chain of 7 */
     CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
-    CHECK(cap_lookup(&a, 4, CAP_TEST_TOKEN, 0, &c) == T_OK);
-    CHECK(cap_lookup(&a, 5, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    for (cap_slot_t i = 1; i <= 3; i++)
+        CHECK(cap_lookup(&a, i, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    for (cap_slot_t i = 4; i <= 7; i++)
+        CHECK(cap_lookup(&a, i, CAP_TEST_TOKEN, 0, &c) == T_OK);
+    CHECK(cdt_parent_of(&cdt_store_a[4]) == &cdt_store_a[0]);
+    CHECK(cdt_parent_of(&cdt_store_a[5]) == &cdt_store_a[4]);
     CHECK(cdt_consistent(&a));
     CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
     CHECK(cap_revoke(&a, 0, 3) == T_OK);
@@ -296,7 +366,7 @@ static void test_cap_revoke(void)
     CHECK(cap_derive_to(&b, 1, &a, 1, CAP_R_ALL, 0) == T_OK);  /* a0 > b1 > a1 */
     cspace_destroy(&b);
     CHECK(links_within(&a, cdt_store_a, cdt_store_a + ARRAY_SIZE(cdt_store_a)));
-    CHECK(cdt_store_a[1].depth == 1 && cdt_store_a[1].prev == &cdt_store_a[0]);
+    CHECK(cdt_parent_of(&cdt_store_a[1]) == &cdt_store_a[0]);
     CHECK(cdt_consistent(&a));
     CHECK(finalised == 1);
 
@@ -618,7 +688,9 @@ static void test_untyped_revoke(void)
     CHECK(cap_derive_to(&cn, 0, &cn, 3, CAP_R_READ, 0) == T_OK);
     CHECK(cap_delete(&uts, 2) == T_OK);
     CHECK(!cap_has_children(&ut_store[1]));
-    CHECK(ut_store[1].next == NULL || ut_store[1].next < cn_lo || ut_store[1].next >= cn_hi);
+    CHECK(!(cdt_elem_cap(ut_store[1].open.next) >= cn_lo && cdt_elem_cap(ut_store[1].open.next) < cn_hi));
+    CHECK(!ut_store[1].close.next ||
+          !(cdt_elem_cap(ut_store[1].close.next) >= cn_lo && cdt_elem_cap(ut_store[1].close.next) < cn_hi));
     CHECK(cdt_consistent(&uts));
 
     ut_teardown();
@@ -626,6 +698,300 @@ static void test_untyped_revoke(void)
 }
 
 /* T33: deleting nested CNodes uses constant kernel stack. */
+/* ---- The bracket-list CDT against a reference forest (ADR 0010, SC20,
+ * test 7, gate SC31.1) ----
+ *
+ * The model keeps, for every slot of two cspaces, its parent (as a global
+ * index), or ROOT, or EMPTY, and its object. Every kernel operation is
+ * applied to both, and after each one the parent of every live record,
+ * read from the brackets, must equal the model's. */
+
+#define CDT_N     64                 /* slots per cspace; two cspaces */
+#define M_EMPTY   (-2)
+#define M_ROOT    (-1)
+static struct cap cdtm_a[CDT_N], cdtm_b[CDT_N];
+static struct cspace cdtm_cs[2];
+static int16_t m_par[2 * CDT_N];
+static uint16_t m_obj[2 * CDT_N];
+
+static struct cap *m_cap(int g) { return &cdtm_cs[g / CDT_N].slots[g % CDT_N]; }
+
+static int m_index(const struct cap *c)
+{
+    for (int k = 0; k < 2; k++)
+        if (c >= cdtm_cs[k].slots && c < cdtm_cs[k].slots + CDT_N)
+            return k * CDT_N + (int)(c - cdtm_cs[k].slots);
+    return -100;   /* outside the model: a failure */
+}
+
+static void m_reset(void)
+{
+    cspace_init(&cdtm_cs[0], cdtm_a, CDT_N);
+    cspace_init(&cdtm_cs[1], cdtm_b, CDT_N);
+    for (int g = 0; g < 2 * CDT_N; g++)
+        m_par[g] = M_EMPTY;
+    finalised = 0;
+    cap_set_finaliser(CAP_TEST_TOKEN, count_finaliser);
+}
+
+static bool m_root(int g, uint16_t obj)
+{
+    m_par[g] = M_ROOT;
+    m_obj[g] = obj;
+    return cap_install(&cdtm_cs[g / CDT_N], g % CDT_N, CAP_TEST_TOKEN, CAP_R_ALL, 0x1000u + obj) == T_OK;
+}
+
+static bool m_derive(int src, int dst)
+{
+    m_par[dst] = (int16_t)src;
+    m_obj[dst] = m_obj[src];
+    return cap_derive_to(&cdtm_cs[src / CDT_N], src % CDT_N, &cdtm_cs[dst / CDT_N],
+                         dst % CDT_N, CAP_R_ALL, 0) == T_OK;
+}
+
+/* Deleting x in the model: x's children go to x's parent. Returns whether
+ * the kernel should have run the finaliser (no record of x's object
+ * left). */
+static bool m_forget(int x)
+{
+    bool last = true;
+    for (int g = 0; g < 2 * CDT_N; g++)
+        if (m_par[g] == x)
+            m_par[g] = m_par[x];
+    m_par[x] = M_EMPTY;
+    for (int g = 0; g < 2 * CDT_N; g++)
+        if (m_par[g] != M_EMPTY && m_obj[g] == m_obj[x])
+            last = false;
+    return last;
+}
+
+static bool m_delete(int x)
+{
+    unsigned before = finalised;
+    uint16_t obj = m_obj[x];
+    bool last = m_forget(x);
+    if (cap_delete(&cdtm_cs[x / CDT_N], x % CDT_N) != T_OK)
+        return false;
+    return finalised == before + (last ? 1u : 0u) &&
+           (!last || finalised_object == 0x1000u + obj);
+}
+
+/* Every slot agrees with the model, and both lists are well-nested. */
+static bool m_agrees(void)
+{
+    for (int g = 0; g < 2 * CDT_N; g++) {
+        const struct cap *c = m_cap(g);
+        if (m_par[g] == M_EMPTY) {
+            if (c->type != CAP_NULL)
+                return false;
+            continue;
+        }
+        const struct cap *p = cdt_parent_of(c);
+        int want = m_par[g];
+        if (want == M_ROOT ? p != NULL : (p == NULL || m_index(p) != want))
+            return false;
+    }
+    return cdt_consistent(&cdtm_cs[0]) && cdt_consistent(&cdtm_cs[1]);
+}
+
+static int m_has_child(int p)
+{
+    for (int g = 0; g < 2 * CDT_N; g++)
+        if (m_par[g] == p)
+            return 1;
+    return 0;
+}
+
+/* The tree A{B{C{D},E}} with each deletion order the ADR asks for. */
+static void test_cdt_forest(void)
+{
+    enum { A, B, C, D, E };
+    static const int8_t orders[][5] = {
+        { B, -1 }, { C, -1 }, { D, -1 }, { E, -1 },        /* each alone */
+        { B, C, -1 }, { C, B, -1 }, { D, B, E, -1 },
+        { E, D, C, B, -1 }, { B, E, D, C, -1 }, { A, B, -1 }, /* root first */
+    };
+    for (size_t o = 0; o < ARRAY_SIZE(orders); o++) {
+        m_reset();
+        CHECK(m_root(A, 1) && m_derive(A, B) && m_derive(B, C) && m_derive(C, D) &&
+              m_derive(B, E));
+        CHECK(m_agrees());
+        for (int k = 0; orders[o][k] >= 0; k++) {
+            CHECK(m_delete(orders[o][k]));
+            CHECK(m_agrees());
+        }
+    }
+
+    /* The revision-2 counterexample: z must end up under p. */
+    enum { P0 = 0, X1, Y2, Z3, M4, W5 };
+    m_reset();
+    CHECK(m_root(P0, 2) && m_derive(P0, X1) && m_derive(X1, Y2) && m_derive(Y2, Z3) &&
+          m_derive(P0, M4) && m_derive(M4, W5));
+    CHECK(m_delete(M4) && m_agrees());
+    CHECK(m_delete(Y2) && m_agrees());
+    CHECK(m_delete(X1) && m_agrees());
+    CHECK(cdt_parent_of(m_cap(Z3)) == m_cap(P0));
+    CHECK(cdt_parent_of(m_cap(W5)) == m_cap(P0));
+    /* Revoking w must not touch z, which was never derived from it. */
+    CHECK(cap_revoke(&cdtm_cs[0], W5, 0) == T_OK && m_cap(Z3)->type == CAP_TEST_TOKEN);
+
+    /* Re-derivation into the same slot, from a different parent, in the
+     * other cspace. */
+    CHECK(m_delete(Z3) && m_derive(W5, Z3) && m_agrees());
+    CHECK(cdt_parent_of(m_cap(Z3)) == m_cap(W5));
+    CHECK(m_delete(Z3) && m_derive(P0, CDT_N + 7) && m_derive(CDT_N + 7, Z3) && m_agrees());
+    cap_set_finaliser(CAP_TEST_TOKEN, NULL);
+}
+
+/* Random derive, delete and one-step revoke across two cspaces and several
+ * objects, compared with the model after every step. */
+static void test_cdt_random(void)
+{
+    for (uint64_t seed = 1; seed <= 4; seed++) {
+        rng_state = 0x9E3779B97F4A7C15ull * seed;
+        m_reset();
+        for (int k = 0; k < 4; k++)
+            CHECK(m_root(k * 9, (uint16_t)(10 + k)));
+        bool ok = true;
+        for (int step = 0; step < 400 && ok; step++) {
+            static int live[2 * CDT_N], empty[2 * CDT_N];   /* off the stack (T33) */
+            int nl = 0, ne = 0;
+            for (int g = 0; g < 2 * CDT_N; g++) {
+                if (m_par[g] == M_EMPTY)
+                    empty[ne++] = g;
+                else
+                    live[nl++] = g;
+            }
+            uint32_t r = rng(100);
+            if (nl == 0) {
+                ok &= m_root(empty[rng((uint32_t)ne)], (uint16_t)(20 + step % 7));
+            } else if (r < 50 && ne > 0) {
+                ok &= m_derive(live[rng((uint32_t)nl)], empty[rng((uint32_t)ne)]);
+            } else if (r < 80) {
+                ok &= m_delete(live[rng((uint32_t)nl)]);
+            } else {
+                /* One revocation step: the victim is the kernel's first
+                 * child, which must be one of p's children in the model. */
+                int p = live[rng((uint32_t)nl)];
+                if (m_has_child(p)) {
+                    int v = m_index(cap_first_child(m_cap(p)));
+                    ok &= v >= 0 && m_par[v] == p;
+                    if (!ok)
+                        break;
+                    unsigned before = finalised;
+                    bool last = m_forget(v);
+                    int want = m_has_child(p) ? T_EAGAIN : T_OK;
+                    ok &= cap_revoke(&cdtm_cs[p / CDT_N], p % CDT_N, 1) == want;
+                    ok &= finalised == before + (last ? 1u : 0u);
+                }
+            }
+            ok &= m_agrees();
+        }
+        CHECK(ok);
+    }
+    cap_set_finaliser(CAP_TEST_TOKEN, NULL);
+}
+
+/* SC22 and O8: revocation never deletes an Untyped that still has
+ * descendants; it descends into it (bounded, because nested Untypeds
+ * shrink). U0 > U1 > U2 > F, revoked one step at a time. */
+static void test_cdt_untyped_descent(void)
+{
+    CHECK(ut_setup(16));
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 15, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 1, CAP_UNTYPED, 14, &uts, 2, 1) == T_OK);
+    CHECK(cap_retype(&uts, 2, CAP_FRAME, 0, &uts, 3, 1) == T_OK);
+    CHECK(cap_derive(&uts, 3, 4, CAP_R_ALL, 0) == T_OK);
+    /* Step 1 descends U1 > U2 and deletes F (its copy F' re-parents to
+     * U2); step 2 descends again and deletes F'; then U2; then U1. The
+     * step counts are the deletion plus one per Untyped descended. */
+    static const struct { cap_slot_t gone; uint64_t steps; } plan[] = {
+        { 3, 3 }, { 4, 3 }, { 2, 2 }, { 1, 1 },
+    };
+    for (size_t k = 0; k < ARRAY_SIZE(plan); k++) {
+        uint64_t steps = cdt_revoke_steps;
+        CHECK(cap_revoke(&uts, 0, 1) == (k + 1 < ARRAY_SIZE(plan) ? T_EAGAIN : T_OK));
+        CHECK(cdt_revoke_steps - steps == plan[k].steps);
+        CHECK(is_free_slot(&uts, plan[k].gone));
+        for (cap_slot_t s = 1; s < plan[k].gone && s < 3; s++)
+            CHECK(!is_free_slot(&uts, s));            /* Untypeds above still there */
+        CHECK(cdt_consistent(&uts));
+    }
+    ut_teardown();
+    CHECK(frames_conserved());
+}
+
+/* Gate SC31.4: one revocation step costs O(1), whatever the subtree's
+ * size. A chain of 1500 and a fan of 1500 under one root, revoked with
+ * budget 1: each call deletes exactly one record and takes a bounded
+ * number of steps; the tree stays valid throughout. A pre-scan of the
+ * subtree would cost thousands of steps on the first call. */
+#define BIG_N 3072
+static struct cap big_store[BIG_N];
+static int16_t big_par[BIG_N];
+
+static bool big_agrees(const struct cspace *cs)
+{
+    /* One linear pass: every record's parent from the bracket nesting. */
+    const struct cdt_elem *prev = NULL;
+    unsigned depth = 0;
+    for (const struct cdt_elem *e = &cs->slots[0].open; e; prev = e, e = e->next) {
+        const struct cap *c = cdt_elem_cap(e);
+        if (e->prev != prev)
+            return false;
+        if (cdt_elem_is_open(e)) {
+            int want = big_par[c - cs->slots];
+            int got = depth ? (int)(cdt_stack[depth - 1] - cs->slots) : M_ROOT;
+            if (got != want || depth == CDT_WALK_MAX)
+                return false;
+            cdt_stack[depth++] = c;
+        } else if (!depth || cdt_stack[--depth] != c) {
+            return false;
+        }
+    }
+    return depth == 0;
+}
+
+static void test_cdt_revoke_bound(void)
+{
+    struct cspace cs;
+
+    cspace_init(&cs, big_store, BIG_N);
+    CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_ALL, 0x2000) == T_OK);
+    big_par[0] = M_ROOT;
+    for (int i = 1; i <= 1500; i++) {                 /* chain 0 > 1 > ... > 1500 */
+        CHECK(cap_derive(&cs, (cap_slot_t)(i - 1), (cap_slot_t)i, CAP_R_ALL, 0) == T_OK);
+        big_par[i] = (int16_t)(i - 1);
+    }
+    for (int i = 1501; i < BIG_N; i++) {               /* fan under the root */
+        CHECK(cap_derive(&cs, 0, (cap_slot_t)i, CAP_R_ALL, 0) == T_OK);
+        big_par[i] = 0;
+    }
+    CHECK(big_agrees(&cs));
+    unsigned left = BIG_N - 1;
+    uint64_t worst = 0;
+    bool ok = true;
+    while (left && ok) {
+        struct cap *v = cap_first_child(&cs.slots[0]);
+        int vi = (int)(v - cs.slots);
+        uint64_t steps = cdt_revoke_steps;
+        ok &= cap_revoke(&cs, 0, 1) == (left > 1 ? T_EAGAIN : T_OK);
+        uint64_t d = cdt_revoke_steps - steps;
+        worst = d > worst ? d : worst;
+        ok &= cs.slots[vi].type == CAP_NULL;          /* exactly that one went */
+        for (int g = 1; g < BIG_N; g++)
+            if (big_par[g] == vi)
+                big_par[g] = big_par[vi];
+        big_par[vi] = M_EMPTY;
+        left--;
+        if (left % 256 == 0 && left)
+            ok &= big_agrees(&cs);
+    }
+    CHECK(ok && left == 0 && worst == 1);
+    CHECK(!cap_has_children(&cs.slots[0]));
+    cspace_destroy(&cs);
+}
+
 static void test_cnode_chain(void)
 {
     struct cspace cur;
@@ -2672,6 +3038,7 @@ struct world {
     unsigned n;
     struct cap *at[WORLD_MAX];
     struct cap v[WORLD_MAX];
+    const struct cap *parent[WORLD_MAX];   /* CDT parent at the snapshot */
 };
 static struct world world_a, world_b;
 static struct cspace world_t[WORLD_TABLES];
@@ -2696,6 +3063,8 @@ static void world_take(struct world *w)
             KASSERT(w->n < WORLD_MAX);                     /* bounded copy */
             w->at[w->n] = &world_t[t].slots[i];
             memcpy(&w->v[w->n], &world_t[t].slots[i], sizeof(struct cap));
+            if (world_t[t].slots[i].type != CAP_NULL)
+                w->parent[w->n] = cdt_parent_of(&world_t[t].slots[i]);
             w->n++;
         }
 }
@@ -2714,20 +3083,10 @@ static int in_list(const struct cap *c, struct cap *const *list, unsigned n)
     return -1;
 }
 
-/* In pre-order with depths, a record's parent is the nearest earlier
- * record with a smaller depth, which must be exactly one less. */
-static const struct cap *cdt_parent(const struct cap *c)
-{
-    for (const struct cap *p = c->prev; p; p = p->prev)
-        if (p->depth < c->depth)
-            return p->depth + 1 == c->depth ? p : NULL;
-    return NULL;
-}
-
 /* P55, success: exactly the n records dst[i] appeared, each a CDT child of
  * src[i] with its type, object, rights and badge and no mapping state;
- * every other record is unchanged apart from its links; and with the new
- * records skipped, every link is exactly what it was. */
+ * every other record is unchanged apart from its list links, and keeps
+ * exactly the parent it had (ADR 0010: parentage is the tree). */
 static bool world_transferred(const struct world *a, const struct world *b,
                               struct cap *const *src, struct cap *const *dst, unsigned n)
 {
@@ -2748,22 +3107,16 @@ static bool world_transferred(const struct world *a, const struct world *b,
             if (now->type != s->type || now->object != s->object ||
                 now->rights != s->rights || now->badge != (badged ? s->badge : 0) ||
                 now->map_entry || now->slot_flags || now->pending_link ||
-                now->depth != s->depth + 1 || cdt_parent(a->at[i]) != s)
+                b->parent[i] != s)
                 return false;
             continue;
         }
         struct cap x, y;
         memcpy(&x, was, sizeof(x));
         memcpy(&y, now, sizeof(y));
-        x.prev = x.next = y.prev = y.next = NULL;
-        if (memcmp(&x, &y, sizeof(x)) != 0)
-            return false;
-        const struct cap *nx = now->next, *pv = now->prev;
-        while (nx && in_list(nx, dst, n) >= 0)
-            nx = nx->next;
-        while (pv && in_list(pv, dst, n) >= 0)
-            pv = pv->prev;
-        if (nx != was->next || pv != was->prev)
+        memset(&x.open, 0, 2 * sizeof(struct cdt_elem));
+        memset(&y.open, 0, 2 * sizeof(struct cdt_elem));
+        if (memcmp(&x, &y, sizeof(x)) != 0 || a->parent[i] != b->parent[i])
             return false;
     }
     return found == n;
@@ -2949,7 +3302,8 @@ static void test_ep_xfer_refuse(void)
     struct cap *dst[] = { &c40.slots[7], &c40.slots[8], &c40.slots[9] };
     CHECK(world_transferred(&world_a, &world_b, src, dst, 3));
     /* Two independent CDT children of one source, not one deduplicated. */
-    CHECK(cdt_parent(&c40.slots[7]) == &c10.slots[3] && cdt_parent(&c40.slots[8]) == &c10.slots[3]);
+    CHECK(cdt_parent_of(&c40.slots[7]) == &c10.slots[3] &&
+          cdt_parent_of(&c40.slots[8]) == &c10.slots[3]);
     CHECK(c40.slots[7].type == CAP_FRAME && c40.slots[8].type == CAP_FRAME);
     CHECK(cap_delete(&c40, 8) == T_OK && c40.slots[7].type == CAP_FRAME);
     CHECK(cap_derive_to(&c10, 3, &c40, 8, CAP_R_ALL, 0) == T_OK);   /* restore */
@@ -4183,6 +4537,10 @@ static const struct {
     { "untyped_exhaustion", test_untyped_exhaustion },
     { "untyped_overlap", test_untyped_overlap },
     { "untyped_revoke", test_untyped_revoke },
+    { "cdt_forest", test_cdt_forest },
+    { "cdt_random", test_cdt_random },
+    { "cdt_untyped_descent", test_cdt_untyped_descent },
+    { "cdt_revoke_bound", test_cdt_revoke_bound },
     { "cnode_chain", test_cnode_chain },
     { "vspace_perms", test_vspace_perms },
     { "vspace_alias", test_vspace_alias },

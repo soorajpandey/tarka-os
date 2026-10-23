@@ -139,7 +139,7 @@ struct thread {
     struct ipc_offer    offer;       /* a blocked receiver's captured slots (P50) */
     struct thread      *reg_next;    /* test builds: registry of live threads */
     struct thread      *reg_prev;
-    struct cap          bind[TS_COUNT] __aligned(64);
+    struct cap          bind[TS_COUNT];  /* 128-byte aligned by type (SC20a) */
 };
 _Static_assert(sizeof(struct thread) <= 4096, "TCB must fit in page 0 of the thread object");
 

@@ -16,7 +16,7 @@
 #include <tarka/thread.h>
 #include <tarka/vspace.h>
 
-_Static_assert(sizeof(struct cap) <= (1u << CAP_SLOT_BITS), "CNode slot size too small");
+_Static_assert(sizeof(struct cap) == (1u << CAP_SLOT_BITS), "a CNode slot is exactly one record");
 
 static struct cap root_slots[ROOT_CSPACE_SLOTS];
 static struct cspace root_cs;
@@ -44,7 +44,7 @@ static struct cspace cnode_of(paddr_t paddr, unsigned obj_bits)
  * drains the list, so kernel stack use is the same for one CNode or a
  * chain of a million. The list is intrusive: the link lives in slot 0's
  * `pending_link`, tagged with the CNode's size in its low 6 bits (slots
- * are 64-byte aligned). Clearing a slot preserves that word, so a
+ * are 128-byte aligned). Clearing a slot preserves that word, so a
  * revocation that deletes the capability in a pending CNode's slot 0
  * cannot cut the list.
  */

@@ -18,7 +18,7 @@
 #include <tarka/string.h>
 #include <tarka/vspace.h>
 
-_Static_assert(offsetof(struct thread, bind) % 64 == 0, "binding slots must be slot-aligned");
+_Static_assert(offsetof(struct thread, bind) % sizeof(struct cap) == 0, "binding slots must be slot-aligned");
 
 /* ---- run queue (FIFO; internal references, removed by the finaliser) ---- */
 

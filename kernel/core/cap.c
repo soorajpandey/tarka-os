@@ -25,9 +25,11 @@ void cap_slot_clear(struct cap *c)
     c->pending_link = link;
 }
 
-/* Incremented on every slot deletion. Lets revocation notice that a
- * finaliser deleted further capabilities behind its back (ADR 0006, O11). */
-static uint64_t cdt_generation;
+#ifdef TARKA_SELFTEST
+/* Steps taken by revocation (ADR 0010 gate SC31.4, until stage 6 turns
+ * it into the general work counter of SC27). */
+uint64_t cdt_revoke_steps;
+#endif
 
 void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn)
 {
@@ -43,6 +45,7 @@ void cap_set_cleanup(enum cap_type type, cap_cleanup_t fn)
 
 void cspace_init(struct cspace *cs, struct cap *storage, uint32_t nslots)
 {
+    KASSERT((uintptr_t)storage % _Alignof(struct cap) == 0);   /* SC20a */
     memset(storage, 0, sizeof(*storage) * nslots);
     cs->slots = storage;
     cs->nslots = nslots;
@@ -62,49 +65,117 @@ bool cap_same_object(const struct cap *a, const struct cap *b)
     return a && b && a->type == b->type && a->object == b->object;
 }
 
-struct cap *cap_object_first(struct cap *c)
-{
-    while (cap_same_object(c->prev, c))
-        c = c->prev;
-    return c;
-}
-
-/*
- * All capabilities to one object are contiguous in the CDT: the kernel
- * installs one root per object and every copy is derived from it. So a
- * capability is the last one to its object exactly when neither CDT
- * neighbour refers to the same object.
+/* ---- The CDT: a balanced-bracket list (ADR 0010, SC20) ----
+ *
+ * Every record contributes an open and a close element to one doubly
+ * linked list, and the list is well-nested. A record's parent is the pair
+ * that most tightly encloses its own. Each function below names the step
+ * of SC20's proof it implements and does nothing else to the list (gate
+ * SC31.1). Records are 128-byte aligned, so an element's offset within its
+ * record says which bracket it is.
  */
-static bool is_final(const struct cap *c)
+
+struct cap *cdt_elem_cap(const struct cdt_elem *e)
 {
-    return !cap_same_object(c->prev, c) && !cap_same_object(c->next, c);
+    return (struct cap *)((uintptr_t)e & ~(uintptr_t)(sizeof(struct cap) - 1));
 }
 
-/* Unlink `c` from the CDT. Its descendants move up one level so they
- * become children of `c`'s parent instead of being orphaned. */
+bool cdt_elem_is_open(const struct cdt_elem *e)
+{
+    return ((uintptr_t)e & (sizeof(struct cap) - 1)) == offsetof(struct cap, open);
+}
+
+static void elem_unlink(struct cdt_elem *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    if (e->next)
+        e->next->prev = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Proof step 1 (base): a record with no parent is an adjacent pair "()". */
+static void cdt_make_root(struct cap *c)
+{
+    c->open.prev = NULL;
+    c->open.next = &c->close;
+    c->close.prev = &c->open;
+    c->close.next = NULL;
+}
+
+/* Proof steps 1-3: `child` becomes `parent`'s child as an adjacent pair
+ * inserted immediately after open(parent). Nothing else moves. */
+void cap_insert_child(struct cap *parent, struct cap *child)
+{
+    struct cdt_elem *after = parent->open.next;   /* at least close(parent) */
+
+    KASSERT(after != NULL);
+    child->open.prev = &parent->open;
+    child->open.next = &child->close;
+    child->close.prev = &child->open;
+    child->close.next = after;
+    after->prev = &child->close;
+    parent->open.next = &child->open;
+}
+
+/* Proof steps 4-5: unlink both brackets. No other element moves, so every
+ * remaining record keeps its enclosures, and c's children are now most
+ * tightly enclosed by c's parent. O(1): no descendant is touched. */
 static void cdt_remove(struct cap *c)
 {
-    for (struct cap *n = c->next; n && n->depth > c->depth; n = n->next)
-        n->depth--;
-    if (c->prev)
-        c->prev->next = c->next;
-    if (c->next)
-        c->next->prev = c->prev;
+    elem_unlink(&c->open);
+    elem_unlink(&c->close);
 }
 
 bool cap_has_children(const struct cap *c)
 {
-    return c->next && c->next->depth > c->depth;
+    return c->open.next != &c->close;
 }
 
-void cap_insert_child(struct cap *parent, struct cap *child)
+/* The record whose open element directly follows open(c): by
+ * well-nestedness, a child of c (NULL if c has none). */
+struct cap *cap_first_child(const struct cap *c)
 {
-    child->depth = parent->depth + 1;
-    child->prev = parent;
-    child->next = parent->next;
-    if (parent->next)
-        parent->next->prev = child;
-    parent->next = child;
+    if (!cap_has_children(c))
+        return NULL;
+    KASSERT(cdt_elem_is_open(c->open.next));
+    return cdt_elem_cap(c->open.next);
+}
+
+/*
+ * TRANSITIONAL (ADR 0010 stage 1 only). The records of one object happen
+ * to form one contiguous run of the list under today's rules: derivation
+ * copies the source's object, and the only records whose children are
+ * other objects are Untypeds, which cannot be copied (O2). ADR 0010 does
+ * not allow the kernel to rely on that; stage 2 replaces these three
+ * functions with the live-record count (SC19a), and gate SC31.2 then
+ * forbids them.
+ */
+static bool is_final(const struct cap *c)
+{
+    if (c->open.prev && cap_same_object(cdt_elem_cap(c->open.prev), c))
+        return false;
+    if (c->close.next && cap_same_object(cdt_elem_cap(c->close.next), c))
+        return false;
+    return !cap_has_children(c) || !cap_same_object(cap_first_child(c), c);
+}
+
+struct cap *cap_object_first(struct cap *c)
+{
+    struct cdt_elem *e = &c->open;
+
+    while (e->prev && cap_same_object(cdt_elem_cap(e->prev), c))
+        e = e->prev;
+    KASSERT(cdt_elem_is_open(e));
+    return cdt_elem_cap(e);
+}
+
+struct cap *cap_object_next(const struct cap *x)
+{
+    for (struct cdt_elem *e = x->open.next; e && cap_same_object(cdt_elem_cap(e), x); e = e->next)
+        if (cdt_elem_is_open(e))
+            return cdt_elem_cap(e);
+    return NULL;
 }
 
 static void destroy_slot(struct cap *c)
@@ -124,7 +195,6 @@ static void destroy_slot(struct cap *c)
     uint64_t object = c->object;
 
     cdt_remove(c);
-    cdt_generation++;
     /* Clear the slot before the finaliser runs so nothing can observe or
      * reuse a half-deleted capability. */
     cap_slot_clear(c);
@@ -133,39 +203,38 @@ static void destroy_slot(struct cap *c)
         finalisers[type](type, object);
 }
 
-static struct cap *subtree_last(struct cap *c)
+/* SC20 corollary: the next record a revocation of c deletes. It is c's
+ * first child, except that an Untyped which still has descendants is
+ * never deleted (O8): revocation descends into it instead. That descent
+ * is bounded: each nested Untyped is strictly smaller than its parent. */
+static struct cap *revoke_victim(struct cap *c)
 {
-    struct cap *last = c;
+    struct cap *v = cap_first_child(c);
 
-    for (struct cap *n = c->next; n && n->depth > c->depth; n = n->next)
-        last = n;
-    return last;
+    while (v->type == CAP_UNTYPED && cap_has_children(v)) {
+#ifdef TARKA_SELFTEST
+        cdt_revoke_steps++;
+#endif
+        v = cap_first_child(v);
+    }
+    return v;
 }
 
+/* Delete c's descendants, one first child per step, with no search for
+ * the end of the subtree (ADR 0010 SC22): each step is O(1) apart from
+ * the bounded Untyped descent. Every intermediate state is a valid tree.
+ * A finaliser may delete further records, even c itself (O11); the loop
+ * re-reads c every step. Until stage 5, `budget` 0 still means "until
+ * done". */
 static int revoke(struct cap *c, uint32_t budget)
 {
-    struct cap *last = subtree_last(c);
-
-    /* Delete from the end of the subtree backwards. In pre-order every
-     * node's descendants follow it, so each node is a leaf by the time it
-     * is reached: nothing needs re-parenting, and stopping part-way leaves
-     * a valid tree that the next call continues from. */
-    for (uint32_t done = 0; last != c; done++) {
+    for (uint32_t done = 0; c->type != CAP_NULL && cap_has_children(c); done++) {
         if (budget && done == budget)
             return T_EAGAIN;
-
-        struct cap *prev = last->prev;
-        uint64_t gen = cdt_generation;
-
-        destroy_slot(last);
-
-        /* A finaliser (e.g. a CNode's) may have deleted more slots,
-         * possibly including `prev` or even `c`. The memory is still not
-         * reusable (no retype can run meanwhile), but the saved pointer
-         * may now name an empty slot: re-find the end of the subtree. */
-        if (c->type == CAP_NULL)
-            return T_OK;
-        last = cdt_generation == gen + 1 ? prev : subtree_last(c);
+#ifdef TARKA_SELFTEST
+        cdt_revoke_steps++;
+#endif
+        destroy_slot(revoke_victim(c));
     }
     return T_OK;
 }
@@ -201,6 +270,7 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
     c->type = type;
     c->rights = rights;
     c->object = object;
+    cdt_make_root(c);
     return T_OK;
 }
 

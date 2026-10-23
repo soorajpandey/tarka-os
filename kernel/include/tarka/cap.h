@@ -1,6 +1,7 @@
 #ifndef TARKA_CAP_H
 #define TARKA_CAP_H
 
+#include <stddef.h>
 #include <tarka/types.h>
 
 /*
@@ -45,11 +46,17 @@ typedef uint32_t cap_rights_t;
  * gets a struct cap_info from cap_identify() instead.
  *
  * Capabilities derived from one another form the capability derivation
- * tree (CDT), stored as a doubly linked list in pre-order with a depth per
- * node: the descendants of a node are the entries that follow it with a
- * greater depth. The tree spans every cspace, so revocation reaches copies
- * wherever they were delegated.
+ * tree (CDT), stored as a balanced-bracket list (ADR 0010, SC20): every
+ * record contributes an open and a close element to one doubly linked
+ * list, and a record's descendants are exactly the records whose brackets
+ * lie between its own. There is no depth: nesting alone is the tree. The
+ * tree spans every cspace, so revocation reaches copies wherever they
+ * were delegated.
  */
+struct cdt_elem {
+    struct cdt_elem *prev, *next;
+};
+
 struct cap {
     uint32_t     type;     /* enum cap_type */
     cap_rights_t rights;
@@ -60,20 +67,26 @@ struct cap {
         uint64_t map_state;    /* CAP_FRAME: va | rights | MAPPED;
                                 * CAP_PAGE_TABLE: depth | INSTALLED (ADR 0007) */
     };
-    struct cap  *prev;     /* CDT pre-order links */
-    struct cap  *next;
-    uint32_t     depth;    /* CDT depth; children are parent depth + 1 */
+    struct cdt_elem open;  /* CDT: this record's opening bracket */
+    struct cdt_elem close; /* CDT: this record's closing bracket */
     uint32_t     slot_flags; /* property of the slot, not of the capability in
                               * it: 0 for ordinary slots; SLOT_BINDING | index
                               * for a thread's binding slots (ADR 0008, T2) */
+    uint32_t     reserved0;  /* zero */
     uint64_t    *map_entry; /* CAP_FRAME / CAP_PAGE_TABLE: the hardware entry
                              * this capability filled, or NULL */
     uint64_t     pending_link; /* property of the slot: zero, except in slot 0 of
                                 * a CNode waiting to be drained (ADR 0008,
                                 * T33), see cnode_finalise() */
-};
+    uint64_t     reserved[6]; /* zero; for ADR 0010 stages 2-4 (SC20a) */
+} __aligned(128);
 
-_Static_assert(sizeof(struct cap) == 64, "struct cap must have no implicit padding");
+/* ADR 0010 SC20a: the size and alignment are part of the architecture.
+ * The alignment also lets a list element tell which bracket it is. */
+_Static_assert(sizeof(struct cap) == 128, "struct cap must be exactly 128 bytes");
+_Static_assert(_Alignof(struct cap) == 128, "struct cap must be 128-byte aligned");
+_Static_assert(offsetof(struct cap, reserved) + sizeof(((struct cap *)0)->reserved) == 128,
+               "struct cap must have no implicit padding");
 
 #define SLOT_BINDING     0x80000000u
 #define SLOT_BINDING_IDX 0x000000FFu

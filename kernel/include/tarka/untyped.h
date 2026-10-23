@@ -13,7 +13,7 @@
 #define CNODE_MAX_SLOT_BITS 12
 #define FRAME_BITS          12
 #define ENDPOINT_BITS       6
-#define CAP_SLOT_BITS       6      /* a CNode slot occupies 64 bytes */
+#define CAP_SLOT_BITS       7      /* a CNode slot occupies 128 bytes (ADR 0010, SC20a) */
 
 /* Frames kept in the kernel's own allocator; everything else becomes
  * Untyped. */

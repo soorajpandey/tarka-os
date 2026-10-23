@@ -45,11 +45,23 @@ static inline bool cap_badged_type(uint32_t type)
 /* True if both capabilities refer to the same object. */
 bool cap_same_object(const struct cap *a, const struct cap *b);
 
-/* All capabilities to one object are contiguous in the CDT; return the
- * first of them. Iterate with ->next while cap_same_object(). */
+/* TRANSITIONAL (ADR 0010 stage 1; replaced by live-record counts in
+ * stage 2): iterate over every record of c's object,
+ *   for (x = cap_object_first(c); x; x = cap_object_next(x)) */
 struct cap *cap_object_first(struct cap *c);
+struct cap *cap_object_next(const struct cap *x);
 
-/* Link `child` into the CDT directly after `parent`, as its first child. */
+/* The CDT as a balanced-bracket list (ADR 0010, SC20). */
+struct cap *cdt_elem_cap(const struct cdt_elem *e);
+bool cdt_elem_is_open(const struct cdt_elem *e);
+struct cap *cap_first_child(const struct cap *c);
+
+/* Link `child` into the CDT as `parent`'s first child: an adjacent pair
+ * immediately after open(parent). */
 void cap_insert_child(struct cap *parent, struct cap *child);
+
+#ifdef TARKA_SELFTEST
+extern uint64_t cdt_revoke_steps;
+#endif
 
 #endif

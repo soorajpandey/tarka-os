@@ -49,7 +49,7 @@ static unsigned count_with(const struct cap *c, cap_rights_t right, const struct
 {
     unsigned n = 0;
 
-    for (struct cap *x = cap_object_first((struct cap *)c); cap_same_object(x, c); x = x->next)
+    for (struct cap *x = cap_object_first((struct cap *)c); x; x = cap_object_next(x))
         if (x != except && (x->rights & right))
             n++;
     return n;

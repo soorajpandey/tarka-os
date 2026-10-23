@@ -1255,3 +1255,42 @@ Each stage keeps every existing test passing before the next begins.
    Then the work counter (SC27) across the whole suite.
 7. **Mutation testing, review, documentation,** and the amendments
    above. T36 is then satisfied.
+
+## Implementation notes
+
+**Stage 1 (done).**
+- `struct cap` is 128 bytes and 128-byte aligned. The CDT is a
+  balanced-bracket list; every CDT function in `cap.c` names the proof
+  step of SC20 it implements (gate SC31.1).
+- Revocation deletes the first child each step, with no subtree scan
+  (gate SC31.4). It never deletes an Untyped that still has descendants:
+  the victim search descends through such Untypeds (at most `CHAIN_MAX`
+  of them), so O8 holds at every step and the carving back-pointers of
+  stage 2 stay valid. The revoke API is unchanged until stage 5.
+- **Transitional:** `is_final()`, `cap_object_first()` and
+  `cap_object_next()` still decide finality and iterate an object's
+  records by list position, adapted to brackets. That is correct under
+  today's rules, but SC19a forbids relying on it. Stage 2 replaces them
+  with the live-record count, and gate SC31.2's build check then forbids
+  them.
+- **Tests:**
+  - every existing CDT, revocation, Untyped and transfer-conservation
+    test now checks parentage, never depth or list order
+  - a reference forest checks the A{B{C{D},E}} deletion orders, the
+    revision-2 counterexample (and that revoking w leaves z alone),
+    re-derivation into the same slots across cspaces, and 1,600 random
+    derive, delete and one-step-revoke operations over two cspaces and
+    several objects, including the finaliser firing exactly at the last
+    record
+  - an Untyped descent test asserts the exact deletion order and step
+    count
+  - a 3,071-record subtree (a chain and a fan) is revoked one record per
+    call, at exactly one step each
+- **Mutation testing:** 11 mutants, 10 caught. The equivalent one
+  deletes the last child instead of the first: any child is a correct
+  revocation victim, and both are O(1). SC22 names the first child only
+  to fix one choice.
+- **Records on the stack:** doubling the record size pushed a test
+  frame holding eight records over the 1 KiB frame limit (T33); test
+  storage for records is now static. No kernel function keeps a record
+  on its stack.
