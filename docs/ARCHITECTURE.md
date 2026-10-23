@@ -53,13 +53,13 @@
 | CPU hardening | `arch/x86_64/cpu.c` | done |
 | Page-table inspection | `arch/x86_64/paging.c` | query, kernel guard pages |
 | Physical memory | `core/pmm.c` | bitmap allocator |
-| Capabilities | `core/cap.c`, `core/objmeta.c`, `core/reaper.c` | flat cspaces; 128-byte records in a bracket-list derivation tree across cspaces; resumable revocation; per-object live-record, rights and frame-alias counts (finality by count only), carving back-pointers, derivation freeze check; never-reused serials; dying objects torn down by the reaper; finalisers |
+| Capabilities | `core/cap.c`, `core/objmeta.c`, `core/reaper.c`, `core/cont.c` | flat cspaces; 128-byte records in a bracket-list derivation tree across cspaces; resumable revocation; per-object live-record, rights and frame-alias counts (finality by count only), carving back-pointers, derivation freeze check; never-reused serials; dying objects torn down by the reaper; finalisers |
 | Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
 | Address spaces, page tables | `arch/x86_64/vspace.c` | done ([ADR 0007](adr/0007-address-spaces.md)): install/map/unmap/protect, W^X across aliases, teardown in any order |
 | Threads, user entry, syscalls, faults | `arch/x86_64/thread.c`, `user.c`, `isr.S`, `user_entry.S`, `core/syscall.c`, `core/uaccess.c` | done ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)): ring 3 runs; 28 syscalls; FIFO run queue without preemption |
 | Local APIC | `arch/x86_64/lapic.c` | x2APIC or xAPIC (MMIO); self-IPI, self-NMI, one-shot timer |
 | IPC, notifications, fault IPC | `core/ipc.c`, `endpoint.c`, `notification.c` | done ([ADR 0009](adr/0009-ipc.md)): send/recv/call/reply/reply_recv, capability transfer, badges, notifications, fault delivery |
-| Scheduler with timer preemption, bounded kernel work | | specified ([ADR 0010](adr/0010-scheduler.md)); stages 1-3 done (bracket-list CDT; counters, frame metadata table and creation gates; serials, bounded page-table detach, dying objects and the reaper); stage 4 (thread continuations) next. Gate for untrusted code (ADR 0008 T36) |
+| Scheduler with timer preemption, bounded kernel work | | specified ([ADR 0010](adr/0010-scheduler.md)); stages 1-4 done (bracket-list CDT; counters, frame metadata table and creation gates; serials, bounded page-table detach, dying objects and the reaper; thread continuations: revocation with the derivation freeze, the chunked receive drain, the retype limit); stage 5 (scheduler plumbing) next. Gate for untrusted code (ADR 0008 T36) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
 | IOMMU, DMA domains | | planned ([ADR 0001](adr/0001-microkernel.md)) |

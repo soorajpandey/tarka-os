@@ -5721,6 +5721,27 @@ static void test_revoke_chunks(void)
     k1.slot = 1;                                                /* aimed at it */
     CHECK(cap_revoke_chunk(&cs, &k1) == T_EINTR);               /* no mark: never the root */
     cspace_destroy(&cs);
+
+    /* E1 property 5: the identity, not only the mark. A cancelled
+     * revocation's slot later holds a different object, which a second
+     * revocation has marked. The first continuation must not adopt that
+     * root: T_EINTR, and the second keeps its mark, freeze and subtree. */
+    big_build(&cs, 0x3003);
+    CHECK(cap_revoke_begin(&cs, 0, &k) == CONT_PENDING);
+    cap_revoke_abandon(&cs, &k);                                /* first: cancelled */
+    for (cap_slot_t i = 0; i < 4; i++)
+        CHECK(cap_delete(&cs, i) == T_OK);
+    CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_ALL, 0x3004) == T_OK);   /* object B */
+    CHECK(cap_derive(&cs, 0, 1, CAP_R_ALL, 0) == T_OK && cap_derive(&cs, 0, 2, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_revoke_begin(&cs, 0, &k2) == CONT_PENDING);       /* second, on B */
+    CHECK(cap_revoke_chunk(&cs, &k) == T_EINTR);                /* never adopted */
+    CHECK((cs.slots[0].rights & CAP_R_REVOKING) && obj_frozen(&cs.slots[0]));
+    CHECK(cs.slots[1].type == CAP_TEST_TOKEN && cs.slots[2].type == CAP_TEST_TOKEN);
+    int rc2;
+    while ((rc2 = cap_revoke_chunk(&cs, &k2)) == CONT_PENDING)
+        ;
+    CHECK(rc2 == T_OK && cs.slots[1].type == CAP_NULL);
+    cspace_destroy(&cs);
     CHECK(meta_audit());
 }
 
@@ -5946,6 +5967,95 @@ static void test_reaper_r6(void)
         CHECK(slot_paddr(101) == slot_paddr(100) && AUDIT());
         ut_teardown();
     }
+}
+
+/* E3: a revocation that reaches an Untyped pinned by dying objects
+ * deletes nothing in that chunk and yields; reaper work happens before
+ * its next chunk; M = (R, B) falls lexicographically every time; and the
+ * revocation completes. */
+static void test_revoke_blocked(void)
+{
+    struct thread_cont k = { 0 };
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 100, 1) == T_OK);   /* Ua: the victim */
+    CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    const cap_slot_t w[] = { 10, 20, 30, 40, 50, 60 };
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+        CHECK(ep_thread(w[i], false, 0, 0, CAP_R_READ));
+    run_user();
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++) {
+        struct cspace c = task_cs(w[i]);
+        CHECK(cap_delete(&c, 1) == T_OK);
+    }
+    CHECK(cap_delete(&uts, 1) == T_OK && ut_store[100].ut.dying == 1);   /* pinned */
+    /* Revoke U0: its subtree holds the tasks and Ua. */
+    CHECK(cap_revoke_begin(&uts, 0, &k) == CONT_PENDING);
+    unsigned blocked = 0, rounds = 0;
+    uint64_t r_prev = UINT64_MAX;
+    bool lex = true;
+    int rc;
+    for (;;) {
+        unsigned before = 0;
+        for (cap_slot_t i = 1; i < ARRAY_SIZE(ut_store); i++)
+            before += ut_store[i].type != CAP_NULL;
+        uint64_t units = reaper_units_total;
+        rc = cap_revoke_chunk(&uts, &k);
+        unsigned after = 0;
+        for (cap_slot_t i = 1; i < ARRAY_SIZE(ut_store); i++)
+            after += ut_store[i].type != CAP_NULL;
+        if (rc != CONT_PENDING)
+            break;
+        if (after == before) {
+            /* Blocked: nothing deleted, so B must fall before the next
+             * chunk. This is the boundary schedule() would pass. */
+            blocked++;
+            CHECK(ut_store[100].ut.dying > 0);
+            reaper_run(REAP_CHUNK);
+            lex &= reaper_units_total > units;
+        } else {
+            lex &= after < r_prev || r_prev == UINT64_MAX;   /* R fell */
+        }
+        r_prev = after;
+        if (++rounds > 10000)
+            break;
+    }
+    CHECK(rc == T_OK && blocked >= 1 && lex);
+    CHECK(ut_store[100].type == CAP_NULL && !cap_has_children(&ut_store[0]));
+    CHECK(!(ut_store[0].ut.flags & OBJ_FROZEN) && !(ut_store[0].rights & CAP_R_REVOKING));
+    reap_all();
+    CHECK(AUDIT());
+    ut_teardown();
+}
+
+/* SC16: no result before the final chunk. Before every chunk at
+ * dispatch, the revoker's RAX still holds what it entered the syscall
+ * with. */
+static bool rax_untouched;
+static void hook_rax(struct thread *t)
+{
+    rax_untouched &= t->regs.rax == SYS_CAP_REVOKE;
+}
+
+static void test_revoke_no_early_result(void)
+{
+    struct cspace bs;
+    enum { N = 400 };
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL) && thread_suspend(&uts, 10 + T_THR) == T_OK);
+    revoke_subtree(10, &bs, N);
+    nreq = 0;
+    REQ(10, SYS_CAP_REVOKE, 2);
+    rax_untouched = true;
+    uint64_t chunks = cont_chunks_run;
+    cont_test_hook = hook_rax;
+    go(10);
+    cont_test_hook = NULL;
+    CHECK(cont_chunks_run - chunks >= N / REVOKE_CHUNK - 1 && rax_untouched);
+    CHECK(res(10, 0) == T_OK && live_in(&bs, N) == 0);
+    cspace_destroy(&bs);
+    ut_teardown();
 }
 
 /* ---- Stage 4: the receive drain as a continuation (ADR 0010 SC25;
@@ -6220,6 +6330,8 @@ static const struct {
     { "revoke_chunks", test_revoke_chunks },
     { "revoke_cancel", test_revoke_cancel },
     { "revoke_syscall", test_revoke_syscall },
+    { "revoke_blocked", test_revoke_blocked },
+    { "revoke_no_early_result", test_revoke_no_early_result },
     { "retype_limit", test_retype_limit },
     { "drain_chunks", test_drain_chunks },
     { "drain_identity", test_drain_identity },

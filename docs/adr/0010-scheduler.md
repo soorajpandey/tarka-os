@@ -2032,3 +2032,85 @@ the whole suite.
 - **Not tested directly:** R6 (stopping the deleting thread changes
   nothing). It holds by construction: the death commits in the
   deleter's entry, and the reaper refers to no thread.
+
+**Stage 4 (done).** Revision 3e, E0-E10, in two layers.
+- **Continuations** (`core/cont.c`, `struct thread_cont` in the TCB).
+  - **What they hold:** values only: the kind, the slot, the target's
+    identity (type, object, serial), and a cursor (`aux`). The captured
+    offer and reply live in the TCB's `offer` and `msg`. No pointer
+    survives between chunks; even the transfer plan is rebuilt in each.
+  - **How they run:** the first chunk runs in the syscall. An unfinished
+    operation yields, RUNNABLE, to the tail. `schedule()` runs the next
+    chunk instead of entering user mode (E4), and only the final chunk
+    writes RAX.
+  - **How they stop:** every stop goes through `thread_stop()` →
+    `cont_abandon()` first. That releases what the continuation holds
+    and leaves `T_EINTR`, unless the thread is being destroyed.
+  - **IPC audit rule 12:** a continuation only on a RUNNABLE or RUNNING
+    thread, of a known kind, with no residue. Rules 7 and 8 let a drain
+    continuation hold its offer and captured reply.
+- **Revocation** (`SYS_CAP_REVOKE`):
+  - **The root and the freeze.** The root gets the kernel-only
+    `CAP_R_REVOKING` mark. It is masked from `cap_identify`, masked in
+    derivation, and refused by `cap_delete`. The object, or for an
+    Untyped root the Untyped itself, is frozen.
+  - **Each chunk** re-resolves the root by slot, identity and mark, and
+    deletes at most `REVOKE_CHUNK` (8) first children. It yields on an
+    Untyped pinned by dying objects (E3).
+  - **Cancellation.** `destroy_slot()` and `cap_reap_slot()` cancel a
+    marked root before deleting it: an enclosing revocation, the reaper,
+    or a finaliser. The owner then finds no marked root with its
+    identity and ends with `T_EINTR`.
+  - **The kernel API** `cap_revoke()` keeps its step budget for tests,
+    and refuses a marked root.
+  - **The audit** checks the one-to-one correspondence of marked root,
+    frozen object and revocation continuation, from both sides.
+- **The receive drain** (`recv`, `reply_recv`):
+  - **Capture once.** The slot and identity, the offer and, for
+    `reply_recv`, the reply (`reply_capture()`, which reads user memory
+    once), and k from the endpoint's own `senders.len`. Wait queues now
+    keep their length; the audit checks it.
+  - **Each chunk** re-resolves the endpoint. A different endpoint in
+    the slot gets `T_EBADCAP`. It fails at most `DRAIN_CHUNK` (8)
+    senders, each exactly once.
+  - **`reply_recv`** commits its reply after at most k failures, with
+    `reply_validate()` re-run on the captured copy, then continues as a
+    plain receive (E2).
+- **The retype limit:** `RETYPE_ZERO_MAX` is 512 KiB; Untyped children
+  are exempt (SC28).
+- **Unbounded loops:** `waitq_wake_all()` is now test-only. `drain()`
+  and the unbudgeted revocation reachable from a syscall are gone.
+- **Tests:**
+  - `revoke_chunks`: a 3,071-record subtree, exactly `REVOKE_CHUNK` per
+    chunk, against the reference forest. Also the F4 and F5 refusals,
+    the mark never shown, abandonment, and E1 properties 5 and 8: a
+    cancelled continuation never adopts another revocation's root,
+    even in its own slot.
+  - `revoke_cancel`: an enclosing revocation, and the reaper.
+  - `revoke_syscall`: user threads; derivers refused throughout; and
+    suspend, cspace unbind and destruction mid-way, each releasing the
+    freeze and leaving `T_EINTR`.
+  - `revoke_blocked`: E3's measure, step by step.
+  - `revoke_no_early_result`: RAX untouched before the final chunk.
+  - `drain_chunks`: two chunks; each sender failed once; the offer
+    rewritten in user memory between chunks has no effect.
+  - `drain_identity`: the endpoint deleted, or replaced in its slot,
+    between chunks.
+  - `drain_reply_bound`: senders that re-send after every failure delay
+    the reply by exactly the k senders of the snapshot. It uses a new
+    `resend` user program, and senders that share a task at two slots
+    each.
+  - `retype_limit`, at the exact boundary.
+  - `reaper_r6`: R6 tested directly. The deleter stops, or destroys,
+    itself in its next syscall; the reaper had done no unit when it
+    stopped, and the teardown is exact.
+- **Mutation testing:** 24 stage-4 mutants, aimed at identity, cursor,
+  ownership and interruption. 23 are caught. One is equivalent: masking
+  the mark in derivation can never be observed, since a marked root's
+  object is always frozen and derivation from it is refused first. The
+  mask stays as defence in depth.
+  - **A survivor that taught something:** the first run let
+    `rev_no_identity` (resume on the mark alone) survive. A cancelled
+    continuation could adopt a later revocation's root in its own slot,
+    giving two owners for one freeze. The test above now catches it.
+  - The stage 2 and stage 3 sets were re-run against stage 4.
