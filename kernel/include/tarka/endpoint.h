@@ -14,6 +14,7 @@ struct endpoint {
     struct waitq    senders;    /* kind = THREAD_BLOCKED_SEND */
     struct waitq    receivers;  /* kind = THREAD_BLOCKED_RECV */
     struct obj_meta meta;       /* live and rights counts (ADR 0010, SC17, SC19a) */
+    uint64_t        reap_next;  /* the reaper link while listed (SC24) */
 };
 _Static_assert(sizeof(struct endpoint) <= 128, "endpoint must fit its 128-byte object");
 

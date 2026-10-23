@@ -18,6 +18,7 @@
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
+#include <tarka/reaper.h>
 #include <tarka/syscall.h>
 #include <tarka/untyped.h>
 
@@ -53,8 +54,11 @@ unsigned notification_signal_caps(const struct cap *c)
  * deletion completes (P27, I-L1). The count still includes `c`. */
 static void notification_cleanup(struct cap *c)
 {
-    if ((c->rights & CAP_R_WRITE) && count_write(c) == 1)
-        waitq_wake_all(&notification_of(c)->waiters, T_EDEAD);
+    struct notification *n = notification_of(c);
+
+    /* Failed by the reaper, one per unit (SC23). */
+    if ((c->rights & CAP_R_WRITE) && count_write(c) == 1 && n->waiters.head)
+        reaper_doom(c, &n->meta, OBJ_DOOM_RECV);
 }
 
 /* Last capability deleted: nobody is waiting any more (O10). */
@@ -63,7 +67,8 @@ static void notification_finalise(enum cap_type type, uint64_t object)
     struct notification *n = phys_to_virt(pa(object & ~CAP_OBJ_BITS_MASK));
 
     (void)type;
-    waitq_wake_all(&n->waiters, T_EDEAD);
+    /* Finalised at once only when nobody waits (SC23). */
+    KASSERT(!n->waiters.head);
 }
 
 void notification_boot(void)

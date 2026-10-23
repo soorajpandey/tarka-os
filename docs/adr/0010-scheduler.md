@@ -1657,3 +1657,100 @@ stage 2; 2.0 MiB from stage 3, with D3). Endpoints and notifications are 128 byt
   assertion in the metadata code compiled out, so that only the tests
   could catch them: all 18 were caught, most by the oracle.
 
+**Stage 3 (done).** Revision 3d, D1-D8, in three layers, each passing
+the whole suite.
+- **Serials (D3, SC21).** `struct obj_meta` is 32 bytes and carries a
+  serial; an Untyped's metadata is a 24-byte `struct ut_meta` in its own
+  record (no live count, O2). One counter issues every serial.
+  - It only increases. Retype checks at its new step 5b that enough
+    serials remain, otherwise `T_ENOMEM` with nothing changed.
+  - `obj_identity_is()` is the single identity predicate: type, address
+    and serial together.
+  - The frame table is now 2,044 KiB at 256 MiB (measured at boot).
+  - The record still fits in 128 bytes: `pending_link` became the CNode
+    header's reaper link (in the metadata union), and `reserved0` became
+    the slot property `slot_aux` (the reaper's cursor).
+- **Bounded detach (D1, V15').**
+  - Every fill and clear of a hardware entry goes through `entry_fill()`
+    and `entry_clear()`, which keep the table's filled-entry count in
+    its frame table entry.
+  - `vspace_uninstall` clears one entry.
+  - Deleting a PageTable, or an AddressSpace, detaches only its own
+    entries.
+  - `vspace_install()` reads the count at the reachability commit and
+    refuses a populated table.
+  - Metadata is now cleared by `meta_retire()` once teardown completes,
+    never when the count reaches 0, so an AddressSpace finaliser still
+    sees its own counts.
+- **Dying objects and the reaper (SC23, SC24, D2, D4, D5).**
+  - **The death transaction.** `destroy_slot()` runs it in R0's order:
+    count to 0, then `reaper_take()` (mark dying, read the carver, raise
+    its dying count, list), then unlink the record and clear the slot.
+  - **What dies through the reaper:** every CNode, and an endpoint or
+    notification that has waiters or is already listed. Everything else
+    is finalised at once, within `UNIT_MAX`. "Every CNode", not only
+    occupied ones, avoids a scan in the deleter's entry; an empty CNode
+    costs the reaper one unit.
+  - **Authority loss** lists a live object with its doomed direction
+    (`OBJ_DOOM_SEND`, `OBJ_DOOM_RECV`) instead of waking every waiter in
+    the deleter's entry.
+  - **One reaper unit** is one of: one waiter failed with `T_EDEAD`;
+    one CNode slot deleted; for an Untyped in a dying CNode, one
+    descendant deleted (the Untyped frozen by the reaper, F7); or a
+    requeue (D2). Its completing unit unlists the object, drops the
+    dying count and retires the metadata, together.
+  - **Where it runs** (until stage 5): at the top of each pass of
+    `schedule()`, `REAP_CHUNK` (4) units at a time. With nothing
+    runnable the loop keeps reaping, one chunk per pass: the idle loop
+    of D5.
+  - **The old drain is gone.** `cnode_finalise()` and its pending list
+    are removed; T33's constant stack now comes from the reaper's flat
+    list.
+  - **Amended O7/O8.** The watermark is not reset while the dying count
+    is non-zero; a retype that then does not fit gets `T_EAGAIN`.
+    Deleting such an Untyped gets `T_EBUSY`, and a revocation that
+    reaches one gets `T_EAGAIN`.
+  - **D2 at a deeper level.** The victim search can also stop at a
+    *nested* Untyped with dying objects. That blocks too and requeues,
+    and D2's proof covers it: everything carved from the nested
+    Untyped is younger still.
+- **Audits.** The oracle now also checks:
+  - every object's serial: issued, unique, and greater than its
+    carver's
+  - each table's filled count against its hardware entries
+  - R3: no object with a record is dying; only a live endpoint or
+    notification may be listed, and only with a doomed direction
+  - the reaper list itself: each entry listed once and flagged as
+    listed; each dying entry has no records, has a serial, and was
+    carved from a live Untyped
+  - each Untyped's dying count against the dying entries naming it,
+    counted from the list and never read from the kernel's tally
+- **Tests:**
+  - `reaper_dying`: the R0 state after the death; `T_EAGAIN` and
+    `T_EBUSY` with byte-identical state while pinned; exactly
+    `REAP_CHUNK` waiters per boundary, each failed once; the memory
+    reset only afterwards
+  - `reaper_aba`: the two-phase D7 test (below)
+  - `reaper_requeue`: D2's proof at run time, from a trace of every
+    unit. It checks: the requeue happens; only strictly younger objects
+    are worked on; real work separates requeues; Y1-Y3 finish before X,
+    which finishes last; and F7's freeze refuses derivation from a live
+    descendant mid-teardown.
+  - `serial_exhaustion`
+  - `vspace_teardown`, rewritten for V15': detach is not destruction,
+    and a populated table is installable only after its holders empty
+    it level by level
+  - existing liveness tests now check both halves: still pending after
+    the deletion, done after the reaper runs
+- **A test that first proved too little.** The first ABA test passed
+  even with the pin removed: B came from the same Untyped as A and was
+  alive, and a live child alone blocks a reset. Now B comes from
+  another Untyped, so only A's pin keeps D off A's address. With the
+  pin removed and the oracle switched off, the test fails on its own:
+  D lands at A's address, A's reaper corrupts it, and the kernel
+  faults.
+- **Mutation testing:** 24 stage-3 mutants, all caught (see the stage 3
+  commit message for the list).
+- **Not tested directly:** R6 (stopping the deleting thread changes
+  nothing). It holds by construction: the death commits in the
+  deleter's entry, and the reaper refers to no thread.

@@ -90,6 +90,11 @@ struct obj_meta {
 };
 
 #define OBJ_FROZEN     0x1u    /* a revocation is emptying a subtree under it */
+#define OBJ_DYING      0x2u    /* no capability left; owned by the reaper (SC23) */
+#define OBJ_LISTED     0x4u    /* on the reaper's list (R1, R2) */
+#define OBJ_DOOM_SEND  0x8u    /* endpoint: last READ gone, senders to fail */
+#define OBJ_DOOM_RECV  0x10u   /* endpoint: last WRITE gone, receivers to fail;
+                                * notification: last WRITE gone, waiters to fail */
 #define OBJ_BITS_SHIFT 8       /* CAP_CNODE: object size bits, set at retype */
 #define OBJ_BITS_MASK  (0xFFu << OBJ_BITS_SHIFT)
 
@@ -201,10 +206,13 @@ void cap_set_cleanup(enum cap_type type, cap_cleanup_t fn);
  * those links dangling. Use cspace_destroy() first. */
 void cspace_init(struct cspace *cs, struct cap *storage, uint32_t nslots);
 
-/* Delete every capability in `cs` so that no CDT link points into its
- * storage. Untypeds are revoked first (ADR 0006, O8). Must be called
- * before the storage is freed or goes out of scope. */
+#ifdef TARKA_SELFTEST
+/* Test storage only: delete every capability in `cs` so that no CDT link
+ * points into it. Untypeds are revoked first (ADR 0006, O8), running the
+ * reaper until their dying objects are gone (unbounded: never called by
+ * the kernel itself, whose CNodes are torn down by the reaper). */
 void cspace_destroy(struct cspace *cs);
+#endif
 
 /* Install a new root capability. Only the kernel calls this while
  * constructing the initial task; it is never reachable from user space. */

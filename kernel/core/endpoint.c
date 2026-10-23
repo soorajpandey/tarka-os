@@ -26,6 +26,7 @@
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
+#include <tarka/reaper.h>
 #include <tarka/string.h>
 #include <tarka/syscall.h>
 #include <tarka/untyped.h>
@@ -70,10 +71,13 @@ static void endpoint_cleanup(struct cap *c)
 {
     struct endpoint *e = endpoint_of(c);
 
-    if ((c->rights & CAP_R_READ) && count_with(c, CAP_R_READ) == 1)
-        waitq_wake_all(&e->senders, T_EDEAD);
-    if ((c->rights & CAP_R_WRITE) && count_with(c, CAP_R_WRITE) == 1)
-        waitq_wake_all(&e->receivers, T_EDEAD);
+    /* Authority loss (SC23): the doomed waiters are failed by the reaper,
+     * one per unit, not all in this entry. A count that reaches 0 never
+     * rises again, so a doomed queue only shrinks. */
+    if ((c->rights & CAP_R_READ) && count_with(c, CAP_R_READ) == 1 && e->senders.head)
+        reaper_doom(c, &e->meta, OBJ_DOOM_SEND);
+    if ((c->rights & CAP_R_WRITE) && count_with(c, CAP_R_WRITE) == 1 && e->receivers.head)
+        reaper_doom(c, &e->meta, OBJ_DOOM_RECV);
 }
 
 static void endpoint_finalise(enum cap_type type, uint64_t object)
@@ -81,12 +85,9 @@ static void endpoint_finalise(enum cap_type type, uint64_t object)
     struct endpoint *e = phys_to_virt(pa(object & ~CAP_OBJ_BITS_MASK));
 
     (void)type;
-    /* The final capability's cleanup hook has already run, and it held
-     * whatever authority remained, so P43/P44 emptied both queues. The
-     * wakes below are defence in depth (P26). */
+    /* Finalised at once only when nobody waits (an endpoint with waiters
+     * dies through the reaper, SC23), so there is nothing to wake. */
     KASSERT(!e->senders.head && !e->receivers.head);
-    waitq_wake_all(&e->senders, T_EDEAD);
-    waitq_wake_all(&e->receivers, T_EDEAD);
 }
 
 void endpoint_boot(void)

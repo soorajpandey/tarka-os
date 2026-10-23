@@ -15,6 +15,7 @@
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
+#include <tarka/reaper.h>
 #include <tarka/string.h>
 #include <tarka/thread.h>
 #include <tarka/uaccess.h>
@@ -411,6 +412,26 @@ static bool ut_setup(unsigned bits)
     return false;
 }
 
+/* Let the reaper finish every dying object (SC24): what a test means by
+ * "and then the memory is free again" (R4, amended O7). Bounded: the
+ * reaper panics if it does not end. */
+static void reap_all(void)
+{
+    (void)reaper_drain(1ul << 24);
+}
+
+/* Revoke completely: T_EAGAIN means an Untyped below still has dying
+ * objects (amended O8), which the reaper finishes. */
+static int revoke_all(struct cspace *cs, cap_slot_t slot)
+{
+    int rc;
+
+    while ((rc = cap_revoke(cs, slot, 0)) == T_EAGAIN)
+        reap_all();
+    reap_all();
+    return rc;
+}
+
 static void ut_teardown(void)
 {
     cspace_destroy(&uts); /* revokes the test Untyped, then deletes it */
@@ -594,7 +615,7 @@ static void test_untyped_overlap(void)
     rng_state = 0x7a72a05ull;
 
     for (int round = 0; round < 8; round++) {
-        CHECK(cap_revoke(&uts, 0, 0) == T_OK);
+        CHECK(revoke_all(&uts, 0) == T_OK);
         uint32_t nobj = 0;
         objs[0].base = slot_paddr(0);
         objs[0].size = 1ull << 18;
@@ -626,6 +647,10 @@ static void test_untyped_overlap(void)
                 break;
 
             int rc = cap_retype(&uts, src, t, sb, &uts, dst, count);
+            if (rc == T_EAGAIN) {   /* a reset waits for the reaper (SC23) */
+                reap_all();
+                continue;
+            }
             if (rc == T_ENOMEM || rc == T_EINVAL) {
                 if (rc == T_ENOMEM && src == 0)
                     break;
@@ -696,6 +721,10 @@ static void test_untyped_revoke(void)
     CHECK(cap_derive_to(&uts, 1, &cn, 0, CAP_R_ALL, 0) == T_OK);
     CHECK(cap_derive_to(&cn, 0, &cn, 3, CAP_R_READ, 0) == T_OK);
     CHECK(cap_delete(&uts, 2) == T_OK);
+    /* SC23: the CNode is dying; the reaper empties it later. Until then
+     * its slots still hold their records (nobody can reach them). */
+    CHECK(cap_has_children(&ut_store[1]));
+    reap_all();
     CHECK(!cap_has_children(&ut_store[1]));
     CHECK(!(cdt_elem_cap(ut_store[1].open.next) >= cn_lo && cdt_elem_cap(ut_store[1].open.next) < cn_hi));
     CHECK(!ut_store[1].close.next ||
@@ -1024,7 +1053,11 @@ static void test_cnode_chain(void)
     }
     CHECK(built == 1000);
     CHECK(cap_delete(&uts, 1) == T_OK);
-    CHECK(!cap_has_children(&ut_store[0])); /* all 1000 drained */
+    /* Each CNode dies through the reaper, which meets the next one in
+     * slot 0 and lists it: an iterative walk, constant stack (T33). */
+    CHECK(cap_has_children(&ut_store[0]) && ut_store[0].ut.dying == 1);
+    reap_all();
+    CHECK(!cap_has_children(&ut_store[0]) && ut_store[0].ut.dying == 0); /* all 1000 */
     CHECK(cdt_consistent(&uts));
 
     /* A revocation during the drain deletes the capability held in slot 0
@@ -1040,10 +1073,12 @@ static void test_cnode_chain(void)
     CHECK(cnode_view(&a, 1, &b) == T_OK && cnode_view(&a, 2, &c) == T_OK);
     CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &b, 1, 1) == T_OK);      /* leak detector */
     CHECK(cap_retype(&a, 3, CAP_FRAME, 0, &c, 0, 1) == T_OK);           /* C[0] from U2 */
-    /* Draining A pushes B, then C (C's link -> B), then revoking U2
-     * deletes C[0]. */
+    /* The reaper lists B and C while emptying A, and revoking U2 deletes
+     * C[0] while C is still listed: C's list link (a slot property) must
+     * survive, or the endpoint below leaks. */
     CHECK(cap_delete(&uts, 1) == T_OK);
-    CHECK(!cap_has_children(&ut_store[0]));
+    reap_all();
+    CHECK(!cap_has_children(&ut_store[0]) && ut_store[0].ut.dying == 0);
     CHECK(cdt_consistent(&uts));
 
     ut_teardown();
@@ -2630,7 +2665,13 @@ static void test_notif_liveness(void)
     CHECK(COUNTS(1) && tstate(30) == THREAD_BLOCKED_NOTIF);
     /* The last signal authority goes: the waiter wakes with T_EDEAD. */
     CHECK(cap_delete(&uts, 3) == T_OK);
+    /* SC23: authority loss lists the live object with its doomed
+     * direction; the reaper fails the waiter. */
+    CHECK(COUNTS(0) && tstate(30) == THREAD_BLOCKED_NOTIF && n->waiters.head == th(30));
+    CHECK((n->meta.flags & (OBJ_LISTED | OBJ_DOOM_RECV)) == (OBJ_LISTED | OBJ_DOOM_RECV));
+    reap_all();
     CHECK(COUNTS(0) && tstate(30) == THREAD_RUNNABLE && !n->waiters.head);
+    CHECK(!(n->meta.flags & (OBJ_LISTED | OBJ_DOOM_RECV | OBJ_DYING)));
     CHECK(ipc_audit(nq, 1));
     run_user();
     CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EDEAD);
@@ -2675,7 +2716,13 @@ static void test_notif_destroy(void)
     }
     CHECK(tstate(30) == THREAD_BLOCKED_NOTIF);   /* the master (WRITE) still exists */
     CHECK(cap_delete(&uts, 1) == T_OK);          /* last WRITE and last cap */
+    /* SC23: dying, with its waiters still queued; the reaper fails them
+     * one per unit, and only then is the memory released. */
+    CHECK(tstate(30) == THREAD_BLOCKED_NOTIF && tstate(50) == THREAD_BLOCKED_NOTIF);
+    CHECK((n->meta.flags & OBJ_LISTED) && notif_ok(n));
+    reap_all();
     CHECK(tstate(30) == THREAD_RUNNABLE && tstate(50) == THREAD_RUNNABLE);
+    CHECK(!(n->meta.flags & OBJ_LISTED) && ut_store[0].ut.dying == 0);
     run_user();
     CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD &&
           (int64_t)test_reports[1].a == T_EDEAD);
@@ -2704,7 +2751,8 @@ static struct ipc_buffer *tbuf(cap_slot_t b)
 /* A thread at uts slots b.. that performs one SEND (with `tag` as its only
  * word) or one RECV on its cspace slot 1, with its data page bound as its
  * IPC buffer, and the endpoint capability given with `rights`. */
-static bool ep_thread(cap_slot_t b, bool send, uint64_t label, uint64_t tag, cap_rights_t rights)
+static bool ep_thread_on(cap_slot_t b, cap_slot_t ep, bool send, uint64_t label, uint64_t tag,
+                         cap_rights_t rights)
 {
     struct user_regs r = { .r12 = send ? SYS_SEND : SYS_RECV, .rdi = 1,
                            .rsi = MSG_INFO(label, 1) };
@@ -2712,8 +2760,14 @@ static bool ep_thread(cap_slot_t b, bool send, uint64_t label, uint64_t tag, cap
         return false;
     struct cspace cs = task_cs(b);
     tbuf(b)->words[0] = send ? tag : 0xAAAAAAAAAAAAAAAAull;
-    return cap_derive_to(&uts, 1, &cs, 1, rights, 0) == T_OK &&
+    return cap_derive_to(&uts, ep, &cs, 1, rights, 0) == T_OK &&
            thread_bind(&uts, b + T_THR, TS_IPCBUF, &uts, b + T_DATA) == T_OK;
+}
+
+/* A thread at b using the endpoint in uts slot 1, from its cspace slot 1. */
+static bool ep_thread(cap_slot_t b, bool send, uint64_t label, uint64_t tag, cap_rights_t rights)
+{
+    return ep_thread_on(b, 1, send, label, tag, rights);
 }
 
 static uint64_t got(cap_slot_t b) { return tbuf(b)->words[0]; }
@@ -2978,7 +3032,13 @@ static void test_ep_liveness(void)
     CHECK(cap_delete(&uts, 2) == T_OK);              /* 3 re-parents */
     CHECK(EPC(CAP_R_READ, 1) && tstate(10) == THREAD_BLOCKED_SEND);
     CHECK(cap_delete(&uts, 3) == T_OK);              /* the last READ */
-    CHECK(EPC(CAP_R_READ, 0) && !e->senders.head);
+    /* Doomed, not woken in this entry (SC23): the reaper fails the
+     * senders one per unit, each exactly once. */
+    CHECK(EPC(CAP_R_READ, 0) && e->senders.head == th(10) && tstate(10) == THREAD_BLOCKED_SEND);
+    CHECK((e->meta.flags & (OBJ_LISTED | OBJ_DOOM_SEND)) == (OBJ_LISTED | OBJ_DOOM_SEND));
+    CHECK(reaper_run(1) == 1 && tstate(10) == THREAD_RUNNABLE && tstate(20) == THREAD_BLOCKED_SEND);
+    reap_all();
+    CHECK(EPC(CAP_R_READ, 0) && !e->senders.head && !(e->meta.flags & OBJ_LISTED));
     CHECK(tstate(10) == THREAD_RUNNABLE && tstate(20) == THREAD_RUNNABLE && ep_ok(e));
     run_user();
     CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD &&
@@ -3002,6 +3062,8 @@ static void test_ep_liveness(void)
     CHECK(cap_delete(&uts, 1) == T_OK);              /* master */
     CHECK(tstate(40) == THREAD_BLOCKED_RECV && tstate(50) == THREAD_BLOCKED_RECV && ep_ok(e));
     CHECK(cap_delete(&uts, 2) == T_OK);              /* the last WRITE */
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && (e->meta.flags & OBJ_DOOM_RECV));
+    reap_all();
     CHECK(tstate(40) == THREAD_RUNNABLE && tstate(50) == THREAD_RUNNABLE && ep_ok(e));
     run_user();
     CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD);
@@ -3029,7 +3091,14 @@ static void test_ep_destroy(void)
     }
     CHECK(tstate(10) == THREAD_BLOCKED_SEND);       /* the master (READ) remains */
     CHECK(cap_delete(&uts, 1) == T_OK);             /* the object goes */
+    /* Thread 20's cspace still holds a send capability, so this is the
+     * loss of the last READ, not death: doomed and listed, waiters
+     * intact until the reaper fails them. */
+    CHECK(e->meta.flags == (OBJ_LISTED | OBJ_DOOM_SEND) && e->meta.live == 1);
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && ut_store[0].ut.dying == 0);
+    reap_all();
     CHECK(tstate(10) == THREAD_RUNNABLE && tstate(30) == THREAD_RUNNABLE && ep_ok(e));
+    CHECK(e->meta.flags == 0 && e->meta.live == 1);
     run_user();
     CHECK(test_report_count == 2 && (int64_t)test_reports[1].a == T_EDEAD);
     ut_teardown();
@@ -4337,6 +4406,7 @@ static void test_fault_handler_gone(void)
             CHECK(cap_revoke(&uts, 1, 1000) == T_OK && cap_delete(&uts, 1) == T_OK);
             break;
         }
+        reap_all();   /* cases 3 and 4: the reaper fails the queued fault call */
         CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6);
         CHECK(memcmp(&before, &th(10)->regs, sizeof(before)) == 0);
         CHECK(th(10)->regs.rax == 0 && th(10)->regs.rip == UCODE_VA);   /* no T_EDEAD */
@@ -4792,8 +4862,15 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
     if (m->live != live)
         return meta_mismatch("live count", c);
     uint32_t bits = c->type == CAP_CNODE ? cap_obj_bits(c) << OBJ_BITS_SHIFT : 0;
-    if ((m->flags & ~OBJ_FROZEN) != bits)
+    /* R3: an object with a record is never dying. Only a live endpoint or
+     * notification may be listed, and only with a doomed direction. */
+    uint32_t doom = 0;
+    if (c->type == CAP_ENDPOINT || c->type == CAP_NOTIFICATION)
+        doom = m->flags & (OBJ_LISTED | OBJ_DOOM_SEND | OBJ_DOOM_RECV);
+    if ((m->flags & ~(OBJ_FROZEN | OBJ_BITS_MASK)) != doom || (m->flags & OBJ_BITS_MASK) != bits)
         return meta_mismatch("flags", c);
+    if (doom && !(doom & OBJ_LISTED) != !(doom & (OBJ_DOOM_SEND | OBJ_DOOM_RECV)))
+        return meta_mismatch("listed without a doomed direction", c);
     if (c->type == CAP_ENDPOINT || c->type == CAP_NOTIFICATION) {
         if (m->n_read != nr || m->n_write != nw)
             return meta_mismatch("rights counts", c);
@@ -4907,6 +4984,49 @@ static bool meta_audit(void)
             kprintf("    meta_audit: serial %lu used twice\n", or_serials[k]);
             return false;
         }
+
+    /* D8: the reaper's list, against the Untypeds found by the scan.
+     * Every entry is listed once and flagged as listed; a dying entry has
+     * no records, carries a serial, and was carved from a live Untyped;
+     * and each Untyped's dying count equals the dying entries naming it
+     * (counted here from the list, never read from the kernel's tally). */
+    static const struct obj_meta *listed[ORACLE_CN * 4];
+    unsigned nl = 0;
+    or_sort(or_by_ptr);   /* or_has() searches by address */
+    uint64_t cur = 0;
+    unsigned kind;
+    const struct obj_meta *lm;
+    while (reaper_list_next(&cur, &kind, &lm)) {
+        if (nl == ARRAY_SIZE(listed)) {
+            kprintf("    meta_audit: reaper list too long or cyclic\n");
+            return false;
+        }
+        for (unsigned j = 0; j < nl; j++)
+            if (listed[j] == lm) {
+                kprintf("    meta_audit: listed twice (R2)\n");
+                return false;
+            }
+        listed[nl++] = lm;
+        bool dying = lm->flags & OBJ_DYING;
+        if (!(lm->flags & OBJ_LISTED) || (dying && (lm->live || !lm->serial || !lm->carver)) ||
+            (!dying && !(lm->flags & (OBJ_DOOM_SEND | OBJ_DOOM_RECV))) ||
+            (dying && !(or_has(lm->carver) && lm->carver->type == CAP_UNTYPED))) {
+            kprintf("    meta_audit: bad reaper entry (kind %u flags %x)\n", kind, lm->flags);
+            return false;
+        }
+    }
+    for (unsigned k = 0; k < or_n; k++) {
+        const struct cap *u = or_rec[k];
+        uint32_t want = 0;
+        if (u->type != CAP_UNTYPED)
+            continue;
+        for (unsigned j = 0; j < nl; j++)
+            want += (listed[j]->flags & OBJ_DYING) && listed[j]->carver == u;
+        if (u->ut.dying != want) {
+            kprintf("    meta_audit: Untyped dying count %u, %u listed\n", u->ut.dying, want);
+            return false;
+        }
+    }
 
     /* Nothing is stored for an object with no records: every non-zero
      * frame table entry and token entry belongs to an object found above,
@@ -5189,6 +5309,265 @@ static void test_meta_freeze(void)
     CHECK(meta_audit());
 }
 
+/* ---- Stage 3: identity, dying objects and the reaper (ADR 0010 SC21,
+ * SC23, SC24, R0-R9; revision 3d D0-D7) ---- */
+
+struct ident { uint32_t type; uint64_t object, serial; };
+
+static struct ident ident_of(const struct cap *c)
+{
+    return (struct ident){ c->type, c->object, obj_serial(c) };
+}
+
+static bool ident_is(const struct cap *c, struct ident id)
+{
+    return obj_identity_is(c, id.type, id.object, id.serial);
+}
+
+/* R0 and R4: an endpoint with more waiters than one reaper chunk dies.
+ * Its slot is free at once; it is dying, pinned and listed; its memory is
+ * not reusable and its Untyped not deletable until the reaper's last
+ * unit; each waiter is failed exactly once, at most REAP_CHUNK per
+ * boundary. */
+static void test_reaper_dying(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 100, 1) == T_OK);   /* Ua */
+    CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    const cap_slot_t w[] = { 10, 20, 30, 40, 50, 60 };   /* > REAP_CHUNK */
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+        CHECK(ep_thread(w[i], false, 0, 0, CAP_R_READ));
+    run_user();
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++) {
+        struct cspace c = task_cs(w[i]);
+        CHECK(tstate(w[i]) == THREAD_BLOCKED_RECV && cap_delete(&c, 1) == T_OK);
+    }
+    uint64_t serial = e->meta.serial;
+    CHECK(reaper_idle() && ut_store[100].ut.dying == 0);
+
+    /* The death transaction (R0): after it, no capability, dying, pinned,
+     * listed, the slot empty and reusable; nothing else changed. */
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(ut_store[1].type == CAP_NULL && !cap_has_children(&ut_store[100]));
+    /* (Its last record was also the last WRITE, so the receivers were
+     * doomed first, in the same deletion.) */
+    CHECK(e->meta.live == 0 && (e->meta.flags & (OBJ_DYING | OBJ_LISTED)) == (OBJ_DYING | OBJ_LISTED));
+    CHECK(e->meta.serial == serial && e->meta.carver == &ut_store[100]);
+    CHECK(ut_store[100].ut.dying == 1 && !reaper_idle());
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+        CHECK(tstate(w[i]) == THREAD_BLOCKED_RECV);
+    CHECK(ep_ok(e) && AUDIT());
+
+    /* Amended O7/O8 while it is dying: a retype that needs a reset gets
+     * T_EAGAIN with nothing changed; the Untyped cannot be deleted. */
+    world_tables(w, 2);
+    world_take(&world_a);
+    CHECK(cap_retype(&uts, 100, CAP_FRAME, 0, &uts, 101, 16) == T_EAGAIN);
+    CHECK(cap_delete(&uts, 100) == T_EBUSY);
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+
+    /* R5: at most REAP_CHUNK units per boundary, one waiter per unit,
+     * in queue order, each exactly once. */
+    CHECK(reaper_run(REAP_CHUNK) == REAP_CHUNK);
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+        CHECK(tstate(w[i]) == (i < REAP_CHUNK ? THREAD_RUNNABLE : THREAD_BLOCKED_RECV));
+    CHECK(ut_store[100].ut.dying == 1 && AUDIT());
+    reap_all();
+    CHECK(reaper_idle() && ut_store[100].ut.dying == 0 && e->meta.flags == 0);
+    CHECK(e->meta.serial == 0 && e->meta.carver == NULL);   /* retired: nothing stale */
+    run_user();
+    CHECK(test_report_count == ARRAY_SIZE(w) && reports_with(T_EDEAD) == ARRAY_SIZE(w));
+
+    /* Only now is the memory reusable, and the Untyped deletable. */
+    CHECK(cap_retype(&uts, 100, CAP_FRAME, 0, &uts, 101, 16) == T_OK);
+    CHECK(slot_paddr(101) == slot_paddr(100));   /* reset: from the start again */
+    for (cap_slot_t k = 101; k < 117; k++)
+        CHECK(cap_delete(&uts, k) == T_OK);
+    CHECK(cap_delete(&uts, 100) == T_OK && AUDIT());
+    ut_teardown();
+}
+
+/* D7, the ABA lifecycle, in two phases. While A is dying, a new object
+ * can take A's slot but never A's address (the pin, R4); after A's
+ * teardown, C takes A's address and slot with a newer serial. A stale
+ * identity of A never matches, and A's reaper never touches B. */
+static void test_reaper_aba(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 100, 1) == T_OK);   /* Ua */
+    CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);   /* A in X = 1 */
+    /* B from a different Untyped: once A dies, Ua holds nothing alive, so
+     * only A's pin (its dying count) stands between Ua and a reset that
+     * would put the next object at A's address. */
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 5, 1) == T_OK);     /* B in 5 */
+    struct endpoint *a = endpoint_of(&ut_store[1]), *b = endpoint_of(&ut_store[5]);
+    struct ident ida = ident_of(&ut_store[1]), idb = ident_of(&ut_store[5]);
+    const cap_slot_t w[] = { 10, 20, 30, 40, 50, 60 };
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+        CHECK(ep_thread(w[i], false, 0, 0, CAP_R_READ));
+    CHECK(ep_thread_on(70, 5, false, 0, 0, CAP_R_READ));                /* B's waiter */
+    run_user();
+    CHECK(a->receivers.head == th(w[0]) && b->receivers.head == th(70));
+    for (unsigned i = 0; i < ARRAY_SIZE(w); i++) {
+        struct cspace c = task_cs(w[i]);
+        CHECK(cap_delete(&c, 1) == T_OK);
+    }
+    CHECK(cap_delete(&uts, 1) == T_OK);                       /* A dies */
+    CHECK(a->meta.flags & OBJ_DYING);
+
+    /* Phase 1. A new object retyped into A's slot, from A's Untyped, while
+     * A is pending. Ua has no children, so a reset would be allowed if A
+     * were not pinned: D must still land above A, never at A's address. */
+    CHECK(!cap_has_children(&ut_store[100]) && ut_store[100].ut.dying == 1);
+    CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);  /* D in X */
+    struct endpoint *d = endpoint_of(&ut_store[1]);
+    struct ident idd = ident_of(&ut_store[1]);
+    CHECK(idd.object != ida.object && idd.object != idb.object && idd.serial > idb.serial);
+    CHECK(!ident_is(&ut_store[1], ida) && ident_is(&ut_store[1], idd));
+    CHECK(cap_derive(&uts, 1, 6, CAP_R_ALL, 0) == T_OK);      /* keep D, move it aside */
+    CHECK(cap_delete(&uts, 1) == T_OK && d->meta.live == 1);
+    CHECK(cap_derive(&uts, 5, 1, CAP_R_ALL, 0) == T_OK);      /* B into X */
+    CHECK(!ident_is(&ut_store[1], ida) && ident_is(&ut_store[1], idb));
+    struct obj_meta bm = b->meta, dm = d->meta;
+
+    /* Interleave A's reaper work with operations on B. */
+    CHECK(reaper_run(1) == 1 && tstate(w[0]) == THREAD_RUNNABLE);
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_ALL, 0) == T_OK && b->meta.live == bm.live + 1);
+    CHECK(reaper_run(2) == 2 && AUDIT());
+    CHECK(cap_delete(&uts, 2) == T_OK);
+    CHECK(reaper_run(1) == 1 && ep_ok(b) && ep_ok(a));
+    for (cap_slot_t k = 0; k < ARRAY_SIZE(ut_store); k++)
+        CHECK(!ident_is(&ut_store[k], ida));                  /* nothing names A */
+    CHECK(memcmp(&b->meta, &bm, sizeof(bm)) == 0 && b->receivers.head == th(70) &&
+          tstate(70) == THREAD_BLOCKED_RECV);                 /* B untouched */
+    CHECK(memcmp(&d->meta, &dm, sizeof(dm)) == 0 && ep_ok(d) &&
+          !d->senders.head && !d->receivers.head);            /* D untouched */
+    CHECK(a->meta.flags & OBJ_DYING);                         /* A still pending */
+    /* (B is live in Ua, so no reset could happen anyway; reaper_dying
+     * covers the T_EAGAIN of a reset blocked only by a dying object.) */
+    reap_all();
+    CHECK(ut_store[100].ut.dying == 0 && tstate(70) == THREAD_BLOCKED_RECV);  /* B's waiter stays */
+    CHECK(memcmp(&b->meta, &bm, sizeof(bm)) == 0 && ep_ok(b));
+    CHECK(memcmp(&d->meta, &dm, sizeof(dm)) == 0 && ep_ok(d));
+    CHECK(cap_delete(&uts, 6) == T_OK);                       /* D goes */
+
+    /* B goes too (its waiter is failed by the reaper), and every waiter
+     * of either was failed exactly once. */
+    struct cspace c70 = task_cs(70);
+    CHECK(cap_delete(&c70, 1) == T_OK && cap_delete(&uts, 1) == T_OK && cap_delete(&uts, 5) == T_OK);
+    reap_all();
+    run_user();
+    CHECK(reports_with(T_EDEAD) == ARRAY_SIZE(w) + 1 && test_report_count == ARRAY_SIZE(w) + 1);
+
+    /* Phase 2. After the teardowns the memory resets, and C lands at A's
+     * address and in A's slot with a newer serial. Neither A's identity
+     * nor B's matches it. */
+    CHECK(!cap_has_children(&ut_store[100]) && ut_store[100].ut.dying == 0);
+    CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct ident idc = ident_of(&ut_store[1]);
+    CHECK(idc.object == ida.object && idc.serial > idd.serial);   /* A's address, reset */
+    CHECK(!ident_is(&ut_store[1], ida) && !ident_is(&ut_store[1], idb) &&
+          ident_is(&ut_store[1], idc));
+    CHECK(AUDIT());
+    ut_teardown();
+}
+
+/* D2's proof at run time. X, a dying CNode, holds Untyped U in slot 0;
+ * Y1..Y3 were carved from U and become dying while X is emptied. The
+ * reaper must requeue X (never wait, never delete U early); every object
+ * X waits for has a larger serial than X; between two requeues of X
+ * there is real work; and X finishes last. */
+static void test_reaper_requeue(void)
+{
+    struct cspace x, y;
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 2, &uts, 1, 1) == T_OK);        /* X */
+    CHECK(cnode_view(&uts, 1, &x) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 14, &x, 0, 1) == T_OK);       /* U in X[0] */
+    CHECK(cnode_view(&uts, 1, &x) == T_OK);
+    for (cap_slot_t i = 0; i < 3; i++) {                                 /* Y1..Y3 from U */
+        CHECK(cap_retype(&x, 0, CAP_CNODE, 1, &uts, 10 + i, 1) == T_OK);
+        CHECK(cnode_view(&uts, 10 + i, &y) == T_OK);
+        CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &y, 0, 2) == T_OK);       /* real work */
+    }
+    CHECK(cap_retype(&x, 0, CAP_FRAME, 0, &uts, 20, 1) == T_OK);         /* a live descendant */
+    CHECK(cnode_view(&uts, 1, &x) == T_OK);
+    struct cap *u = &x.slots[0];
+    uint64_t sx = x.slots[0].slot_meta.serial, su = u->ut.serial;
+    uint64_t sy[3];
+    for (unsigned i = 0; i < 3; i++)
+        sy[i] = obj_serial(&ut_store[10 + i]);
+    CHECK(sx < su && su < sy[0] && su < sy[1] && su < sy[2]);             /* step 1 */
+
+    reap_trace_n = 0;
+    CHECK(cap_delete(&uts, 1) == T_OK);                                  /* X dies */
+    /* F7: the first unit freezes U and deletes its first descendant; the
+     * holders of the rest cannot derive into U meanwhile. */
+    CHECK(reaper_run(1) == 1 && (u->ut.flags & OBJ_FROZEN));
+    CHECK(ut_store[20].type == CAP_NULL && ut_store[10].type == CAP_CNODE);  /* first child went */
+    CHECK(cap_derive(&uts, 10, 21, CAP_R_ALL, 0) == T_EBUSY && ut_store[21].type == CAP_NULL);
+    unsigned units = reaper_drain(100000);
+    CHECK(units > 0 && reaper_idle() && ut_store[0].ut.dying == 0 && AUDIT());
+
+    /* The trace against the proof. */
+    unsigned requeues = 0, last_x = 0, x_done = 0, y_done = 0;
+    bool real_between = true, order_ok = true;
+    for (unsigned k = 0; k < reap_trace_n; k++) {
+        const struct reap_event *ev = &reap_trace[k];
+        if (ev->serial == sx) {
+            if (ev->act == REAP_REQUEUE) {
+                if (requeues) {
+                    /* step 5: real work on a dependency since the last one */
+                    bool seen = false;
+                    for (unsigned j = last_x + 1; j < k; j++)
+                        seen |= reap_trace[j].act == REAP_REAL && reap_trace[j].serial > sx;
+                    real_between &= seen;
+                }
+                requeues++;
+                last_x = k;
+            } else if (ev->act == REAP_DONE) {
+                x_done = k + 1;
+            }
+        } else {
+            order_ok &= ev->serial > sx;          /* step 1: only younger objects */
+            if (ev->act == REAP_DONE)
+                y_done++;
+        }
+    }
+    CHECK(requeues >= 1 && real_between && order_ok);
+    CHECK(x_done == reap_trace_n && y_done == 3);   /* X finishes last, after Y1..Y3 */
+    CHECK(reap_trace_n < REAP_TRACE_MAX);           /* the trace saw everything */
+    ut_teardown();
+}
+
+/* SC21, D3: serials are never reused. Near exhaustion, creation fails
+ * with T_ENOMEM and nothing changes; the last serials are still issued. */
+static void test_serial_exhaustion(void)
+{
+    CHECK(ut_setup(20));
+    uint64_t saved = objmeta_test_next_serial();
+    objmeta_test_set_serial(UINT64_MAX - 2);   /* two serials left */
+    world_tables(NULL, 0);
+    world_take(&world_a);
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 3) == T_ENOMEM);
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 2) == T_OK);
+    CHECK(obj_serial(&ut_store[1]) == UINT64_MAX - 2 && obj_serial(&ut_store[2]) == UINT64_MAX - 1);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &uts, 3, 1) == T_ENOMEM);
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 12, &uts, 3, 1) == T_ENOMEM);
+    CHECK(objmeta_test_next_serial() == UINT64_MAX);   /* never wrapped */
+    CHECK(AUDIT());
+    ut_teardown();
+    /* Test-only: the counter goes back to where it was. No object with a
+     * serial at or above `saved` exists, so nothing can collide. */
+    objmeta_test_set_serial(saved);
+    CHECK(AUDIT());
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -5264,6 +5643,10 @@ static const struct {
     { "meta_frames", test_meta_frames },
     { "meta_overflow", test_meta_overflow },
     { "meta_freeze", test_meta_freeze },
+    { "reaper_dying", test_reaper_dying },
+    { "reaper_aba", test_reaper_aba },
+    { "reaper_requeue", test_reaper_requeue },
+    { "serial_exhaustion", test_serial_exhaustion },
     { "cpu_hardening", test_cpu_hardening },
 };
 

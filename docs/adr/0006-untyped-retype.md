@@ -89,6 +89,11 @@ a previous owner's data, whatever happened to the memory before.
 *Amended by ADR 0010 (SC23):* and its dying count is 0, so memory of an
 object still being torn down by the reaper is never reused; a retype
 that would reset the watermark meanwhile returns `T_EAGAIN`.
+*Implemented at ADR 0010 stage 3:* while the dying count is non-zero the
+watermark is simply not reset. A retype that fits above it succeeds,
+since dying objects all lie below it. One that does not fit returns
+`T_EAGAIN` where it would otherwise have returned `T_ENOMEM`, with
+nothing changed and nothing reserved.
 Deleting one object out of many does *not* make its bytes reusable; the
 watermark only resets once the last child is gone. This is the seL4
 model: O(1), with no per-object free lists hidden in the kernel. For
@@ -99,7 +104,10 @@ one object from each. Deleting that object frees that child.
 (SC23):* nor while its dying count is nonzero. `cap_delete` on it
 fails with `T_EBUSY`; revoke it first. Otherwise its children would be
 re-parented above it and the memory it covered would lose its owner.
-`cspace_destroy` revokes Untypeds before deleting them.
+*Implemented at ADR 0010 stage 3:* a revocation that reaches an Untyped
+(at any depth) whose dying count is non-zero returns `T_EAGAIN`, a plain
+retryable error; the reaper finishes those objects at the next
+scheduling boundaries. `cspace_destroy` is now test-only.
 
 **O9. Revoking an Untyped destroys everything created from it,** however
 deeply nested: objects, child Untypeds, the grandchildren of those, and

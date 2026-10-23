@@ -23,6 +23,12 @@ __must_check int cap_derive_into(struct cap *src, struct cap *dst, cap_rights_t 
 /* Delete the capability in a slot (any slot), running every hook. */
 void cap_slot_delete(struct cap *c);
 
+/* One reaper unit on a slot of a dying CNode (SC24, F7, D2). */
+#define REAP_SLOT_EMPTIED  0   /* the slot is empty now */
+#define REAP_SLOT_PROGRESS 1   /* one record deleted; the slot still holds an Untyped */
+#define REAP_SLOT_BLOCKED  2   /* an Untyped with dying objects: requeue */
+int cap_reap_slot(struct cap *c);
+
 /* Bounds-checked slot access; NULL if `slot` is out of range. */
 struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot);
 

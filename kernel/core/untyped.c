@@ -33,51 +33,6 @@ static struct cspace cnode_of(paddr_t paddr, unsigned obj_bits)
     };
 }
 
-/*
- * Last capability to a CNode deleted: delete everything stored in it so
- * no capability (and no CDT link) survives in memory that is about to
- * become reusable (O10).
- *
- * Without recursion (ADR 0008, T33): deleting a CNode's contents can make
- * other CNodes final, to any depth a user cares to build. Instead of
- * recursing, a final CNode is pushed onto a pending list and a single loop
- * drains the list, so kernel stack use is the same for one CNode or a
- * chain of a million. The list is intrusive: the link lives in slot 0's
- * `pending_link`, tagged with the CNode's size in its low 6 bits (slots
- * are 128-byte aligned). Clearing a slot preserves that word, so a
- * revocation that deletes the capability in a pending CNode's slot 0
- * cannot cut the list.
- */
-static uint64_t pending_cnodes;   /* tagged pointer to slot 0, or 0 */
-static bool draining;
-
-static void cnode_finalise(enum cap_type type, uint64_t object)
-{
-    (void)type;
-    struct cspace cn = cnode_of(pa(object & ~CAP_OBJ_BITS_MASK),
-                                (unsigned)(object & CAP_OBJ_BITS_MASK));
-
-    KASSERT(cn.slots[0].slot_meta.reap_next == 0);
-    cn.slots[0].slot_meta.reap_next = pending_cnodes;
-    pending_cnodes = (uint64_t)(uintptr_t)cn.slots | (object & CAP_OBJ_BITS_MASK);
-    if (draining)
-        return; /* the loop below, further up the stack, will get to it */
-
-    draining = true;
-    while (pending_cnodes) {
-        struct cap *slots = (struct cap *)(uintptr_t)(pending_cnodes & ~CAP_OBJ_BITS_MASK);
-        unsigned bits = (unsigned)(pending_cnodes & CAP_OBJ_BITS_MASK);
-
-        pending_cnodes = slots[0].slot_meta.reap_next;   /* pop before emptying */
-        slots[0].slot_meta.reap_next = 0;
-        meta_retire(&slots[0].slot_meta);
-
-        struct cspace view = { .slots = slots, .nslots = 1u << (bits - CAP_SLOT_BITS) };
-        cspace_destroy(&view);                     /* may push more */
-    }
-    draining = false;
-}
-
 void untyped_boot(void)
 {
     paddr_t base;
@@ -85,7 +40,9 @@ void untyped_boot(void)
     uint32_t n = 0;
 
     cspace_init(&root_cs, root_slots, ROOT_CSPACE_SLOTS);
-    cap_set_finaliser(CAP_CNODE, cnode_finalise);
+    /* A CNode has no finaliser: every CNode dies through the reaper,
+     * one slot per unit (ADR 0010 SC23, SC24; this replaces the pending
+     * list of ADR 0008 T33, which drained in one entry). */
     /* SC18: the frame table exists before any memory can become a Frame. */
     objmeta_boot();
 
@@ -171,8 +128,10 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     if ((rc = serial_check(count)))
         return rc;
 
-    /* 6. reset rule (O7) */
-    if (!cap_has_children(ut))
+    /* 6. reset rule (O7, amended by ADR 0010 SC23): the memory is
+     * reusable only when nothing carved from it is alive or dying */
+    bool may_reset = !cap_has_children(ut);
+    if (may_reset && ut->ut.dying == 0)
         ut->ut_watermark = 0;
 
     /* 7. placement (O5) */
@@ -181,7 +140,9 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     uint64_t span, end;
     if (mul_overflow((uint64_t)count, obj_size, &span) || add_overflow(start, span, &end) ||
         end > (1ull << ut_bits))
-        return T_ENOMEM;
+        /* A reset would make room once the reaper has finished: retry
+         * later. A plain error; nothing is reserved or queued. */
+        return may_reset && ut->ut.dying ? T_EAGAIN : T_ENOMEM;
 
     /* No state has changed so far. From here on the operation cannot fail. */
     paddr_t base = pa_add(cap_obj_paddr(ut), start);

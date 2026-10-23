@@ -14,6 +14,7 @@ struct notification {
     uint64_t        pending;
     struct waitq    waiters;    /* kind = THREAD_BLOCKED_NOTIF */
     struct obj_meta meta;       /* live and rights counts (ADR 0010, SC17, SC19a) */
+    uint64_t        reap_next;  /* the reaper link while listed (SC24) */
 };
 _Static_assert(sizeof(struct notification) <= 128, "notification must fit its 128-byte object");
 

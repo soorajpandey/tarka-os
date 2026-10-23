@@ -14,6 +14,7 @@
 #include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/reaper.h>
 #include <tarka/selftest.h>
 #include <tarka/syscall.h>
 #include <tarka/vspace.h>
@@ -138,7 +139,14 @@ static __noreturn void schedule(void)
     for (;;) {
         if (!t) {
             cpu->current = NULL;
+            /* A scheduling boundary: one reaper chunk (SC24, R5). Until
+             * stage 5 brings per-CPU idle threads, this loop is also the
+             * idle loop: with nothing runnable, it keeps reaping, one
+             * chunk per pass, until the reaper is idle too (D5). */
+            reaper_run(REAP_CHUNK);
             t = runq_pop();
+            if (!t && !reaper_idle())
+                continue;
             if (!t) {
                 vspace_activate_kernel();
                 kcont_resume(&idle_cont);

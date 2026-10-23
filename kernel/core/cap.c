@@ -4,6 +4,7 @@
 
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/reaper.h>
 #include <tarka/string.h>
 
 static cap_finaliser_t finalisers[CAP_TYPE_COUNT];
@@ -160,17 +161,23 @@ static void destroy_slot(struct cap *c)
     bool final = meta_del(c);
     uint64_t object = c->object;
 
+    /* R0, D4: the death of an object is one step. With the count at 0 and
+     * before the record goes: mark it dying, pin its memory in its
+     * carving Untyped's dying count, and hand it to the reaper. */
+    bool dying = final && reaper_take(c, m);
+
     cdt_remove(c);
     /* Clear the slot before the finaliser runs so nothing can observe or
      * reuse a half-deleted capability. */
     cap_slot_clear(c);
 
-    if (final && finalisers[type])
-        finalisers[type](type, object);
-    /* The teardown is complete: only now is the metadata cleared. (A
-     * CNode's is cleared by its drain, which may finish later.) */
-    if (final && m && type != CAP_CNODE)
-        meta_retire(m);
+    if (final && !dying) {
+        /* Nothing to tear down later: finish now (bounded, D1, D4). */
+        if (finalisers[type])
+            finalisers[type](type, object);
+        if (m)
+            meta_retire(m);
+    }
 }
 
 /* SC20 corollary: the next record a revocation of c deletes. It is c's
@@ -204,24 +211,56 @@ static int revoke(struct cap *c, uint32_t budget)
 #ifdef TARKA_SELFTEST
         cdt_revoke_steps++;
 #endif
-        destroy_slot(revoke_victim(c));
+        struct cap *v = revoke_victim(c);
+        /* Amended O8: an Untyped whose dying objects are still being torn
+         * down cannot go yet. Plain retryable error; the reaper finishes
+         * them at the next boundaries. */
+        if (v->type == CAP_UNTYPED && v->ut.dying)
+            return T_EAGAIN;
+        destroy_slot(v);
     }
     return T_OK;
 }
 
+int cap_reap_slot(struct cap *c)
+{
+    if (c->type == CAP_UNTYPED) {
+        if (cap_has_children(c)) {
+            /* F7: the reaper owns a freeze on an Untyped it is emptying, so
+             * holders of its descendants cannot derive into it meanwhile.
+             * One unit: its current first descendant (SC22, O8 descent). */
+            c->ut.flags |= OBJ_FROZEN;
+            struct cap *v = revoke_victim(c);
+            if (v->type == CAP_UNTYPED && v->ut.dying)
+                return REAP_SLOT_BLOCKED;
+            destroy_slot(v);
+            return REAP_SLOT_PROGRESS;
+        }
+        if (c->ut.dying)
+            return REAP_SLOT_BLOCKED;   /* D2: the caller requeues, never waits */
+        c->ut.flags &= ~OBJ_FROZEN;     /* F7: released as the Untyped goes */
+    }
+    destroy_slot(c);
+    return REAP_SLOT_EMPTIED;
+}
+
+#ifdef TARKA_SELFTEST
 void cspace_destroy(struct cspace *cs)
 {
     for (uint32_t i = 0; i < cs->nslots; i++) {
         struct cap *c = &cs->slots[i];
 
-        if (c->type == CAP_UNTYPED)
-            (void)revoke(c, 0);
+        /* Test storage only: empty an Untyped completely, letting the
+         * reaper finish its dying objects (amended O8). */
+        while (c->type == CAP_UNTYPED && (revoke(c, 0) != T_OK || c->ut.dying))
+            (void)reaper_drain(1ul << 24);
         if (c->type != CAP_NULL)
             destroy_slot(c);
     }
     cs->slots = NULL;
     cs->nslots = 0;
 }
+#endif
 
 /* Only roots that no retype could make: boot Untypeds, the debug console
  * (no object), and in test builds test tokens (no object; their roots may
@@ -378,7 +417,9 @@ int cap_delete(struct cspace *cs, cap_slot_t slot)
         return T_ERANGE;
     if (c->type == CAP_NULL)
         return T_EBADCAP;
-    if (c->type == CAP_UNTYPED && cap_has_children(c))
+    /* O8 as amended (SC23): not while anything carved from it is alive or
+     * dying. */
+    if (c->type == CAP_UNTYPED && (cap_has_children(c) || c->ut.dying))
         return T_EBUSY;
 
     destroy_slot(c);
