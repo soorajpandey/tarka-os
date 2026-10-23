@@ -312,6 +312,15 @@ PROG f_ac
     ud2                            /* reached only if #AC was not raised */
 END f_ac
 
+/* Blocks on test wait queue `rdi`, then reports its syscall result. */
+PROG block
+    movl $0x7F01, %eax
+    syscall
+    movq %rax, %rdi
+    REPORT
+    EXIT
+END block
+
 /* Spins long enough for a timer interrupt to arrive in ring 3, then
  * reports how far it got (a = iterations, proving it ran to the end). */
 PROG spin

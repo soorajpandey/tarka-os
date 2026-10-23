@@ -8,6 +8,8 @@
 #include <tarka/types.h>
 
 #ifdef TARKA_SELFTEST
+#include <tarka/thread.h>
+
 __noreturn void selftest_run(void);
 
 void selftest_check(bool ok, const char *expr, const char *file, int line);
@@ -36,6 +38,8 @@ struct entry_observation {
     uint64_t nmi_gs_ok;
 };
 extern struct entry_observation entry_obs;
+
+extern struct waitq test_waitqs[];
 #define CHECK(cond) selftest_check((cond), #cond, __FILE__, __LINE__)
 #endif
 

@@ -9,6 +9,7 @@
 #include <tarka/selftest.h>
 
 #include <tarka/cap.h>
+#include <tarka/ipc.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
@@ -307,7 +308,7 @@ static void test_cap_revoke(void)
 
 /* ---- Untyped and retype (docs/adr/0006-untyped-retype.md) ---- */
 
-static struct cap ut_store[96];
+static struct cap ut_store[128];
 static struct cspace uts;
 
 static bool is_free_slot(const struct cspace *cs, cap_slot_t s)
@@ -420,7 +421,7 @@ static void test_untyped_rules(void)
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 1, 0) == T_EINVAL);
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 1, RETYPE_MAX_COUNT + 1) == T_EINVAL);
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 0xFFFFFFFFu, 2) == T_ERANGE);
-    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 95, 2) == T_ERANGE);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, ARRAY_SIZE(ut_store) - 1, 2) == T_ERANGE);
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 0, 1) == T_EBUSY);   /* occupied */
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 1, 17) == T_ENOMEM); /* 16 frames fit */
 
@@ -492,7 +493,7 @@ static void test_untyped_exhaustion(void)
 }
 
 /* O5: random retype sequences never produce overlapping objects. */
-static struct { uint64_t base; uint64_t size; int parent; } objs[96];
+static struct { uint64_t base; uint64_t size; int parent; } objs[ARRAY_SIZE(ut_store)];
 
 static uint64_t rng_state;
 static uint32_t rng(uint32_t n)
@@ -1235,7 +1236,7 @@ static void test_thread_lifecycle(void)
 #define UDATA_VA   0x401000ull
 #define USTACK_TOP 0x403000ull
 
-#define PROGS(X) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
+#define PROGS(X) X(block) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
     X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
@@ -1772,6 +1773,239 @@ static void test_entry_paths(void)
     ut_teardown();
 }
 
+/* ---- IPC state machinery (docs/adr/0009-ipc.md, step 5.1) ---- */
+
+static struct waitq *const tq_all[] = { &test_waitqs[0], &test_waitqs[1] };
+#define AUDIT() ipc_audit(tq_all, ARRAY_SIZE(tq_all))
+
+/* Exact snapshot of all IPC-relevant state: every live thread's state,
+ * links and saved registers, the run queue order, the test queues and the
+ * current thread. Used to prove a failed operation changed nothing. */
+#define SNAP_MAX 32
+struct ipc_snap {
+    unsigned n;
+    struct {
+        const struct thread *t;
+        uint32_t state, reply_state, reply_flags;
+        const void *wait_q, *wait_next, *wait_prev, *reply_to, *reply_from;
+        struct user_regs regs;
+    } th[SNAP_MAX];
+    const struct thread *runq[SNAP_MAX];
+    struct waitq q[TEST_WAITQS];
+    const struct thread *current;
+};
+static struct ipc_snap snap_a, snap_b;
+
+static void snapshot(struct ipc_snap *s, const struct thread *const *threads, unsigned n)
+{
+    memset(s, 0, sizeof(*s));
+    s->n = n;
+    for (unsigned i = 0; i < n && i < SNAP_MAX; i++) {
+        const struct thread *t = threads[i];
+        s->th[i].t = t;
+        s->th[i].state = t->state;
+        s->th[i].reply_state = t->reply_state;
+        s->th[i].reply_flags = t->reply_flags;
+        s->th[i].wait_q = t->wait_q;
+        s->th[i].wait_next = t->wait_next;
+        s->th[i].wait_prev = t->wait_prev;
+        s->th[i].reply_to = t->reply_to;
+        s->th[i].reply_from = t->reply_from;
+        s->th[i].regs = t->regs;
+    }
+    unsigned k = 0;
+    for (struct thread *t = runq_pop(); t; t = runq_pop())
+        s->runq[k++] = t;
+    for (unsigned i = 0; i < k; i++)                 /* restore the order */
+        thread_enqueue((struct thread *)s->runq[i]);
+    for (unsigned i = 0; i < TEST_WAITQS; i++)
+        s->q[i] = test_waitqs[i];
+    s->current = this_cpu()->current;
+}
+
+static struct thread *th(cap_slot_t b) { return thread_of(&ut_store[b + T_THR]); }
+
+static void test_ipc_audit_detects(void)
+{
+    struct user_regs r0 = { .rdi = 0 };
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(block), false, &r0));
+    CHECK(spawn(20, P(block), false, &r0));
+    run_user();
+    CHECK(AUDIT());
+    struct thread *a = th(10), *b = th(20);
+
+    /* The audit must notice each kind of corruption. */
+    a->state = THREAD_RUNNABLE;          /* runnable but not queued to run */
+    CHECK(!AUDIT());
+    a->state = THREAD_BLOCKED_RECV;
+    CHECK(AUDIT());
+
+    struct thread *tail = test_waitqs[0].tail;
+    test_waitqs[0].tail = NULL;          /* broken queue */
+    CHECK(!AUDIT());
+    test_waitqs[0].tail = tail;
+
+    static struct thread ghost;          /* not a live thread */
+    ghost.state = THREAD_BLOCKED_RECV;
+    ghost.wait_q = &test_waitqs[0];
+    ghost.wait_prev = b;
+    b->wait_next = &ghost;
+    CHECK(!AUDIT());                     /* stale pointer in a queue */
+    b->wait_next = NULL;
+
+    a->reply_from = b;                   /* half a reply link */
+    CHECK(!AUDIT());
+    a->reply_from = NULL;
+    CHECK(AUDIT());
+
+    waitq_wake_all(&test_waitqs[0], T_EDEAD);
+    run_user();
+    ut_teardown();
+    CHECK(AUDIT() && !test_waitqs[0].head);
+}
+
+static void test_ipc_states(void)
+{
+    struct user_regs r0 = { .rdi = 0 }, r1 = { .rdi = 1 }, rbad = { .rdi = 7 };
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(block), false, &r0));
+    CHECK(spawn(20, P(block), false, &r0));
+    CHECK(spawn(30, P(block), false, &r0));
+    run_user();
+
+    /* Blocked means not runnable (P10); FIFO by arrival (P11). */
+    struct thread *a = th(10), *b = th(20), *c = th(30);
+    CHECK(runq_empty() && this_cpu()->current == NULL);
+    CHECK(test_waitqs[0].head == a && a->wait_next == b && b->wait_next == c &&
+          test_waitqs[0].tail == c);
+    CHECK(tstate(10) == THREAD_BLOCKED_RECV && tstate(30) == THREAD_BLOCKED_RECV);
+    CHECK(test_report_count == 0);
+    CHECK(AUDIT());
+
+    /* A failed blocking request changes nothing for anyone else. */
+    const struct thread *others[] = { a, b, c };
+    CHECK(spawn(40, P(block), false, &rbad));
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);  /* exclude it from the run-queue view */
+    snapshot(&snap_a, others, 3);
+    CHECK(thread_resume(&uts, 40 + T_THR) == T_OK);
+    run_user();
+    snapshot(&snap_b, others, 3);
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EINVAL);
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0);
+    CHECK(AUDIT());
+
+    /* Wake the head: result, state and run queue change together. */
+    thread_wake(waitq_first(&test_waitqs[0]), 0x5150);
+    CHECK(tstate(10) == THREAD_RUNNABLE && runq_contains(a) && a->regs.rax == 0x5150);
+    CHECK(test_waitqs[0].head == b && !a->wait_q && !a->wait_next && !b->wait_prev);
+    CHECK(AUDIT());
+    run_user();
+    CHECK(test_report_count == 1 && test_reports[0].a == 0x5150 && tstate(10) == THREAD_INACTIVE);
+
+    /* Destroying a blocked thread in the middle relinks the queue. */
+    CHECK(spawn(50, P(block), false, &r0));            /* queue: b c d */
+    run_user();
+    CHECK(cap_delete(&uts, 30 + T_THR) == T_OK);       /* c */
+    CHECK(test_waitqs[0].head == b && b->wait_next == th(50) && th(50)->wait_prev == b);
+    CHECK(AUDIT());
+
+    /* Suspending a blocked thread: off the queue, T_EINTR on resume. */
+    CHECK(thread_suspend(&uts, 20 + T_THR) == T_OK);
+    CHECK(tstate(20) == THREAD_INACTIVE && !b->wait_q && test_waitqs[0].head == th(50));
+    CHECK(AUDIT());
+    CHECK(thread_resume(&uts, 20 + T_THR) == T_OK);
+    run_user();
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EINTR);
+
+    /* Losing a required binding while blocked: the same, via T2. */
+    CHECK(thread_unbind(&uts, 50 + T_THR, TS_ASPACE) == T_OK);
+    CHECK(tstate(50) == THREAD_INACTIVE && !test_waitqs[0].head);
+    CHECK(AUDIT());
+
+    /* P6a: losing the IPC buffer aborts a receiver, not other waiters. */
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 60, 2) == T_OK);
+    CHECK(spawn(70, P(block), false, &r0));            /* BLOCKED_RECV */
+    CHECK(spawn(80, P(block), false, &r1));            /* BLOCKED_NOTIF */
+    CHECK(thread_bind(&uts, 70 + T_THR, TS_IPCBUF, &uts, 60) == T_OK);
+    CHECK(thread_bind(&uts, 80 + T_THR, TS_IPCBUF, &uts, 61) == T_OK);
+    run_user();
+    CHECK(tstate(70) == THREAD_BLOCKED_RECV && tstate(80) == THREAD_BLOCKED_NOTIF);
+    CHECK(thread_unbind(&uts, 70 + T_THR, TS_IPCBUF) == T_OK);
+    CHECK(thread_unbind(&uts, 80 + T_THR, TS_IPCBUF) == T_OK);
+    CHECK(tstate(70) == THREAD_INACTIVE && th(70)->regs.rax == (uint64_t)(int64_t)T_EINTR);
+    CHECK(tstate(80) == THREAD_BLOCKED_NOTIF);
+    CHECK(AUDIT());
+
+    /* Object death wakes *every* waiter with T_EDEAD (P26): three of them,
+     * so waking only the first cannot pass. */
+    CHECK(spawn(90, P(block), false, &r1));
+    CHECK(spawn(100, P(block), false, &r1));
+    run_user();
+    CHECK(tstate(80) == THREAD_BLOCKED_NOTIF && tstate(90) == THREAD_BLOCKED_NOTIF &&
+          tstate(100) == THREAD_BLOCKED_NOTIF);
+    waitq_wake_all(&test_waitqs[1], T_EDEAD);
+    CHECK(!test_waitqs[1].head && !test_waitqs[1].tail);
+    CHECK(tstate(80) == THREAD_RUNNABLE && tstate(90) == THREAD_RUNNABLE &&
+          tstate(100) == THREAD_RUNNABLE);
+    CHECK(AUDIT());
+    run_user();
+    CHECK(test_report_count == 3);
+    for (unsigned i = 0; i < test_report_count; i++)
+        CHECK((int64_t)test_reports[i].a == T_EDEAD);
+    CHECK(AUDIT());
+
+    ut_teardown();
+    CHECK(AUDIT() && runq_empty());
+}
+
+/* P16, P17, P28, P29: reply links when either side disappears. */
+static void test_ipc_reply_links(void)
+{
+    CHECK(ut_setup(20));
+    for (cap_slot_t b = 10; b <= 60; b += 10) {
+        CHECK(spawn(b, P(hello), false, NULL));
+        CHECK(thread_suspend(&uts, b + T_THR) == T_OK);
+    }
+
+    /* Caller destroyed: the server keeps its authority, marked gone. */
+    reply_link(th(10), th(20), REPLY_CALL_GRANT);
+    CHECK(tstate(20) == THREAD_BLOCKED_REPLY && th(10)->reply_to == th(20));
+    CHECK(AUDIT());
+    CHECK(cap_delete(&uts, 20 + T_THR) == T_OK);
+    CHECK(th(10)->reply_state == REPLY_CALLER_GONE && th(10)->reply_to == NULL);
+    CHECK(AUDIT());
+    th(10)->reply_state = REPLY_NONE;    /* (a reply would consume it, step 5.5) */
+
+    /* Server suspended: the caller wakes with T_EDEAD. */
+    reply_link(th(10), th(30), 0);
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(tstate(30) == THREAD_RUNNABLE && runq_contains(th(30)));
+    CHECK(th(30)->regs.rax == (uint64_t)(int64_t)T_EDEAD && th(30)->reply_from == NULL);
+    CHECK(th(10)->reply_state == REPLY_NONE && th(10)->reply_to == NULL);
+    CHECK(AUDIT());
+    CHECK(thread_suspend(&uts, 30 + T_THR) == T_OK);
+
+    /* Server destroyed: the same. */
+    reply_link(th(40), th(50), 0);
+    CHECK(cap_delete(&uts, 40 + T_THR) == T_OK);
+    CHECK(tstate(50) == THREAD_RUNNABLE && th(50)->regs.rax == (uint64_t)(int64_t)T_EDEAD);
+    CHECK(AUDIT());
+    CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);
+
+    /* Caller suspended: T_EINTR for it, "caller gone" for the server. */
+    reply_link(th(10), th(60), 0);
+    CHECK(thread_suspend(&uts, 60 + T_THR) == T_OK);
+    CHECK(tstate(60) == THREAD_INACTIVE && th(60)->regs.rax == (uint64_t)(int64_t)T_EINTR);
+    CHECK(th(10)->reply_state == REPLY_CALLER_GONE && th(60)->reply_from == NULL);
+    CHECK(AUDIT());
+
+    ut_teardown();
+    CHECK(AUDIT() && runq_empty());
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1821,6 +2055,9 @@ static const struct {
     { "syscalls", test_syscalls },
     { "syscall_lifecycle", test_syscall_lifecycle },
     { "entry_paths", test_entry_paths },
+    { "ipc_audit_detects", test_ipc_audit_detects },
+    { "ipc_states", test_ipc_states },
+    { "ipc_reply_links", test_ipc_reply_links },
     { "cpu_hardening", test_cpu_hardening },
 };
 

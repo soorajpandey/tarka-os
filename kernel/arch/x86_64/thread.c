@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <tarka/errno.h>
+#include <tarka/ipc.h>
 #include <tarka/kernel.h>
 #include <tarka/string.h>
 #include <tarka/vspace.h>
@@ -69,6 +70,14 @@ bool runq_empty(void)
     return rq_head == NULL;
 }
 
+bool runq_contains(const struct thread *t)
+{
+    for (const struct thread *x = rq_head; x; x = x->rq_next)
+        if (x == t)
+            return true;
+    return false;
+}
+
 /* ---- validation (T11-T15) ---- */
 
 bool user_regs_valid(const struct user_regs *r)
@@ -94,8 +103,12 @@ bool thread_runnable_safe(const struct thread *t)
 /* Stop a thread: it leaves the run queue and will not run again until
  * resumed. If it is running on this CPU, the CPU leaves its address
  * space now, before whatever is being deleted can be freed. */
-static void thread_stop(struct thread *t, enum thread_state to)
+static void thread_stop(struct thread *t, enum thread_state to, bool destroying)
 {
+    /* ADR 0009 P28-P31: leave every queue and reply link first. A thread
+     * stopped in the middle of a blocking syscall gets T_EINTR as that
+     * syscall's result when it is resumed (unless it is being destroyed). */
+    ipc_detach(t, destroying);
     runq_remove(t);
     t->state = to;
     if (this_cpu()->current == t)
@@ -117,6 +130,9 @@ void thread_obj_init(paddr_t obj)
     for (unsigned i = 0; i < TS_COUNT; i++)
         t->bind[i].slot_flags = SLOT_BINDING | i;
     fpu_init_area(thread_xsave_area(t));   /* T7 */
+#ifdef TARKA_SELFTEST
+    thread_registry_add(t);
+#endif
 }
 
 /* T2: a required binding is about to disappear. */
@@ -126,7 +142,10 @@ static void binding_lost(struct cap *c)
     struct thread *t = (struct thread *)((uint8_t *)(c - idx) - offsetof(struct thread, bind));
 
     if ((idx == TS_ASPACE || idx == TS_CSPACE) && t->state != THREAD_INACTIVE)
-        thread_stop(t, THREAD_INACTIVE);
+        thread_stop(t, THREAD_INACTIVE, false);
+    /* P6a: only a receiving thread needs its IPC buffer while blocked. */
+    else if (idx == TS_IPCBUF && t->state == THREAD_BLOCKED_RECV)
+        thread_stop(t, THREAD_INACTIVE, false);
 }
 
 /* T5: last Thread capability deleted. */
@@ -135,9 +154,12 @@ static void thread_finalise(enum cap_type type, uint64_t object)
     struct thread *t = phys_to_virt(pa(object & ~CAP_OBJ_BITS_MASK));
 
     (void)type;
-    thread_stop(t, THREAD_INACTIVE);
+    thread_stop(t, THREAD_INACTIVE, true);
     if (this_cpu()->current == t)
         this_cpu()->current = NULL;
+#ifdef TARKA_SELFTEST
+    thread_registry_remove(t);
+#endif
     for (unsigned i = 0; i < TS_COUNT; i++)
         cap_slot_delete(&t->bind[i]);
 #ifdef TARKA_SELFTEST
@@ -256,7 +278,7 @@ int thread_suspend(struct cspace *cs, cap_slot_t thr)
 
     if ((rc = lookup(cs, thr, CAP_R_WRITE, &t)))
         return rc;
-    thread_stop(t, THREAD_INACTIVE);
+    thread_stop(t, THREAD_INACTIVE, false);
     return T_OK;
 }
 

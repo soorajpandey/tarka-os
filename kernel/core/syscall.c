@@ -9,6 +9,7 @@
 #include <tarka/syscall.h>
 
 #include <tarka/errno.h>
+#include <tarka/ipc.h>
 #include <tarka/kernel.h>
 #include <tarka/selftest.h>
 #include <tarka/uaccess.h>
@@ -298,6 +299,9 @@ static inline uint64_t index_nospec(uint64_t idx, uint64_t size)
 #ifdef TARKA_SELFTEST
 struct test_report test_reports[TEST_REPORT_MAX];
 unsigned test_report_count;
+struct waitq test_waitqs[TEST_WAITQS] = {
+    { .kind = THREAD_BLOCKED_RECV }, { .kind = THREAD_BLOCKED_NOTIF },
+};
 #endif
 
 void syscall_handle(struct thread *t)
@@ -318,6 +322,14 @@ void syscall_handle(struct thread *t)
         t->regs.rax = T_OK;
         return;
     }
+    if (nr == SYS_TEST_BLOCK) {
+        if (args.a[0] >= TEST_WAITQS) {
+            t->regs.rax = (uint64_t)(int64_t)T_EINVAL;
+            return;
+        }
+        waitq_block(t, &test_waitqs[args.a[0]]);
+        return;   /* the result arrives with the wake-up */
+    }
 #endif
     if (nr >= NSYS)
         rv = T_EINVAL;   /* T31: an error, not a fault */
@@ -327,7 +339,7 @@ void syscall_handle(struct thread *t)
         rv = table[index_nospec(nr, NSYS)](&ctx, &args);
 
     /* The syscall may have destroyed the caller: write the result only if
-     * it is still the current thread. */
-    if (this_cpu()->current == t)
+     * it is still the current thread, and only if it did not block. */
+    if (this_cpu()->current == t && rv != SYS_NORESULT)
         t->regs.rax = (uint64_t)rv;
 }

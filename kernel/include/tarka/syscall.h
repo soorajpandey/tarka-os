@@ -29,9 +29,16 @@ enum {
 
 #define DEBUG_WRITE_MAX 256
 
+/* A handler that blocked the caller returns this: the result is written
+ * when the thread is woken (ADR 0009, P10), not now. */
+#define SYS_NORESULT INT64_MIN
+
 #ifdef TARKA_SELFTEST
-/* Test builds only: report three values to the kernel test harness. */
+/* Test builds only: report four values to the kernel test harness. */
 #define SYS_TEST_REPORT 0x7F00
+/* Test builds only: block the caller on test wait queue `rdi`. */
+#define SYS_TEST_BLOCK  0x7F01
+#define TEST_WAITQS     2
 #endif
 
 /* Handle the syscall `t` just made. Arguments are read from the copy of

@@ -32,7 +32,28 @@ enum thread_state {
     THREAD_RUNNABLE,
     THREAD_RUNNING,
     THREAD_FAULTED,
+    THREAD_BLOCKED_SEND,    /* ADR 0009: in an endpoint's send queue */
+    THREAD_BLOCKED_RECV,    /* in an endpoint's receive queue */
+    THREAD_BLOCKED_REPLY,   /* linked to exactly one server */
+    THREAD_BLOCKED_NOTIF,   /* in a notification's wait queue */
+    THREAD_STATE_COUNT,
 };
+
+/* A wait queue (ADR 0009, P9). FIFO, intrusive through the TCB's single
+ * wait link. `kind` is the one blocked state its members must be in. */
+struct waitq {
+    struct thread *head, *tail;
+    uint32_t kind;          /* enum thread_state */
+    uint32_t reserved;
+};
+
+/* A server's reply authority (P16, P17). Not a capability. */
+enum reply_state {
+    REPLY_NONE = 0,
+    REPLY_PENDING,          /* reply_to is the caller, BLOCKED_REPLY */
+    REPLY_CALLER_GONE,      /* authority held, but the caller is gone */
+};
+#define REPLY_CALL_GRANT (1u << 0)  /* the call carried GRANT (P23a) */
 
 /* Binding slots (T1, T2). */
 enum {
@@ -65,7 +86,17 @@ struct thread {
     struct fault_record fault;
     struct thread      *rq_next;     /* run queue (internal references, O10) */
     struct thread      *rq_prev;
-    uint64_t            reserved[2];
+    /* IPC (ADR 0009). Every pointer here is an internal reference,
+     * cleared before the thread or object it names can be freed. */
+    struct waitq       *wait_q;      /* the queue this thread is in, or NULL */
+    struct thread      *wait_next;
+    struct thread      *wait_prev;
+    struct thread      *reply_to;    /* server side: the caller to answer */
+    struct thread      *reply_from;  /* caller side: the server answering */
+    uint32_t            reply_state; /* enum reply_state */
+    uint32_t            reply_flags;
+    struct thread      *reg_next;    /* test builds: registry of live threads */
+    struct thread      *reg_prev;
     struct cap          bind[TS_COUNT] __aligned(64);
 };
 _Static_assert(sizeof(struct thread) <= 4096, "TCB must fit in page 0 of the thread object");
@@ -99,6 +130,7 @@ __must_check int thread_get_state(struct cspace *cs, cap_slot_t thr, uint32_t *o
 /* Scheduler interface (step 4: a minimal FIFO run queue). */
 struct thread *runq_pop(void);
 bool runq_empty(void);
+bool runq_contains(const struct thread *t);
 void thread_enqueue(struct thread *t);
 
 /* T4: may this thread's saved state be loaded and run? */

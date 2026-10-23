@@ -15,6 +15,9 @@ enum {
     T_EAGAIN     = -8,  /* partial progress; call again to continue */
     T_ENOENT     = -9,  /* a required page-table level is missing */
     T_EFAULT     = -10, /* user address not accessible (ADR 0008, T26) */
+    T_EDEAD      = -11, /* the object, or the peer or authority on the
+                         * other side, is gone (ADR 0009) */
+    T_EINTR      = -12, /* blocking operation aborted (ADR 0009, P30) */
 };
 
 #endif

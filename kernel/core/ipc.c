@@ -1,0 +1,243 @@
+/*
+ * IPC state machinery (ADR 0009, P9-P12, P26-P31).
+ *
+ * Kept deliberately plain: doubly linked FIFO queues through one wait link
+ * per thread, a pair of reply links, and functions that move a thread
+ * between states only together with every structure that records it.
+ */
+
+#include <tarka/ipc.h>
+
+#include <tarka/errno.h>
+#include <tarka/kernel.h>
+
+#include "../arch/x86_64/percpu.h"
+
+static bool blocked(uint32_t state)
+{
+    return state >= THREAD_BLOCKED_SEND && state <= THREAD_BLOCKED_NOTIF;
+}
+
+static void waitq_append(struct waitq *q, struct thread *t)
+{
+    KASSERT(!t->wait_q && !t->wait_next && !t->wait_prev);
+    t->wait_q = q;
+    t->wait_prev = q->tail;
+    t->wait_next = NULL;
+    if (q->tail)
+        q->tail->wait_next = t;
+    else
+        q->head = t;
+    q->tail = t;
+}
+
+static void waitq_remove(struct thread *t)
+{
+    struct waitq *q = t->wait_q;
+
+    if (!q)
+        return;
+    if (t->wait_prev)
+        t->wait_prev->wait_next = t->wait_next;
+    else
+        q->head = t->wait_next;
+    if (t->wait_next)
+        t->wait_next->wait_prev = t->wait_prev;
+    else
+        q->tail = t->wait_prev;
+    t->wait_q = NULL;
+    t->wait_next = t->wait_prev = NULL;
+}
+
+void waitq_block(struct thread *t, struct waitq *q)
+{
+    KASSERT(t->state == THREAD_RUNNING && this_cpu()->current == t);
+    KASSERT(blocked(q->kind) && q->kind != THREAD_BLOCKED_REPLY);
+    waitq_append(q, t);
+    t->state = q->kind;
+}
+
+struct thread *waitq_first(const struct waitq *q)
+{
+    return q->head;
+}
+
+/* Undo the caller side of a reply link. */
+static void reply_unlink_caller(struct thread *caller)
+{
+    struct thread *server = caller->reply_from;
+
+    if (!server)
+        return;
+    KASSERT(server->reply_state == REPLY_PENDING && server->reply_to == caller);
+    server->reply_to = NULL;
+    server->reply_state = REPLY_CALLER_GONE;   /* P29: authority kept, caller gone */
+    caller->reply_from = NULL;
+}
+
+void thread_wake(struct thread *t, int64_t rax)
+{
+    KASSERT(blocked(t->state));
+    waitq_remove(t);
+    reply_unlink_caller(t);
+    t->regs.rax = (uint64_t)rax;   /* P10: result, state and queue together */
+    t->state = THREAD_RUNNABLE;
+    thread_enqueue(t);
+}
+
+void waitq_wake_all(struct waitq *q, int64_t rax)
+{
+    struct thread *t;
+
+    while ((t = q->head))
+        thread_wake(t, rax);
+}
+
+void reply_link(struct thread *server, struct thread *caller, uint32_t flags)
+{
+    KASSERT(server->reply_state == REPLY_NONE && !server->reply_to);
+    KASSERT(!caller->wait_q && !caller->reply_from);
+    server->reply_to = caller;
+    server->reply_state = REPLY_PENDING;
+    server->reply_flags = flags;
+    caller->reply_from = server;
+    caller->state = THREAD_BLOCKED_REPLY;
+}
+
+void ipc_detach(struct thread *t, bool destroying)
+{
+    bool was_blocked = blocked(t->state);
+
+    /* Its own wait: a queue, or a reply it is waiting for. */
+    waitq_remove(t);
+    reply_unlink_caller(t);
+
+    /* P28: authority it holds as a server dies with it (or with its
+     * suspension): the caller is woken with T_EDEAD. */
+    if (t->reply_state == REPLY_PENDING) {
+        struct thread *caller = t->reply_to;
+        KASSERT(caller && caller->reply_from == t && caller->state == THREAD_BLOCKED_REPLY);
+        thread_wake(caller, T_EDEAD);
+    }
+    t->reply_to = NULL;
+    t->reply_state = REPLY_NONE;
+    t->reply_flags = 0;
+
+    /* P30: an interrupted blocking syscall returns T_EINTR on resume. */
+    if (was_blocked && !destroying)
+        t->regs.rax = (uint64_t)(int64_t)T_EINTR;
+}
+
+/* ---- audit (P9), test builds ---- */
+
+#ifdef TARKA_SELFTEST
+
+static struct thread *registry;
+
+void thread_registry_add(struct thread *t)
+{
+    t->reg_prev = NULL;
+    t->reg_next = registry;
+    if (registry)
+        registry->reg_prev = t;
+    registry = t;
+}
+
+void thread_registry_remove(struct thread *t)
+{
+    if (t->reg_prev)
+        t->reg_prev->reg_next = t->reg_next;
+    else if (registry == t)
+        registry = t->reg_next;
+    if (t->reg_next)
+        t->reg_next->reg_prev = t->reg_prev;
+    t->reg_next = t->reg_prev = NULL;
+}
+
+static bool live(const struct thread *t)
+{
+    for (const struct thread *x = registry; x; x = x->reg_next)
+        if (x == t)
+            return true;
+    return false;
+}
+
+/* A queue is a well-formed doubly linked list of live threads, each in
+ * the queue's state and pointing back at it. */
+static bool queue_ok(const struct waitq *q)
+{
+    const struct thread *prev = NULL;
+    unsigned n = 0;
+
+    if (!blocked(q->kind) || q->kind == THREAD_BLOCKED_REPLY)
+        return false;
+    if (!q->head != !q->tail)
+        return false;
+    for (const struct thread *t = q->head; t; prev = t, t = t->wait_next) {
+        if (!live(t) || t->wait_q != q || t->wait_prev != prev || t->state != q->kind)
+            return false;
+        if (++n > 100000)
+            return false;   /* a cycle */
+    }
+    return prev == q->tail;
+}
+
+static bool in_queue(const struct waitq *q, const struct thread *t)
+{
+    for (const struct thread *x = q->head; x; x = x->wait_next)
+        if (x == t)
+            return true;
+    return false;
+}
+
+bool ipc_audit(struct waitq *const *extra, size_t nextra)
+{
+    const struct thread *cur = this_cpu()->current;
+
+    for (size_t i = 0; i < nextra; i++)
+        if (!queue_ok(extra[i]))
+            return false;
+    if (cur && !live(cur))
+        return false;
+
+    for (const struct thread *t = registry; t; t = t->reg_next) {
+        if (t->state >= THREAD_STATE_COUNT)
+            return false;
+        /* 1 and 6: runnable iff queued to run; running iff current. */
+        if ((t->state == THREAD_RUNNABLE) != runq_contains(t))
+            return false;
+        if ((t->state == THREAD_RUNNING) != (t == cur))
+            return false;
+        /* 2, 3, 5: in a wait queue iff blocked in one, and in that one. */
+        bool queued_state = blocked(t->state) && t->state != THREAD_BLOCKED_REPLY;
+        if (queued_state) {
+            if (!t->wait_q || !queue_ok(t->wait_q) || !in_queue(t->wait_q, t))
+                return false;
+        } else if (t->wait_q || t->wait_next || t->wait_prev) {
+            return false;
+        }
+        /* 4: waiting for a reply iff exactly one live server points back. */
+        if ((t->state == THREAD_BLOCKED_REPLY) != (t->reply_from != NULL))
+            return false;
+        if (t->reply_from && (!live(t->reply_from) || t->reply_from->reply_to != t ||
+                              t->reply_from->reply_state != REPLY_PENDING))
+            return false;
+        /* Reply authority held as a server. */
+        switch (t->reply_state) {
+        case REPLY_PENDING:
+            if (!t->reply_to || !live(t->reply_to) || t->reply_to->reply_from != t)
+                return false;
+            break;
+        case REPLY_NONE:
+        case REPLY_CALLER_GONE:
+            if (t->reply_to)
+                return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+#endif
