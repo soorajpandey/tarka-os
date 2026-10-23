@@ -210,6 +210,15 @@ int thread_bind(struct cspace *cs, cap_slot_t thr, unsigned which,
         return rc;
     if (t->bind[which].type != CAP_NULL)
         return T_EBUSY;
+    /* ADR 0009 P5: the kernel writes into an IPC buffer, so binding one is
+     * a writable alias: it needs READ and WRITE, and the frame must not be
+     * mapped executable anywhere. */
+    if (which == TS_IPCBUF) {
+        if ((s->rights & (CAP_R_READ | CAP_R_WRITE)) != (CAP_R_READ | CAP_R_WRITE))
+            return T_EPERM;
+        if (vspace_frame_alias_conflict(cap_slot(src_cs, src), CAP_R_WRITE))
+            return T_EPERM;
+    }
     return cap_derive_into(cap_slot(src_cs, src), &t->bind[which], CAP_R_ALL);
 }
 

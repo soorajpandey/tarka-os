@@ -10,6 +10,7 @@
 
 #include <tarka/cap.h>
 #include <tarka/ipc.h>
+#include <tarka/endpoint.h>
 #include <tarka/notification.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
@@ -136,24 +137,24 @@ static void test_caps(void)
 
     cspace_init(&cs, storage, ARRAY_SIZE(storage));
 
-    CHECK(cap_install(&cs, 0, CAP_ENDPOINT, CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT, 0x1000) == T_OK);
-    CHECK(cap_install(&cs, 0, CAP_ENDPOINT, CAP_R_READ, 0x2000) == T_EBUSY);
-    CHECK(cap_install(&cs, 8, CAP_ENDPOINT, CAP_R_READ, 0) == T_ERANGE);
+    CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT, 0x1000) == T_OK);
+    CHECK(cap_install(&cs, 0, CAP_TEST_TOKEN, CAP_R_READ, 0x2000) == T_EBUSY);
+    CHECK(cap_install(&cs, 8, CAP_TEST_TOKEN, CAP_R_READ, 0) == T_ERANGE);
     CHECK(cap_install(&cs, 1, CAP_NULL, CAP_R_READ, 0) == T_EINVAL);
-    CHECK(cap_install(&cs, 1, CAP_ENDPOINT, 1u << 31, 0) == T_EINVAL);
+    CHECK(cap_install(&cs, 1, CAP_TEST_TOKEN, 1u << 31, 0) == T_EINVAL);
 
     /* Lookup enforces type and rights. */
-    CHECK(cap_lookup(&cs, 0, CAP_ENDPOINT, CAP_R_WRITE, &c) == T_OK && c->object == 0x1000);
+    CHECK(cap_lookup(&cs, 0, CAP_TEST_TOKEN, CAP_R_WRITE, &c) == T_OK && c->object == 0x1000);
     CHECK(cap_lookup(&cs, 0, CAP_IRQ, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&cs, 0, CAP_ENDPOINT, CAP_R_EXEC, &c) == T_EPERM);
-    CHECK(cap_lookup(&cs, 5, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&cs, 0xFFFFFFFFu, CAP_ENDPOINT, 0, &c) == T_ERANGE);
+    CHECK(cap_lookup(&cs, 0, CAP_TEST_TOKEN, CAP_R_EXEC, &c) == T_EPERM);
+    CHECK(cap_lookup(&cs, 5, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&cs, 0xFFFFFFFFu, CAP_TEST_TOKEN, 0, &c) == T_ERANGE);
 
     /* Derivation can only narrow rights, never widen them. */
     CHECK(cap_derive(&cs, 0, 1, CAP_R_READ | CAP_R_EXEC, 0) == T_OK);
-    CHECK(cap_lookup(&cs, 1, CAP_ENDPOINT, CAP_R_READ, &c) == T_OK);
-    CHECK(cap_lookup(&cs, 1, CAP_ENDPOINT, CAP_R_EXEC, &c) == T_EPERM);
-    CHECK(cap_lookup(&cs, 1, CAP_ENDPOINT, CAP_R_WRITE, &c) == T_EPERM);
+    CHECK(cap_lookup(&cs, 1, CAP_TEST_TOKEN, CAP_R_READ, &c) == T_OK);
+    CHECK(cap_lookup(&cs, 1, CAP_TEST_TOKEN, CAP_R_EXEC, &c) == T_EPERM);
+    CHECK(cap_lookup(&cs, 1, CAP_TEST_TOKEN, CAP_R_WRITE, &c) == T_EPERM);
 
     /* Without GRANT a capability cannot be copied onward. */
     CHECK(cap_derive(&cs, 1, 2, CAP_R_ALL, 0) == T_EPERM);
@@ -161,20 +162,20 @@ static void test_caps(void)
 
     /* Badges are write-once. */
     CHECK(cap_derive(&cs, 0, 3, CAP_R_ALL, 0xB1) == T_OK);
-    CHECK(cap_lookup(&cs, 3, CAP_ENDPOINT, 0, &c) == T_OK && c->badge == 0xB1);
+    CHECK(cap_lookup(&cs, 3, CAP_TEST_TOKEN, 0, &c) == T_OK && c->badge == 0xB1);
     CHECK(cap_derive(&cs, 3, 4, CAP_R_ALL, 0xB2) == T_EPERM);
     CHECK(cap_derive(&cs, 3, 4, CAP_R_READ, 0) == T_OK);
-    CHECK(cap_lookup(&cs, 4, CAP_ENDPOINT, 0, &c) == T_OK && c->badge == 0xB1);
+    CHECK(cap_lookup(&cs, 4, CAP_TEST_TOKEN, 0, &c) == T_OK && c->badge == 0xB1);
 
     CHECK(cap_delete(&cs, 1) == T_OK);
     CHECK(cap_delete(&cs, 1) == T_EBADCAP);
-    CHECK(cap_lookup(&cs, 1, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&cs, 1, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
 
     /* cap_identify exposes type, rights and badge only. */
     struct cap_info info;
     memset(&info, 0xEE, sizeof(info));
     CHECK(cap_identify(&cs, 3, &info) == T_OK);
-    CHECK(info.type == CAP_ENDPOINT && info.rights == (CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT) &&
+    CHECK(info.type == CAP_TEST_TOKEN && info.rights == (CAP_R_READ | CAP_R_WRITE | CAP_R_GRANT) &&
           info.badge == 0xB1);
     CHECK(cap_identify(&cs, 1, &info) == T_EBADCAP);
 
@@ -239,12 +240,12 @@ static void test_cap_revoke(void)
     cspace_init(&a, cdt_store_a, ARRAY_SIZE(cdt_store_a));
     cspace_init(&b, cdt_store_b, ARRAY_SIZE(cdt_store_b));
     finalised = 0;
-    cap_set_finaliser(CAP_ENDPOINT, count_finaliser);
+    cap_set_finaliser(CAP_TEST_TOKEN, count_finaliser);
 
     /* root(a0) ─┬─ a3
      *           └─ a1 ─┬─ b0   (delegated into another cspace)
      *                  └─ a2                                      */
-    CHECK(cap_install(&a, 0, CAP_ENDPOINT, CAP_R_ALL, 0xE1) == T_OK);
+    CHECK(cap_install(&a, 0, CAP_TEST_TOKEN, CAP_R_ALL, 0xE1) == T_OK);
     CHECK(cap_derive(&a, 0, 1, CAP_R_ALL, 0) == T_OK);
     CHECK(cap_derive(&a, 1, 2, CAP_R_ALL, 0) == T_OK);
     CHECK(cap_derive_to(&a, 1, &b, 0, CAP_R_READ | CAP_R_GRANT, 0x77) == T_OK);
@@ -255,10 +256,10 @@ static void test_cap_revoke(void)
     /* Revoking a1 removes its descendants in both cspaces, keeps a1, and
      * frees nothing because the object is still referenced. */
     CHECK(cap_revoke(&a, 1, 0) == T_OK);
-    CHECK(cap_lookup(&a, 2, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&b, 0, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&a, 1, CAP_ENDPOINT, CAP_R_ALL, &c) == T_OK);
-    CHECK(cap_lookup(&a, 3, CAP_ENDPOINT, CAP_R_READ, &c) == T_OK);
+    CHECK(cap_lookup(&a, 2, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&b, 0, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 1, CAP_TEST_TOKEN, CAP_R_ALL, &c) == T_OK);
+    CHECK(cap_lookup(&a, 3, CAP_TEST_TOKEN, CAP_R_READ, &c) == T_OK);
     CHECK(finalised == 0);
     CHECK(cdt_consistent(&a) && cdt_consistent(&b));
 
@@ -268,8 +269,8 @@ static void test_cap_revoke(void)
     CHECK(cap_delete(&a, 1) == T_OK);                     /* a0 > a4 */
     CHECK(cdt_store_a[4].depth == 1);
     CHECK(cap_revoke(&a, 0, 0) == T_OK);
-    CHECK(cap_lookup(&a, 4, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&a, 3, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 4, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 3, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
     CHECK(finalised == 0);
 
     /* Deleting the last capability runs the finaliser exactly once. */
@@ -277,17 +278,17 @@ static void test_cap_revoke(void)
     CHECK(finalised == 1 && finalised_object == 0xE1);
 
     /* Revocation is resumable: with a budget it makes bounded progress. */
-    CHECK(cap_install(&a, 0, CAP_ENDPOINT, CAP_R_ALL, 0xE2) == T_OK);
+    CHECK(cap_install(&a, 0, CAP_TEST_TOKEN, CAP_R_ALL, 0xE2) == T_OK);
     for (cap_slot_t i = 1; i < 8; i++)
         CHECK(cap_derive(&a, i - 1, i, CAP_R_ALL, 0) == T_OK);  /* chain of 7 */
     CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
-    CHECK(cap_lookup(&a, 4, CAP_ENDPOINT, 0, &c) == T_OK);
-    CHECK(cap_lookup(&a, 5, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 4, CAP_TEST_TOKEN, 0, &c) == T_OK);
+    CHECK(cap_lookup(&a, 5, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
     CHECK(cdt_consistent(&a));
     CHECK(cap_revoke(&a, 0, 3) == T_EAGAIN);
     CHECK(cap_revoke(&a, 0, 3) == T_OK);
-    CHECK(cap_lookup(&a, 1, CAP_ENDPOINT, 0, &c) == T_EBADCAP);
-    CHECK(cap_lookup(&a, 0, CAP_ENDPOINT, 0, &c) == T_OK);
+    CHECK(cap_lookup(&a, 1, CAP_TEST_TOKEN, 0, &c) == T_EBADCAP);
+    CHECK(cap_lookup(&a, 0, CAP_TEST_TOKEN, 0, &c) == T_OK);
     CHECK(finalised == 1);
 
     /* Destroying a cspace must leave no CDT link pointing into it. */
@@ -304,7 +305,7 @@ static void test_cap_revoke(void)
     for (size_t i = 0; i < ARRAY_SIZE(cdt_store_a); i++)
         CHECK(cdt_store_a[i].type == CAP_NULL && cdt_store_b[i].type == CAP_NULL);
 
-    cap_set_finaliser(CAP_ENDPOINT, NULL);
+    cap_set_finaliser(CAP_TEST_TOKEN, NULL);
 }
 
 /* ---- Untyped and retype (docs/adr/0006-untyped-retype.md) ---- */
@@ -1790,6 +1791,7 @@ struct ipc_snap {
         uint32_t state, reply_state, reply_flags;
         const void *wait_q, *wait_next, *wait_prev, *reply_to, *reply_from;
         struct user_regs regs;
+        struct ipc_msg msg;
     } th[SNAP_MAX];
     const struct thread *runq[SNAP_MAX];
     struct waitq q[TEST_WAITQS];
@@ -1813,10 +1815,13 @@ static void snapshot(struct ipc_snap *s, const struct thread *const *threads, un
         s->th[i].reply_to = t->reply_to;
         s->th[i].reply_from = t->reply_from;
         s->th[i].regs = t->regs;
+        s->th[i].msg = t->msg;
     }
     unsigned k = 0;
-    for (struct thread *t = runq_pop(); t; t = runq_pop())
+    for (struct thread *t = runq_pop(); t; t = runq_pop()) {
+        KASSERT(k < SNAP_MAX);                       /* bounded copy */
         s->runq[k++] = t;
+    }
     for (unsigned i = 0; i < k; i++)                 /* restore the order */
         thread_enqueue((struct thread *)s->runq[i]);
     for (unsigned i = 0; i < TEST_WAITQS; i++)
@@ -2258,6 +2263,377 @@ static void test_notif_destroy(void)
     CHECK(AUDIT());
 }
 
+/* ---- Endpoint rendezvous (ADR 0009, step 5.3) ---- */
+
+#define RW_ (CAP_R_READ | CAP_R_WRITE)
+#define MSG_INFO(label, len) (((uint64_t)(label) << 32) | (len))
+
+/* Endpoint invariants: both queues well-formed and audited, and never both
+ * non-empty (a receiver arriving while senders wait rendezvouses). */
+static bool ep_ok(const struct endpoint *e)
+{
+    struct waitq *q[] = { (struct waitq *)&e->senders, (struct waitq *)&e->receivers };
+    return !(e->senders.head && e->receivers.head) && ipc_audit(q, 2);
+}
+
+static struct ipc_buffer *tbuf(cap_slot_t b)
+{
+    return phys_to_virt(cap_obj_paddr(&ut_store[b + T_DATA]));
+}
+
+/* A thread at uts slots b.. that performs one SEND (with `tag` as its only
+ * word) or one RECV on its cspace slot 1, with its data page bound as its
+ * IPC buffer, and the endpoint capability given with `rights`. */
+static bool ep_thread(cap_slot_t b, bool send, uint64_t label, uint64_t tag, cap_rights_t rights)
+{
+    struct user_regs r = { .r12 = send ? SYS_SEND : SYS_RECV, .rdi = 1,
+                           .rsi = MSG_INFO(label, 1) };
+    if (!spawn(b, P(sys1), false, &r))
+        return false;
+    struct cspace cs = task_cs(b);
+    tbuf(b)->words[0] = send ? tag : 0xAAAAAAAAAAAAAAAAull;
+    return cap_derive_to(&uts, 1, &cs, 1, rights, 0) == T_OK &&
+           thread_bind(&uts, b + T_THR, TS_IPCBUF, &uts, b + T_DATA) == T_OK;
+}
+
+static uint64_t got(cap_slot_t b) { return tbuf(b)->words[0]; }
+
+/* Run threads one at a time in the given order, so each blocks (or
+ * rendezvouses) before the next starts; then let everything finish. */
+static void run_in_order(const cap_slot_t *order, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+        CHECK(thread_suspend(&uts, order[i] + T_THR) == T_OK);
+    for (unsigned i = 0; i < n; i++) {
+        CHECK(thread_resume(&uts, order[i] + T_THR) == T_OK);
+        sched_run();
+    }
+}
+
+/* P39, P41, P42: FIFO across three orders. S_i carries tag 0x50+i; R_i must
+ * receive exactly S_i's tag and label. */
+static void ep_fifo_case(const cap_slot_t *order)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    const cap_slot_t S[3] = { 10, 20, 30 }, R[3] = { 40, 50, 60 };
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(ep_thread(S[i], true, i + 1, 0x51 + i, CAP_R_WRITE));
+        CHECK(ep_thread(R[i], false, 0, 0, CAP_R_READ));
+    }
+    test_report_count = 0;
+    run_in_order(order, 6);
+    CHECK(ep_ok(e) && !e->senders.head && !e->receivers.head);
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(got(R[i]) == 0x51 + i);                       /* S_i <-> R_i */
+        CHECK(tstate(S[i]) == THREAD_INACTIVE && tstate(R[i]) == THREAD_INACTIVE);
+        CHECK(th(S[i])->msg.info == 0);                     /* nothing left (P42) */
+    }
+    /* Every one of the six operations completed with status 0. */
+    CHECK(test_report_count == 6);
+    for (unsigned i = 0; i < test_report_count; i++)
+        CHECK(test_reports[i].a == T_OK);
+    ut_teardown();
+}
+
+static void test_ep_fifo(void)
+{
+    static const cap_slot_t senders_first[6] = { 10, 20, 30, 40, 50, 60 };
+    static const cap_slot_t receivers_first[6] = { 40, 50, 60, 10, 20, 30 };
+    static const cap_slot_t interleaved[6] = { 10, 20, 40, 30, 50, 60 };
+    ep_fifo_case(senders_first);
+    ep_fifo_case(receivers_first);
+    ep_fifo_case(interleaved);
+}
+
+/* P3, P4, P7, P47: message shape; failures with partners queued leave an
+ * exact snapshot unchanged (validation happens before any dequeue). */
+static void test_ep_format(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+
+    /* A receiver waits; a sender sends 32 words. */
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    for (unsigned i = 0; i < MSG_MAX_WORDS; i++)
+        tbuf(40)->words[i] = 0xAA;
+    tbuf(40)->caps[0] = 0xCC;
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && ep_ok(e));
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &cs, 1, RW_, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &cs, 2, CAP_R_READ, 0) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 70, 1) == T_OK);
+    struct ipc_buffer *sb = phys_to_virt(cap_obj_paddr(&ut_store[70]));
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 70) == T_OK);
+    for (unsigned i = 0; i < MSG_MAX_WORDS; i++)
+        sb->words[i] = 0x1000 + i;
+
+    /* Kernel-API failures while the receiver waits: nothing changes. */
+    const struct thread *who[] = { th(40) };
+    struct waitq *eq[] = { &e->senders, &e->receivers };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 1);
+    struct thread *snd = th(10);
+    static const uint64_t bad_info[] = {
+        MSG_INFO(1, 33), MSG_INFO(1, 1) | (1u << 8), MSG_INFO(1, 1) | (1u << 6), /* caps: 5.4 */
+        MSG_INFO(1, 1) | (1ull << 31),
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(bad_info); i++)
+        CHECK(endpoint_send(snd, &cs, 1, bad_info[i]) == T_EINVAL);
+    CHECK(endpoint_send(snd, &cs, 2, MSG_INFO(1, 1)) == T_EPERM);      /* READ only */
+    CHECK(endpoint_send(snd, &cs, 9, MSG_INFO(1, 1)) == T_EBADCAP);
+    snapshot(&snap_b, who, 1);
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    CHECK(tbuf(40)->words[0] == 0xAA && ipc_audit(eq, 2));
+
+    /* The real send, from ring 3: all 32 words arrive. */
+    nreq = 0;
+    REQ(10, SYS_SEND, 1, MSG_INFO(7, 32));
+    run_user();
+    CHECK(res(10, 0) == T_OK && test_report_count == 1);
+    CHECK(test_reports[0].a == T_OK && test_reports[0].b == MSG_INFO(7, 32));
+    bool all = true;
+    for (unsigned i = 0; i < MSG_MAX_WORDS; i++)
+        all &= tbuf(40)->words[i] == 0x1000 + i;
+    CHECK(all && tbuf(40)->caps[0] == 0xCC);       /* nothing beyond the words */
+    CHECK(ep_ok(e));
+
+    ut_teardown();
+
+    /* Length 1 into a dirty buffer: only word 0 is written. */
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    for (unsigned i = 0; i < MSG_MAX_WORDS; i++)
+        tbuf(40)->words[i] = 0xAA;
+    CHECK(ep_thread(10, true, 3, 0x77, CAP_R_WRITE));
+    run_in_order((const cap_slot_t[]){ 40, 10 }, 2);
+    CHECK(tbuf(40)->words[0] == 0x77 && tbuf(40)->words[1] == 0xAA &&
+          tbuf(40)->words[31] == 0xAA);
+    ut_teardown();
+
+    /* Length 0 with no IPC buffer is fine for a sender; a receiver always
+     * needs one; data without a buffer is refused. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(spawn(10, P(runner), false, NULL));
+    cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &cs, 1, RW_, 0) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_RECV, 1);                  /* 0: no buffer */
+    REQ(10, SYS_SEND, 1, MSG_INFO(1, 1));  /* 1: data, no buffer */
+    run_user();
+    CHECK(res(10, 0) == T_EINVAL && res(10, 1) == T_EINVAL);
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    tbuf(40)->words[0] = 0xAA;
+    run_user();                            /* the receiver blocks */
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && ep_ok(e));
+    CHECK(spawn(20, P(runner), false, NULL));
+    struct cspace c20 = task_cs(20);
+    CHECK(cap_derive_to(&uts, 1, &c20, 1, CAP_R_WRITE, 0) == T_OK);
+    nreq = 0;
+    REQ(20, SYS_SEND, 1, MSG_INFO(9, 0));  /* label only, no IPC buffer */
+    run_user();
+    CHECK(res(20, 0) == T_OK);
+    CHECK(test_report_count == 1 && test_reports[0].b == MSG_INFO(9, 0));
+    CHECK(tbuf(40)->words[0] == 0xAA);     /* zero words: buffer untouched */
+    CHECK(ep_ok(e));
+    ut_teardown();
+}
+
+/* P46, P6a: the blocked sender's message lives in the kernel. */
+static void test_ep_capture(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_thread(10, true, 1, 0x1111, CAP_R_WRITE));
+    CHECK(ep_thread(20, true, 2, 0x2222, CAP_R_WRITE));
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    CHECK(ep_thread(50, false, 0, 0, CAP_R_READ));
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK && thread_suspend(&uts, 50 + T_THR) == T_OK);
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && tstate(20) == THREAD_BLOCKED_SEND && ep_ok(e));
+    CHECK(th(10)->msg.info == MSG_INFO(1, 1) && th(10)->msg.words[0] == 0x1111);
+
+    /* P47: refused receives, with senders queued, change nothing: no READ
+     * (only WRITE); holding reply authority, pending or caller-gone. */
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 1, &c40, 2, CAP_R_WRITE, 0) == T_OK);
+    reply_link(th(40), th(50), 0);
+    const struct thread *who[] = { th(10), th(20), th(40), th(50) };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 4);
+    CHECK(endpoint_recv(th(40), &c40, 2) == T_EPERM);
+    CHECK(endpoint_recv(th(40), &c40, 1) == T_EBUSY);
+    snapshot(&snap_b, who, 4);
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);             /* caller gone */
+    CHECK(th(40)->reply_state == REPLY_CALLER_GONE);
+    CHECK(endpoint_recv(th(40), &c40, 1) == T_EBUSY && e->senders.head == th(10) && ep_ok(e));
+    th(40)->reply_state = REPLY_NONE;    /* (a reply would consume it, step 5.5) */
+
+    tbuf(10)->words[0] = 0xBADBAD;                               /* rewritten while blocked */
+    CHECK(thread_unbind(&uts, 20 + T_THR, TS_IPCBUF) == T_OK);   /* unbound while blocked */
+    CHECK(tstate(20) == THREAD_BLOCKED_SEND);                    /* not aborted (P6a) */
+    CHECK(thread_resume(&uts, 40 + T_THR) == T_OK && thread_resume(&uts, 50 + T_THR) == T_OK);
+    run_user();
+    CHECK(got(40) == 0x1111 && got(50) == 0x2222);
+    CHECK(ep_ok(e) && !e->senders.head);
+    ut_teardown();
+}
+
+/* P43, P44, P45: liveness in both directions, counted semantically. */
+static unsigned scan_ep_caps(const struct cap *obj, cap_rights_t right,
+                             struct cspace *const *css, unsigned ncs)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < ncs; i++)
+        for (uint32_t j = 0; j < css[i]->nslots; j++) {
+            const struct cap *c = &css[i]->slots[j];
+            if (c->type == CAP_ENDPOINT && c->object == obj->object && (c->rights & right))
+                n++;
+        }
+    return n;
+}
+
+static void test_ep_liveness(void)
+{
+    /* A blocked sender waits for a receiver: deleting every send
+     * capability, its own included, must not wake it; it still delivers. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_thread(10, true, 1, 0x5151, CAP_R_WRITE));
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);   /* receive authority */
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND);
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_delete(&c10, 1) == T_OK);              /* its own send capability */
+    CHECK(cap_delete(&uts, 1) == T_OK);              /* the master (re-parents) */
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && ep_ok(e));
+    CHECK(spawn(40, P(sys1), false, &(struct user_regs){ .r12 = SYS_RECV, .rdi = 1 }));
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 2, &c40, 1, CAP_R_READ, 0) == T_OK);
+    CHECK(thread_bind(&uts, 40 + T_THR, TS_IPCBUF, &uts, 40 + T_DATA) == T_OK);
+    run_user();
+    CHECK(got(40) == 0x5151 && ep_ok(e));
+    ut_teardown();
+
+    /* Last receive authority gone: blocked senders get T_EDEAD; deleting
+     * a re-parented master or extra send capabilities wakes nobody. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);
+    CHECK(cap_derive(&uts, 2, 3, CAP_R_READ, 0) == T_OK);
+    CHECK(ep_thread(10, true, 1, 1, CAP_R_WRITE));
+    CHECK(ep_thread(20, true, 1, 2, CAP_R_WRITE));
+    run_user();
+    struct cspace c20 = task_cs(20);
+    c10 = task_cs(10);
+    struct cspace *all[] = { &uts, &c10, &c20 };
+    /* Count through a capability that stays alive throughout (sender 10's
+     * own), never through one the test deletes. */
+#define EPC(r, k) (endpoint_caps_with(&c10.slots[1], r) == (k) && scan_ep_caps(&c10.slots[1], r, all, 3) == (k))
+    CHECK(EPC(CAP_R_READ, 3) && EPC(CAP_R_WRITE, 3));
+    CHECK(cap_delete(&uts, 1) == T_OK);              /* master: READ+WRITE */
+    CHECK(EPC(CAP_R_READ, 2) && tstate(10) == THREAD_BLOCKED_SEND && ep_ok(e));
+    CHECK(cap_delete(&c20, 1) == T_OK);              /* a send cap: irrelevant to senders */
+    CHECK(EPC(CAP_R_WRITE, 1) && tstate(10) == THREAD_BLOCKED_SEND);
+    CHECK(cap_delete(&uts, 2) == T_OK);              /* 3 re-parents */
+    CHECK(EPC(CAP_R_READ, 1) && tstate(10) == THREAD_BLOCKED_SEND);
+    CHECK(cap_delete(&uts, 3) == T_OK);              /* the last READ */
+    CHECK(EPC(CAP_R_READ, 0) && !e->senders.head);
+    CHECK(tstate(10) == THREAD_RUNNABLE && tstate(20) == THREAD_RUNNABLE && ep_ok(e));
+    run_user();
+    CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD &&
+          (int64_t)test_reports[1].a == T_EDEAD);
+    /* A later send fails at once: nobody can ever receive. */
+    CHECK(endpoint_send(th(10), &c10, 1, MSG_INFO(1, 0)) == T_EDEAD);
+#undef EPC
+    ut_teardown();
+
+    /* Last send authority gone: blocked receivers get T_EDEAD. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_WRITE, 0) == T_OK);
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    CHECK(ep_thread(50, false, 0, 0, CAP_R_READ));
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && tstate(50) == THREAD_BLOCKED_RECV);
+    struct cspace c50 = task_cs(50);
+    CHECK(cap_delete(&c50, 1) == T_OK);              /* a READ cap: irrelevant */
+    CHECK(cap_delete(&uts, 1) == T_OK);              /* master */
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && tstate(50) == THREAD_BLOCKED_RECV && ep_ok(e));
+    CHECK(cap_delete(&uts, 2) == T_OK);              /* the last WRITE */
+    CHECK(tstate(40) == THREAD_RUNNABLE && tstate(50) == THREAD_RUNNABLE && ep_ok(e));
+    run_user();
+    CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD);
+    /* A later receive fails at once (no sender can exist any more). */
+    struct cspace c40b = task_cs(40);
+    CHECK(endpoint_recv(th(40), &c40b, 1) == T_EDEAD);
+    ut_teardown();
+}
+
+/* P31, P26: destroying a waiter, and the endpoint itself. */
+static void test_ep_destroy(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_thread(10, true, 1, 1, CAP_R_WRITE));
+    CHECK(ep_thread(20, true, 1, 2, CAP_R_WRITE));
+    CHECK(ep_thread(30, true, 1, 3, CAP_R_WRITE));
+    run_user();
+    CHECK(cap_delete(&uts, 20 + T_THR) == T_OK);
+    CHECK(e->senders.head == th(10) && th(10)->wait_next == th(30) && ep_ok(e));
+    for (cap_slot_t b = 10; b <= 30; b += 20) {
+        struct cspace c = task_cs(b);
+        CHECK(cap_delete(&c, 1) == T_OK);
+    }
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND);       /* the master (READ) remains */
+    CHECK(cap_delete(&uts, 1) == T_OK);             /* the object goes */
+    CHECK(tstate(10) == THREAD_RUNNABLE && tstate(30) == THREAD_RUNNABLE && ep_ok(e));
+    run_user();
+    CHECK(test_report_count == 2 && (int64_t)test_reports[1].a == T_EDEAD);
+    ut_teardown();
+    CHECK(AUDIT());
+}
+
+/* P5: an IPC buffer is a writable alias for W^X. */
+static void test_ep_ipcbuf_wx(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(cap_derive(&uts, 10 + T_CODE, 70, CAP_R_ALL, 0) == T_OK);   /* code frame: mapped RX */
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 70) == T_EPERM);
+    /* The mapped capability itself: its own mapping counts too. */
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 10 + T_CODE) == T_EPERM);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 71, 1) == T_OK);
+    CHECK(cap_derive(&uts, 71, 72, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive(&uts, 71, 73, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive(&uts, 71, 74, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 74) == T_EPERM);  /* no WRITE */
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 71) == T_OK);
+    CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RX) == T_EPERM);   /* now an alias */
+    CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RW) == T_OK);
+    CHECK(vspace_map(&uts, 10 + T_AS, 73, ua(0x405000), RO) == T_OK);
+    CHECK(thread_unbind(&uts, 10 + T_THR, TS_IPCBUF) == T_OK);
+    CHECK(vspace_unmap(&uts, 72) == T_OK);
+    CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RX) == T_OK);      /* alias gone */
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -2315,6 +2691,12 @@ static const struct {
     { "notif_waiters", test_notif_waiters },
     { "notif_liveness", test_notif_liveness },
     { "notif_destroy", test_notif_destroy },
+    { "ep_fifo", test_ep_fifo },
+    { "ep_format", test_ep_format },
+    { "ep_capture", test_ep_capture },
+    { "ep_liveness", test_ep_liveness },
+    { "ep_destroy", test_ep_destroy },
+    { "ep_ipcbuf_wx", test_ep_ipcbuf_wx },
     { "cpu_hardening", test_cpu_hardening },
 };
 

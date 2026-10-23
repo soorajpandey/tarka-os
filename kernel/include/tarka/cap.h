@@ -24,6 +24,10 @@ enum cap_type {
     CAP_PAGE_TABLE, /* one page-table level + shadow (ADR 0007) */
     CAP_DEBUG_CONSOLE, /* temporary kernel console output (ADR 0008, T24) */
     CAP_NOTIFICATION, /* signal word + waiters (ADR 0009) */
+#ifdef TARKA_SELFTEST
+    CAP_TEST_TOKEN, /* test builds only: a badgeable capability with no object
+                     * and no hooks, for capability-core (CDT) tests */
+#endif
     CAP_TYPE_COUNT,
 };
 

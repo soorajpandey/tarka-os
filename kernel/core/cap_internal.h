@@ -29,6 +29,10 @@ bool cap_has_children(const struct cap *c);
 
 static inline bool cap_badged_type(uint32_t type)
 {
+#ifdef TARKA_SELFTEST
+    if (type == CAP_TEST_TOKEN)
+        return true;
+#endif
     return type == CAP_ENDPOINT || type == CAP_NOTIFICATION;
 }
 

@@ -11,6 +11,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/string.h>
+#include <tarka/endpoint.h>
 #include <tarka/notification.h>
 #include <tarka/thread.h>
 #include <tarka/vspace.h>
@@ -184,6 +185,8 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
             thread_obj_init(pa_add(base, i * obj_size));
         else if (type == CAP_NOTIFICATION)
             notification_obj_init(pa_add(base, i * obj_size));
+        else if (type == CAP_ENDPOINT)
+            endpoint_obj_init(pa_add(base, i * obj_size));
     }
 
     /* 9. capabilities, as children of the Untyped. Untyped and PageTable

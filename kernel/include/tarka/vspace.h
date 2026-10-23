@@ -32,6 +32,12 @@ void vspace_activate_kernel(void);
  * path, where the capability is a thread's binding). */
 void vspace_activate_cap(const struct cap *as);
 
+/* V6 / ADR 0009 P5: would a new capability record to `frame` (a binding)
+ * with rights `want` make the frame both writable (by a mapping or as an
+ * IPC buffer) and executable? Every existing record is checked, `frame`'s
+ * own mapping included. */
+bool vspace_frame_alias_conflict(struct cap *frame, cap_rights_t want);
+
 /* Structural audit of one AddressSpace (ADR 0007 tests): kernel half equal
  * to the master and supervisor-only; every user entry backed by a shadow
  * pointer to the capability that filled it, and vice versa; every leaf a

@@ -17,6 +17,7 @@
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/string.h>
+#include <tarka/thread.h>
 
 #define PTE_ADDR_MASK  0x000FFFFFFFFFF000ull
 /* Accessed and Dirty are set by the MMU itself; the audit ignores them. */
@@ -216,19 +217,37 @@ static uint64_t pte_flags(cap_rights_t r)
     return f;
 }
 
-/* V6: refuse a mapping that would make one physical frame writable through
- * one capability and executable through another. */
-static bool alias_conflict(struct cap *frame, cap_rights_t want)
+/* A capability bound as a thread's IPC buffer is a writable alias: the
+ * kernel writes into its frame (ADR 0009, P5). */
+static bool ipcbuf_binding(const struct cap *c)
+{
+    return c->slot_flags == (SLOT_BINDING | TS_IPCBUF);
+}
+
+/* V6: refuse a new alias that would make one physical frame writable
+ * through one capability and executable through another. `skip` is the
+ * capability that will hold the new alias, if it is one of the frame's
+ * existing records (a mapping); NULL when the alias is a new record (a
+ * binding), so that every existing record is checked, the source's own
+ * mapping included. */
+static bool alias_conflict(struct cap *frame, const struct cap *skip, cap_rights_t want)
 {
     for (struct cap *c = cap_object_first(frame); cap_same_object(c, frame); c = c->next) {
-        if (c == frame || !(c->map_state & MS_MAPPED))
+        if (c == skip)
             continue;
-        if ((want & CAP_R_WRITE) && (c->map_state & CAP_R_EXEC))
+        bool w = ((c->map_state & MS_MAPPED) && (c->map_state & CAP_R_WRITE)) || ipcbuf_binding(c);
+        bool x = (c->map_state & MS_MAPPED) && (c->map_state & CAP_R_EXEC);
+        if ((want & CAP_R_WRITE) && x)
             return true;
-        if ((want & CAP_R_EXEC) && (c->map_state & CAP_R_WRITE))
+        if ((want & CAP_R_EXEC) && w)
             return true;
     }
     return false;
+}
+
+bool vspace_frame_alias_conflict(struct cap *frame, cap_rights_t want)
+{
+    return alias_conflict(frame, NULL, want);
 }
 
 int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, uaddr_t va, unsigned depth)
@@ -300,7 +319,7 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, uaddr_t va,
     struct cap *fc = cap_slot(cs, frame);
     if (fc->map_state & MS_MAPPED)
         return T_EBUSY;  /* V10: one mapping per capability */
-    if (alias_conflict(fc, rights))
+    if (alias_conflict(fc, fc, rights))
         return T_EPERM;  /* V6 */
 
     uint64_t *entry = entry_at(cap_obj_paddr(a), va, 3);

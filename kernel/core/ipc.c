@@ -8,8 +8,10 @@
 
 #include <tarka/ipc.h>
 
+#include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/string.h>
 
 #include "../arch/x86_64/percpu.h"
 
@@ -37,6 +39,10 @@ static void waitq_remove(struct thread *t)
 
     if (!q)
         return;
+    /* P42: a staged message lives exactly as long as the send wait, however
+     * it ends (rendezvous, T_EDEAD, suspension, destruction). */
+    if (q->kind == THREAD_BLOCKED_SEND)
+        memset(&t->msg, 0, sizeof(t->msg));
     if (t->wait_prev)
         t->wait_prev->wait_next = t->wait_next;
     else
@@ -222,6 +228,14 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
         if (t->reply_from && (!live(t->reply_from) || t->reply_from->reply_to != t ||
                               t->reply_from->reply_state != REPLY_PENDING))
             return false;
+        /* 7 (P42, P46): a message is staged only while blocked sending,
+         * and nothing lies beyond its length. */
+        unsigned len = t->state == THREAD_BLOCKED_SEND ? MSG_LEN(t->msg.info) : 0;
+        if (len > MSG_MAX_WORDS || (t->state != THREAD_BLOCKED_SEND && t->msg.info))
+            return false;
+        for (unsigned i = len; i < MSG_MAX_WORDS; i++)
+            if (t->msg.words[i])
+                return false;
         /* Reply authority held as a server. */
         switch (t->reply_state) {
         case REPLY_PENDING:

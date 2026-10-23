@@ -2,6 +2,7 @@
 #include <tarka/pmm.h>
 #include <tarka/selftest.h>
 #include <tarka/untyped.h>
+#include <tarka/endpoint.h>
 #include <tarka/notification.h>
 #include <tarka/thread.h>
 #include <tarka/user.h>
@@ -86,6 +87,7 @@ __noreturn __no_canary void kmain(void)
     vspace_boot();
     thread_boot();
     notification_boot();
+    endpoint_boot();
     user_boot();
 
 #ifdef TARKA_SELFTEST

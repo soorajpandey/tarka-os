@@ -46,6 +46,27 @@ struct waitq {
     uint32_t kind;          /* enum thread_state */
     uint32_t reserved;
 };
+_Static_assert(sizeof(struct waitq) == 24, "struct waitq must have no padding");
+
+/* A message captured into kernel memory (ADR 0009, P2, P6, P7). */
+#define MSG_MAX_WORDS 32
+#define MSG_MAX_CAPS  3
+struct ipc_msg {
+    uint64_t info;                    /* label | caps | length (P3) */
+    uint64_t words[MSG_MAX_WORDS];    /* zero beyond the length (P7) */
+};
+_Static_assert(sizeof(struct ipc_msg) == (1 + MSG_MAX_WORDS) * 8, "struct ipc_msg must have no padding");
+
+/* The IPC buffer layout (P4), at the start of a thread's TS_IPCBUF frame. */
+struct ipc_buffer {
+    uint64_t words[MSG_MAX_WORDS];
+    uint32_t caps[MSG_MAX_CAPS];
+    uint32_t recv_slots[MSG_MAX_CAPS];
+    uint32_t recv_count;
+    uint32_t reserved;
+};
+_Static_assert(sizeof(struct ipc_buffer) == 32 * 8 + 8 * 4, "struct ipc_buffer must have no padding");
+_Static_assert(sizeof(struct ipc_buffer) <= 4096, "an IPC buffer must fit the smallest frame");
 
 /* A server's reply authority (P16, P17). Not a capability. */
 enum reply_state {
@@ -95,6 +116,7 @@ struct thread {
     struct thread      *reply_from;  /* caller side: the server answering */
     uint32_t            reply_state; /* enum reply_state */
     uint32_t            reply_flags;
+    struct ipc_msg      msg;         /* a blocked sender's captured message (P6) */
     struct thread      *reg_next;    /* test builds: registry of live threads */
     struct thread      *reg_prev;
     struct cap          bind[TS_COUNT] __aligned(64);

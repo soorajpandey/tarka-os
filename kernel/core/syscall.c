@@ -10,6 +10,7 @@
 
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
+#include <tarka/endpoint.h>
 #include <tarka/kernel.h>
 #include <tarka/notification.h>
 #include <tarka/selftest.h>
@@ -288,6 +289,22 @@ static int64_t sys_poll(struct sysctx *c, const struct sysargs *a)
     return notification_wait(c->t, &c->cs, s, false);
 }
 
+static int64_t sys_send(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return endpoint_send(c->t, &c->cs, s, a->a[1]);
+}
+
+static int64_t sys_recv(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return endpoint_recv(c->t, &c->cs, s);
+}
+
 static const sys_fn table[] = {
     [SYS_YIELD] = sys_yield,
     [SYS_EXIT] = sys_exit,
@@ -312,6 +329,8 @@ static const sys_fn table[] = {
     [SYS_SIGNAL] = sys_signal,
     [SYS_WAIT] = sys_wait,
     [SYS_POLL] = sys_poll,
+    [SYS_SEND] = sys_send,
+    [SYS_RECV] = sys_recv,
 };
 #define NSYS (sizeof(table) / sizeof(table[0]))
 
