@@ -14,6 +14,7 @@
 #include <tarka/pmm.h>
 #include <tarka/string.h>
 #include <tarka/thread.h>
+#include <tarka/uaccess.h>
 #include <tarka/untyped.h>
 #include <tarka/user.h>
 #include <tarka/syscall.h>
@@ -1453,6 +1454,86 @@ static void test_user_sysret_edge(void)
     ut_teardown();
 }
 
+/* T25-T27, T35: the copy routines. */
+static uint8_t kbuf[COPY_MAX + 16];
+
+static bool all_bytes(const uint8_t *p, size_t n, uint8_t v)
+{
+    for (size_t i = 0; i < n; i++)
+        if (p[i] != v)
+            return false;
+    return true;
+}
+
+static void test_uaccess(void)
+{
+    extern const char copy_user_insn[];
+    uint64_t rflags;
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL));   /* code RX, data + stack RW */
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    uint8_t *data = phys_to_virt(cap_obj_paddr(&ut_store[10 + T_DATA]));
+    uint8_t *stack = phys_to_virt(cap_obj_paddr(&ut_store[10 + T_STACK]));
+    for (size_t i = 0; i < PAGE_SIZE; i++) {
+        data[i] = (uint8_t)i;
+        stack[i] = (uint8_t)(i ^ 0x5A);
+    }
+
+    CHECK(vspace_activate(&uts, 10 + T_AS) == T_OK);
+    uint64_t faults = entry_obs.copy_faults;
+
+    /* Success: a whole page, and a range crossing into the next page. */
+    CHECK(copy_from_user(kbuf, ua(UDATA_VA), PAGE_SIZE) == T_OK && memcmp(kbuf, data, PAGE_SIZE) == 0);
+    CHECK(copy_from_user(kbuf, ua(UDATA_VA + 0x800), PAGE_SIZE) == T_OK);
+    CHECK(memcmp(kbuf, data + 0x800, 0x800) == 0 && memcmp(kbuf + 0x800, stack, 0x800) == 0);
+
+    /* Faults: first byte, last byte, partway. Destination always zeroed. */
+    memset(kbuf, 0xEE, sizeof(kbuf));
+    CHECK(copy_from_user(kbuf, ua(USTACK_TOP), 16) == T_EFAULT && all_bytes(kbuf, 16, 0));
+    memset(kbuf, 0xEE, sizeof(kbuf));
+    CHECK(copy_from_user(kbuf, ua(USTACK_TOP - 15), 16) == T_EFAULT && all_bytes(kbuf, 16, 0));
+    memset(kbuf, 0xEE, sizeof(kbuf));
+    CHECK(copy_from_user(kbuf, ua(USTACK_TOP - 0x800), PAGE_SIZE) == T_EFAULT);
+    CHECK(all_bytes(kbuf, PAGE_SIZE, 0) && kbuf[PAGE_SIZE] == 0xEE); /* zeroed, not beyond */
+    CHECK(entry_obs.copy_faults == faults + 3);                      /* real faults, recovered */
+
+    /* Rejected by the range check, before any access. */
+    faults = entry_obs.copy_faults;
+    CHECK(copy_from_user(kbuf, ua(0xFFFF800000000000ull), 8) == T_EFAULT);
+    CHECK(copy_from_user(kbuf, ua(0xFFFFFFFF80000000ull), 8) == T_EFAULT);
+    CHECK(copy_from_user(kbuf, ua(~0ull - 7), 16) == T_EFAULT);      /* wraps */
+    CHECK(copy_from_user(kbuf, ua(USER_TOP - 7), 8) == T_EFAULT);    /* one byte over */
+    CHECK(copy_from_user(kbuf, ua(UDATA_VA), COPY_MAX + 1) == T_EINVAL);
+    CHECK(copy_from_user(kbuf, ua(0xFFFF800000000000ull), 0) == T_EFAULT);
+    CHECK(entry_obs.copy_faults == faults);
+    CHECK(copy_from_user(kbuf, ua(UDATA_VA), 0) == T_OK);
+    /* Exactly at USER_TOP: in range, unmapped, so a real recovered fault. */
+    CHECK(copy_from_user(kbuf, ua(USER_TOP - 8), 8) == T_EFAULT);
+    CHECK(entry_obs.copy_faults == faults + 1);
+
+    /* copy_to_user: writable page, and a read-only (code) page. */
+    memset(kbuf, 0x77, 64);
+    CHECK(copy_to_user(ua(UDATA_VA + 64), kbuf, 64) == T_OK && all_bytes(data + 64, 64, 0x77));
+    CHECK(copy_to_user(ua(UCODE_VA), kbuf, 8) == T_EFAULT);
+    CHECK(copy_to_user(ua(0xFFFF800000001000ull), kbuf, 8) == T_EFAULT);
+
+    /* SMAP is closed again after every path. */
+    __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+    CHECK(!(rflags & (1u << 18)) && (read_cr4() & CR4_SMAP));
+
+    /* The recovery decision itself. */
+    CHECK(copy_fault_recoverable((uint64_t)copy_user_insn, UDATA_VA));
+    CHECK(copy_fault_recoverable((uint64_t)copy_user_insn, USER_TOP - 1));
+    CHECK(!copy_fault_recoverable((uint64_t)copy_user_insn, USER_TOP));
+    CHECK(!copy_fault_recoverable((uint64_t)copy_user_insn, 0xFFFF800000000000ull));
+    CHECK(!copy_fault_recoverable((uint64_t)copy_user_insn + 2, UDATA_VA));
+    CHECK(!copy_fault_recoverable((uint64_t)copy_from_user, UDATA_VA));
+
+    vspace_activate_kernel();
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1498,6 +1579,7 @@ static const struct {
     { "user_entry_state", test_user_entry_state },
     { "user_faults", test_user_faults },
     { "user_sysret_edge", test_user_sysret_edge },
+    { "uaccess", test_uaccess },
     { "cpu_hardening", test_cpu_hardening },
 };
 

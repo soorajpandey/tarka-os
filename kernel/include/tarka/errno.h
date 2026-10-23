@@ -14,6 +14,7 @@ enum {
     T_EDOUBLEFREE = -7, /* object already free */
     T_EAGAIN     = -8,  /* partial progress; call again to continue */
     T_ENOENT     = -9,  /* a required page-table level is missing */
+    T_EFAULT     = -10, /* user address not accessible (ADR 0008, T26) */
 };
 
 #endif

@@ -30,6 +30,7 @@ struct entry_observation {
     uint64_t last_vector;
     uint64_t sysret_returns, iret_returns;
     uint64_t nmis, nmi_last_rflags, nmi_last_from_user;
+    uint64_t copy_faults;        /* recovered user-copy faults (T35) */
 };
 extern struct entry_observation entry_obs;
 #define CHECK(cond) selftest_check((cond), #cond, __FILE__, __LINE__)

@@ -85,6 +85,7 @@ run: build/release/tarka.iso
 
 test: build/test/tarka.iso
 	scripts/check-address-types.sh
+	scripts/check-stac.sh
 	scripts/run-tests.sh $<
 
 clean:

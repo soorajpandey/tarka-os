@@ -5,6 +5,7 @@
 
 #include <tarka/kernel.h>
 #include <tarka/selftest.h>
+#include <tarka/uaccess.h>
 
 struct idt_entry {
     uint16_t off_lo;
@@ -91,6 +92,19 @@ void isr_dispatch(struct trap_frame *tf)
 {
     if (tf->vector >= 32)
         return; /* spurious: nothing is configured to raise it */
+    if (tf->vector == 14) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        /* T35: the one recoverable kernel-mode fault. IRETQ restores the
+         * interrupted RFLAGS; the landing pad then clears AC. */
+        if (copy_fault_recoverable(tf->rip, cr2)) {
+#ifdef TARKA_SELFTEST
+            entry_obs.copy_faults++;
+#endif
+            tf->rip = copy_fault_landing();
+            return;
+        }
+    }
     fatal(tf, "kernel mode");
 }
 
