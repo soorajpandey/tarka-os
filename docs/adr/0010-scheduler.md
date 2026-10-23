@@ -2,11 +2,14 @@
 
 Status: accepted (revision 3e; step 6). Revision 3c was `2c517b1`.
 Revisions 3d and 3e (sections "Revision 3d" and "Revision 3e") amend it
-with the stage 3 and stage 4 findings. Rule numbers SC1..SC32 are
+with the stage 3 and stage 4 findings. Revision 3f (section "Revision
+3f", stage 5 findings) is **proposed**, not yet accepted. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3e** (this one): four gaps found while planning stage 4
+- **Revision 3f** (proposed): the stage 5 audit of SC1-SC8 and SC29
+  against the code: gaps G1-G5, and the stage 5 plan (G6-G10).
+- **Revision 3e** (`16091f1`): four gaps found while planning stage 4
   (E1-E4), the stage 4 plan (E5-E10), and E0 as stage 4's master
   invariant. Proposed in `fef2565`; accepted after review, with these
   added from it:
@@ -1281,6 +1284,168 @@ everything it depends on exists.
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
 
+## Revision 3f (proposed): stage 5 findings and plan
+
+Stage 5 implements thread ownership, the transitions and the idle
+thread (SC1-SC8, SC29), with no timer and no migration. The audit
+of the accepted text against the code found five gaps (G1-G5). None is
+implemented.
+
+**G1. SC6's transition table is incomplete.** The code makes transitions
+the table does not list:
+
+| Transition | Where today |
+|---|---|
+| RUNNING → FAULTED | a user fault with no handler (`user_fault`); unsafe saved state found on the way out (`try_exit_to_user`) |
+| BLOCKED_SEND/REPLY → FAULTED | a fault call that fails or is answered with an error (`thread_wake` on a fault caller, P71-P72) |
+| BLOCKED_SEND → BLOCKED_REPLY | a queued caller taken by a receiver (`ipc_call_link`) |
+| RUNNING → INACTIVE by `exit` | `sys_exit` writes the state itself and skips `thread_stop` |
+
+A table with gaps cannot be the single authority. *Proposed fix:* the
+complete table below replaces SC6's. Each edge has exactly one
+primitive. Any edge not in the table is impossible, and the primitive
+asserts its from-state.
+
+| From | To | Primitive | Cause |
+|---|---|---|---|
+| INACTIVE, FAULTED | RUNNABLE | `sched_start(t)` | resume (SC8) |
+| BLOCKED_* | RUNNABLE | `sched_wake(t)` | IPC wake (after IPC has unlinked it) |
+| RUNNABLE | RUNNING | `sched_dispatch(cpu)` | the scheduling boundary |
+| RUNNING | RUNNABLE | `sched_yield(t)` | `yield`; a continuation chunk not finished (E4); preemption at stage 6 |
+| RUNNING | BLOCKED_SEND, BLOCKED_RECV, BLOCKED_NOTIF | `sched_block(t, q)` | IPC wait |
+| RUNNING, BLOCKED_SEND | BLOCKED_REPLY | `sched_block_reply(caller)` | a call rendezvous (P58) |
+| RUNNING, BLOCKED_SEND, BLOCKED_REPLY | FAULTED | `sched_fault(t)` | no handler, a failed fault call, a fault reply other than label 0, unsafe saved state |
+| any but IDLE | INACTIVE | `sched_stop(t)` | suspend, `exit`, destruction, binding loss: the one funnel (abandonment, then IPC detach) |
+| (none) | IDLE | at boot only | each CPU's idle thread |
+
+**G2. Five modules write scheduling state.** `t->state`, run-queue
+membership and `current` are written in `thread.c`, `user.c`, `cont.c`,
+`ipc.c` and `syscall.c`. Nothing stops a sixth.
+
+*Proposed fix:* a new `core/sched.c` holds the primitives above and is
+the only writer.
+- A build gate, `scripts/check-sched.sh` in `make test`, fails if
+  `->state =`, the run-queue links or `->current =` are written
+  anywhere else, as SC31 does for the CDT.
+- The IPC code keeps the queue and reply-link logic (P9) and calls the
+  primitives for every state change.
+
+**G3. `current` is NULL today, which SC2 forbids.**
+- When nothing runs, `schedule()` sets `current` to NULL.
+- `thread_finalise()` sets it to NULL when a thread destroys itself.
+- There is no idle thread, so there is nothing else for it to be.
+
+*Proposed fix:*
+- **The idle thread.** Each CPU gets an idle thread: a static TCB in
+  per-CPU data, state IDLE, with no binding, no continuation, no reply
+  authority and all-zero saved registers. It is not in the
+  test-only thread registry, and no capability can name it.
+- **`current` is never NULL** after boot. When nothing else runs,
+  `current` is the idle thread, and CR3 is the kernel's master page
+  table.
+- **Self-destruction.** A thread that destroys itself hands `current`
+  to the idle thread in the same step.
+- **Between a block or stop and the next dispatch,** within one kernel
+  entry, `current` still names the thread that blocked or stopped. SC1
+  and SC2 are checked at scheduling boundaries (SC7), where
+  `current` is always RUNNING or IDLE.
+
+**G4. The idle loop cannot halt safely yet, and test builds need a way
+out.** SC5's loop ends in `sti; hlt; cli`. Before the stage 6 timer
+there is no periodic interrupt. An idle CPU with an empty run queue and
+reaper therefore halts until an external interrupt, which is correct
+for a release kernel (nothing can become runnable without one). But
+it would hang the self-tests. Today the driver regains control by
+`schedule()` returning when it has nothing to do. SC5 asks for that
+exit to happen "only through the idle thread, so the halt-and-wake path
+is always exercised". That second half cannot hold while no wake source
+is armed.
+
+*Proposed fix:*
+- In test builds, the idle thread returns to the self-test driver at
+  the point where it would halt with no wake source armed (a flag the
+  tests own). It is the only way out.
+- The halt-and-wake path itself gets a test. It arms a wake source (a
+  self-IPI, and the LAPIC one-shot), enters the idle loop, halts, and
+  checks that the interrupt arrived in the idle thread's interrupt
+  window and the loop resumed.
+- At stage 6 the quantum timer makes halting the general case.
+
+**G5. The scheduler's own work has no stated bound.** SC26 bounds what
+each syscall's work may cost, but not the scheduler's own operations.
+*Proposed fix:* every primitive is O(1) and states so:
+- **The queue operations** are doubly linked, with no search.
+- **`sched_stop`** is `cont_abandon` (O(1), E1) plus `ipc_detach`
+  (O(1): it unlinks one queue entry and one reply link, and wakes at
+  most one caller).
+- **Dispatch** takes the queue head.
+- **The idle loop** does one reaper chunk per pass (R5).
+- **Nothing is ever destroyed in the scheduler:** CPUs and idle
+  threads live forever.
+- **There is no wake-all in the scheduler.**
+- **The only O(n) walks are audits,** test-only.
+
+**G6. Continuations are not special to the scheduler** (E4).
+- The scheduler looks only at `cont.kind != NONE`, in one place:
+  dispatch.
+- A thread with a continuation is queued and dispatched like any other.
+  Its unfinished chunk ends in `sched_yield`, its finished chunk returns
+  to user mode, and its cancellation goes through `sched_stop`.
+- The capability machinery never touches scheduler structures except
+  through those primitives.
+
+**G7. No migration** (SC3).
+- `t->home_cpu` is set once at creation (CPU 0) and never written again.
+- `sched_start` and `sched_wake` append to the home CPU's queue, and
+  dispatch takes only from its own CPU's.
+- The run queue and `current` move into per-CPU data. The audit checks
+  SC3 for every RUNNABLE and RUNNING thread.
+
+**G8. The audit (SC1-SC4, SC29),** run at boundaries and in every test
+audit. It checks:
+- **SC1:** each thread's state against what owns it, and exactly once:
+  - RUNNABLE: in its home run queue exactly once, and in nothing else
+  - RUNNING: the current thread of its home CPU, queued nowhere
+  - BLOCKED_*: one wait queue or one reply link, never the run queue
+  - INACTIVE, FAULTED: owned by nothing
+- **The idle thread:** IDLE, owned only as `current`, never queued, no
+  bindings, no continuation, zero saved registers.
+- **SC29:** every queue's length is at most the number of live threads,
+  with no repeats and symmetric links. This replaces the fixed loop
+  limit.
+
+**G9. Tests:**
+- every edge of the G1 table, each from-state it refuses, and each
+  impossible pair
+- `current` never NULL at a boundary, including across self-destruction
+  and self-suspension
+- the idle thread's halt and wake (G4)
+- the idle loop draining the reaper chunk by chunk
+- a thread with a continuation queued fairly among others
+- SC8's refusals
+- `home_cpu` fixed
+
+**G10. Mutants:**
+- **Queues:**
+  - a duplicate insertion
+  - a thread in two queues
+  - a stale link
+  - removing the wrong thread
+  - a queue longer than the live threads
+- **Transitions:**
+  - waking without enqueueing
+  - enqueueing without a state change
+  - dispatch not setting `current`
+  - blocking leaving the thread queued
+  - a stop that skips abandonment
+- **Idle and continuations:**
+  - the idle thread enqueued or addressable
+  - `current` left NULL
+  - a continuation given priority
+  - `home_cpu` changed
+- **Gate:** the build gate must fail on a state write outside
+  `sched.c`.
+
 ## Revision 3e: stage 4 findings and plan
 
 Planning stage 4 (continuations, the receive drain, revocation with the
@@ -2105,10 +2270,16 @@ the whole suite.
     itself in its next syscall; the reaper had done no unit when it
     stopped, and the teardown is exact.
 - **Mutation testing:** 24 stage-4 mutants, aimed at identity, cursor,
-  ownership and interruption. 23 are caught. One is equivalent: masking
-  the mark in derivation can never be observed, since a marked root's
-  object is always frozen and derivation from it is refused first. The
-  mask stays as defence in depth.
+  ownership and interruption. 23 are caught. One, `mark_copied`, is
+  **equivalent under the current state machine**, not untestable:
+  - a marked root's object is always frozen (E1)
+  - derivation from a frozen object is refused before the commit
+  - so the mark can never reach a copied record, and masking it in
+    `cap_derive_commit()` cannot be observed
+
+  The mask stays as defence in depth. If a future operation can derive
+  or copy from a frozen root, the equivalence ends, and that change must
+  make this mutant killable with a test.
   - **A survivor that taught something:** the first run let
     `rev_no_identity` (resume on the mark alone) survive. A cancelled
     continuation could adopt a later revocation's root in its own slot,
