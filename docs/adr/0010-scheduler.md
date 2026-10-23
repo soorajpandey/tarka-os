@@ -1,11 +1,15 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
 Status: accepted (revision 3d; step 6). Revision 3c was `2c517b1`;
-revision 3d (section "Revision 3d") amends it with the stage 3 findings. Rule numbers SC1..SC32 are
+revision 3d (section "Revision 3d") amends it with the stage 3 findings.
+Revision 3e (section "Revision 3e", stage 4 findings) is **proposed**,
+not yet accepted. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3d** (this one): three gaps found while planning stage 3,
+- **Revision 3e** (proposed): four gaps found while planning stage 4
+  (E1-E4), and the stage 4 plan (E5-E9).
+- **Revision 3d**: three gaps found while planning stage 3,
   with their fixes (D1-D3), the identity/lifetime separation (D0), and
   the stage 3 plan (D4-D9). Proposed in `8be48cf`; accepted after
   review with two conditions, both written in: D1's invariant with
@@ -1269,6 +1273,192 @@ everything it depends on exists.
 6. **Timer preemption, the quantum and fairness** (SC9-SC14), with the
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
+
+## Revision 3e (proposed): stage 4 findings and plan
+
+Planning stage 4 (continuations, the receive drain, revocation with the
+freeze, the retype limit) against the code found four places where the
+accepted text does not hold as written (E1-E4). None is implemented.
+
+**E0. The rule every part below follows.** A continuation never owns an
+object. It holds values: captured inputs, a slot number, an identity
+(type, address, serial: D0, D3) and a logical cursor. Every chunk
+resolves the slot again in the thread's current cspace, compares the
+identity with `obj_identity_is()`, and only then touches the object. A
+mismatch ends the operation with the error a fresh lookup would give,
+or with `T_EINTR` if the operation was cancelled (E1).
+
+**E1. A frozen object has no room to record its owner.** F3 says "the
+frozen object records its owner as an internal reference", and F5
+cancels a revocation in O(1) through that reference. But D3 filled the
+metadata:
+- `struct obj_meta` is 32 bytes with no spare word, and growing it does
+  not fit a CNode header and an Untyped part in one 128-byte record
+- an Untyped's `ut_meta` is 24 bytes with no spare word
+
+*Proposed fix (amends F3, F5, F6):* ownership is recorded on the
+revocation's **root record**, not on the object.
+- **The mark.** The root record carries a kernel-internal bit
+  `CAP_R_REVOKING` in its rights word, above every user-visible right.
+  It is never reported (`cap_identify` masks it) and never copied
+  (derivation masks it). The object, or for an Untyped the Untyped
+  itself, carries `OBJ_FROZEN` as today.
+- **The owner** is the one thread whose continuation names that root
+  record by (slot, identity). F4 allows one revocation per object, and
+  the root cannot be deleted while marked (F5: `cap_delete` returns
+  `T_EBUSY`), so the mark, the freeze and the continuation correspond
+  one to one. The audit checks that correspondence in both directions.
+- **Cancellation (F5)** stays one O(1) step at the record being deleted:
+  - an enclosing revocation or the reaper meets a marked root
+  - it clears the mark and the freeze
+  - it deletes the record
+
+  Nothing is written to the owner. When the owner next runs, its chunk
+  re-resolves the root: no marked record with that identity is in that
+  slot. That can only mean cancellation, since nothing else removes the
+  mark, so the revocation ends with `T_EINTR`. A record later placed in
+  the same slot, even another record of the same object, is not marked,
+  so it can never be mistaken for the root.
+- **Abandonment (F6)** runs in the stop funnel, before the thread can be
+  freed or lose its cspace binding (the binding hook runs while the
+  binding is intact). It resolves the root the same way, clears the mark
+  and the freeze if they are still its own, and discards the
+  continuation.
+
+**E2. A chunked `reply_recv` would let strangers delay someone else's
+reply without bound.** SC25 commits `reply_recv`'s reply only after the
+drain. One pass drained the senders present at the call. A chunked
+drain also meets senders that arrive later: holders of WRITE on the
+endpoint can keep queuing undeliverable senders, and the drain never
+ends. Meanwhile the *caller* waiting for the reply, a third party,
+waits too. That breaks SC14's "no third party is affected".
+
+*Proposed fix (amends SC25):*
+- **The drain before the reply is bounded by a snapshot.** The first
+  chunk records the number of queued senders, k, as its budget. Before
+  the reply commits, the drain fails at most k senders, `DRAIN_CHUNK`
+  per chunk, and stops early at a deliverable head or an empty queue.
+- Then the reply-half checks (P63 phase 2) and the liveness check run
+  again, and the reply commits: atomically, as today.
+- If the receive half still has undeliverable senders to fail, it goes
+  on as a plain `recv` continuation, which delays only the server
+  itself.
+- So the caller's wait is bounded by ⌈k/`DRAIN_CHUNK`⌉ of the server's
+  chunks, with k fixed when the call began. That is what one pass
+  gave, chunked.
+
+**E3. Revocation's progress measure ignores stage 3.** SC30 measures a
+revocation by the records left in its subtree. Since stage 3, a
+revocation can reach an Untyped whose dying objects are still being torn
+down (amended O8). It cannot delete that Untyped yet, so the chunk
+deletes nothing and the measure does not fall.
+
+*Proposed fix (amends SC30):*
+- The measure becomes the pair (records in the subtree, reaper units
+  still owed by the dying objects of the Untypeds the revocation is
+  blocked on), compared lexicographically.
+- A chunk that deletes nothing ends at once and yields. The reaper
+  runs at every boundary, so the second component falls between any
+  two such chunks.
+- Neither component can grow:
+  - the first, by the freeze
+  - the second, because the blocking Untyped has no descendants, so
+    nothing new can die from it (D2 step 4)
+
+**E4. The dispatch path needs one hook.** SC16 says a dispatched thread
+with a continuation runs its next chunk instead of entering user mode.
+Today `schedule()` always enters user mode. Stage 4 adds that one branch
+there, and an audit rule: a continuation exists only on a RUNNABLE or
+RUNNING thread. This is the continuation machinery, not stage 5
+scheduler work: there are no per-CPU queues, no idle thread and no
+timer.
+
+**E5. The continuation record (SC16)** lives in the TCB:
+- `kind` (NONE, REVOKE, RECV, REPLY_RECV)
+- the slot, and the target's identity (type, object, serial)
+- a cursor: for a drain, the senders still allowed before the reply
+  commits (E2)
+- the captured inputs: the receive offer (`offer`); for `reply_recv`,
+  the reply message (`msg`, unused while not sending) and its
+  `call_grant` decision
+
+It holds no pointer.
+
+**E6. Revocation (SC22, SC22a, F1-F7):**
+- **First chunk.** Look up the slot. Refuse with `T_EBUSY` if the object
+  or its carving chain is frozen (F4); otherwise mark the root, freeze
+  the object (an Untyped root: freeze the Untyped), and capture the
+  identity. All in the syscall's entry, before the thread can be seen as
+  RUNNABLE again.
+- **Each chunk** deletes at most `REVOKE_CHUNK` first children (or the
+  bounded Untyped descent), with no scan. It yields if it meets a pinned
+  Untyped (E3).
+- **The final chunk** clears the mark and the freeze and returns
+  `T_OK`. The syscall's budget argument is ignored.
+- **Kernel callers** keep `cap_revoke()` with a step budget. Tests use
+  it, and it never runs for a user.
+
+**E7. The receive drain (SC25, E2):** `recv` and `reply_recv`
+capture once:
+- the endpoint slot and its identity
+- the offer
+- for `reply_recv`, the reply
+
+Each chunk:
+- re-validates the endpoint by identity
+- fails at most `DRAIN_CHUNK` undeliverable senders, each exactly once
+  (I-E2)
+- then completes, blocks, or yields
+
+**E8. The retype limit (SC28):** `RETYPE_ZERO_MAX` is 512 KiB. A larger
+zeroed span gets `T_ERANGE` with nothing changed, checked with the
+other step-7 arithmetic.
+
+**E9. Tests and mutants:**
+- **Revocation:**
+  - a subtree of thousands of records (chains and fans), revoked by a
+    user thread: exactly `REVOKE_CHUNK` per chunk, the tree equal to a
+    reference forest after each
+  - many threads deriving into the subtree throughout: refused, and the
+    revocation still completes
+  - a second revocation of the same object: `T_EBUSY`
+  - `cap_delete` of the root: `T_EBUSY`
+  - an enclosing revocation, and the reaper, cancelling it: `T_EINTR`
+  - the revoker suspended, destroyed, exiting, or losing its cspace
+    binding mid-way: the freeze released, `T_EINTR` on resume, deleted
+    records stay deleted
+  - the audit finds no ownerless freeze and no freezeless continuation
+- **The drain:**
+  - more than `DRAIN_CHUNK` undeliverable senders: same result as one
+    pass, each failed once
+  - the offer rewritten in user memory between chunks: no effect
+  - the endpoint deleted, and a new one created in the same slot,
+    between chunks: the lookup error, never the new object
+  - for E2: senders that keep arriving delay the caller's reply by at
+    most the snapshot
+- **Retype:** over 512 KiB refused; exactly 512 KiB accepted.
+- **Mutants** (identity, cursor, ownership, interruption, not only the
+  happy path):
+  - serial or slot not re-validated
+  - user memory re-read after the first chunk
+  - a result written before the final chunk
+  - mark or freeze not set, not cleared on completion, cancellation or
+    any abandonment path
+  - the mark copied by derivation or reported to the user
+  - a second revocation allowed
+  - root deletion allowed
+  - an enclosing revocation waiting instead of cancelling
+  - the drain failing a sender twice, or ignoring the E2 snapshot
+  - `DRAIN_CHUNK` or `REVOKE_CHUNK` ignored
+  - the retype limit off by one
+
+**E10. Other loops, checked for a bound.**
+- `drain()` and `revoke(c, 0)` are the only unbounded loops reachable
+  from a syscall today. Stage 4 replaces both.
+- `waitq_wake_all()` has had no caller since stage 3 and is removed.
+- `pmm_alloc()` scans linearly, but runs only at boot.
+- Retype's per-object initialisation is bounded by `RETYPE_MAX_COUNT`
+  and the object sizes, which W counts (SC26).
 
 ## Revision 3d: stage 3 findings and plan
 
