@@ -30,6 +30,9 @@ struct endpoint *endpoint_of(const struct cap *c);
 unsigned endpoint_caps_with(const struct cap *c, cap_rights_t right);
 
 int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
+int64_t endpoint_call(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
+int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info);
+int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
 int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot);
 
 #endif

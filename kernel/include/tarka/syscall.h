@@ -30,6 +30,9 @@ enum {
     SYS_POLL,               /* (notification) -> RSI: bits, or 0   */
     SYS_SEND,               /* (endpoint, info)                    */
     SYS_RECV,               /* (endpoint) -> RSI: info, RDI: badge */
+    SYS_CALL,               /* (endpoint, info) -> RSI: reply info */
+    SYS_REPLY,              /* (info)                              */
+    SYS_REPLY_RECV,         /* (endpoint, info) -> as SYS_RECV     */
 };
 
 #define DEBUG_WRITE_MAX 256

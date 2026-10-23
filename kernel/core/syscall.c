@@ -58,6 +58,9 @@ static int64_t sys_yield(struct sysctx *c, const struct sysargs *a)
 static int64_t sys_exit(struct sysctx *c, const struct sysargs *a)
 {
     (void)a;
+    /* ADR 0009 P64: exiting is stopping, so reply authority held dies
+     * with it and its caller is woken with T_EDEAD (P28). */
+    ipc_detach(c->t, false);
     c->t->state = THREAD_INACTIVE;
     return T_OK;
 }
@@ -305,6 +308,27 @@ static int64_t sys_recv(struct sysctx *c, const struct sysargs *a)
     return endpoint_recv(c->t, &c->cs, s);
 }
 
+static int64_t sys_call(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return endpoint_call(c->t, &c->cs, s, a->a[1]);
+}
+
+static int64_t sys_reply(struct sysctx *c, const struct sysargs *a)
+{
+    return endpoint_reply(c->t, &c->cs, a->a[0]);
+}
+
+static int64_t sys_reply_recv(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return endpoint_reply_recv(c->t, &c->cs, s, a->a[1]);
+}
+
 static const sys_fn table[] = {
     [SYS_YIELD] = sys_yield,
     [SYS_EXIT] = sys_exit,
@@ -331,6 +355,9 @@ static const sys_fn table[] = {
     [SYS_POLL] = sys_poll,
     [SYS_SEND] = sys_send,
     [SYS_RECV] = sys_recv,
+    [SYS_CALL] = sys_call,
+    [SYS_REPLY] = sys_reply,
+    [SYS_REPLY_RECV] = sys_reply_recv,
 };
 #define NSYS (sizeof(table) / sizeof(table[0]))
 

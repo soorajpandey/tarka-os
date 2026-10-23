@@ -1793,6 +1793,7 @@ struct ipc_snap {
         struct user_regs regs;
         struct ipc_msg msg;
         struct ipc_offer offer;
+        uint32_t ipc_flags;
     } th[SNAP_MAX];
     const struct thread *runq[SNAP_MAX];
     struct waitq q[TEST_WAITQS];
@@ -1818,6 +1819,7 @@ static void snapshot(struct ipc_snap *s, const struct thread *const *threads, un
         s->th[i].regs = t->regs;
         s->th[i].msg = t->msg;
         s->th[i].offer = t->offer;
+        s->th[i].ipc_flags = t->ipc_flags;
     }
     unsigned k = 0;
     for (struct thread *t = runq_pop(); t; t = runq_pop()) {
@@ -3181,6 +3183,543 @@ static void test_ep_xfer_drain(void)
     ut_teardown();
 }
 
+/* ---- Call and reply (ADR 0009, step 5.5) ---- */
+
+#define TB_PARK 1   /* SYS_TEST_BLOCK queue (NOTIF kind) that parks a runner */
+#define INFO_SKIPPED (1ull << 10)
+
+static uint64_t rsi_out(cap_slot_t b, unsigned i) { return reqs(b)[i].a[5]; }
+static uint64_t rdi_out(cap_slot_t b, unsigned i) { return reqs(b)[i].a[4]; }
+
+/* A caller at b (sys1, SYS_CALL) of one word `tag`, with the endpoint at
+ * cspace slot 1 (`rights`, `badge`), its data page as IPC buffer, and an
+ * offer of `n` slots for the reply. */
+static bool ep_caller(cap_slot_t b, uint64_t label, uint64_t tag, cap_rights_t rights,
+                      uint64_t badge, const uint32_t *slots, unsigned n)
+{
+    struct user_regs r = { .r12 = SYS_CALL, .rdi = 1, .rsi = MSG_INFO(label, 1) };
+    if (!spawn(b, P(sys1), false, &r))
+        return false;
+    struct cspace cs = task_cs(b);
+    tbuf(b)->words[0] = tag;
+    for (unsigned i = 0; i < n; i++)
+        tbuf(b)->recv_slots[i] = slots[i];
+    tbuf(b)->recv_count = n;
+    return cap_derive_to(&uts, 1, &cs, 1, rights, badge) == T_OK &&
+           thread_bind(&uts, b + T_THR, TS_IPCBUF, &uts, b + T_DATA) == T_OK;
+}
+
+/* A server at b: the request runner, suspended, with its own IPC buffer
+ * (a frame at uts slot f) and the endpoint at cspace slot 1 with
+ * `rights`. Its requests go in with REQ; go() starts it. */
+static struct ipc_buffer *ep_server(cap_slot_t b, cap_slot_t f, cap_rights_t rights)
+{
+    if (!spawn(b, P(runner), false, NULL) || thread_suspend(&uts, b + T_THR) != T_OK)
+        return NULL;
+    struct cspace cs = task_cs(b);
+    if (cap_retype(&uts, 0, CAP_FRAME, 0, &uts, f, 1) != T_OK ||
+        thread_bind(&uts, b + T_THR, TS_IPCBUF, &uts, f) != T_OK ||
+        cap_derive_to(&uts, 1, &cs, 1, rights, 0) != T_OK)
+        return NULL;
+    return phys_to_virt(cap_obj_paddr(&ut_store[f]));
+}
+
+static void go(cap_slot_t b)
+{
+    CHECK(thread_resume(&uts, b + T_THR) == T_OK);
+    run_user();
+}
+
+/* Release a runner parked with SYS_TEST_BLOCK(TB_PARK), and run. */
+static void unpark(cap_slot_t b)
+{
+    CHECK(th(b)->state == THREAD_BLOCKED_NOTIF);
+    thread_wake(th(b), T_OK);
+    run_user();
+}
+
+/* P57, P58, P66: a call in both orders; the reply authority in between. */
+static void test_call_basic(void)
+{
+    /* The caller first: queued with its message, offer and call flags. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_caller(10, 3, 0x31, CAP_R_WRITE | G_, 0x5A, (const uint32_t[]){ 6 }, 1));
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->ipc_flags == (IPC_CALL | IPC_CALL_GRANT));
+    CHECK(th(10)->offer.count == 1 && th(10)->offer.slots[0] == 6 && th(10)->msg.badge == 0x5A);
+    CHECK(ep_ok(e));
+    struct ipc_buffer *sb = ep_server(40, 110, CAP_R_READ | G_);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    REQ(40, SYS_REPLY, MSG_INFO(9, 1));
+    go(40);
+    /* Between: the server holds the authority, the caller waits on it. */
+    CHECK(res(40, 0) == T_OK && rsi_out(40, 0) == MSG_INFO(3, 1) && rdi_out(40, 0) == 0x5A);
+    CHECK(sb->words[0] == 0x31);
+    CHECK(tstate(10) == THREAD_BLOCKED_REPLY && !runq_contains(th(10)));
+    CHECK(th(40)->reply_to == th(10) && th(10)->reply_from == th(40));
+    CHECK(th(40)->reply_state == REPLY_PENDING && th(40)->reply_flags == REPLY_CALL_GRANT);
+    CHECK(th(10)->msg.info == 0 && th(10)->msg.badge == 0 && th(10)->ipc_flags == 0);
+    CHECK(th(10)->offer.count == 1 && ep_ok(e));
+    sb->words[0] = 0x99;
+    test_report_count = 0;
+    unpark(40);
+    CHECK(res(40, 2) == T_OK && th(40)->reply_state == REPLY_NONE && !th(40)->reply_to);
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_OK);
+    CHECK(test_reports[0].b == MSG_INFO(9, 1) && test_reports[0].c == 0);   /* RDI 0 */
+    CHECK(got(10) == 0x99 && th(10)->offer.count == 0 && ep_ok(e));
+    ut_teardown();
+
+    /* The server first; the reply carries a capability (call_grant). */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    sb = ep_server(40, 110, CAP_R_READ | G_);
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 2, 1) == T_OK);
+    sb->caps[0] = 2;
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_REPLY, MSG_INFO(8, 0) | CAPS(1));
+    go(40);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && ep_ok(e));
+    CHECK(ep_caller(10, 4, 0x41, CAP_R_WRITE | G_, 0, (const uint32_t[]){ 6 }, 1));
+    struct cspace c10 = task_cs(10);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    struct cap *src[] = { &c40.slots[2] }, *dst[] = { &c10.slots[6] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 1));
+    CHECK(res(40, 0) == T_OK && rdi_out(40, 0) == 0 && res(40, 1) == T_OK);
+    CHECK(test_report_count == 1 && test_reports[0].b == (MSG_INFO(8, 0) | CAPS(1) | (1ull << 8)));
+    CHECK(th(40)->reply_state == REPLY_NONE && ep_ok(e));
+    ut_teardown();
+}
+
+/* P58: a caller's own offer is checked at the call, in both orders; a bad
+ * one is refused at once and changes nothing. */
+static void test_call_offer(void)
+{
+    static const struct { uint32_t slots[3]; unsigned n; int rc; } bad[] = {
+        { { 6, 6 }, 2, T_EINVAL }, { { 99 }, 1, T_EINVAL }, { { 1 }, 1, T_EBUSY },
+    };
+    for (unsigned order = 0; order < 2; order++)
+        for (unsigned i = 0; i < ARRAY_SIZE(bad); i++) {
+            CHECK(ut_setup(20));
+            CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+            struct endpoint *e = endpoint_of(&ut_store[1]);
+            if (order) {                         /* a server waiting */
+                CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+                run_user();
+                CHECK(tstate(40) == THREAD_BLOCKED_RECV);
+            }
+            CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE | G_, 0, bad[i].slots, bad[i].n));
+            struct endpoint e0 = *e;
+            run_user();
+            CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == bad[i].rc);
+            CHECK(memcmp(&e0, e, sizeof(e0)) == 0 && ep_ok(e));
+            CHECK(!order || (tstate(40) == THREAD_BLOCKED_RECV && th(40)->reply_state == REPLY_NONE));
+            ut_teardown();
+        }
+}
+
+/* P23a, P61, P65: refused replies keep the authority and change nothing. */
+static void test_reply_refuse(void)
+{
+    /* A caller without GRANT: no capability can come back, whatever the
+     * server's own endpoint capability holds. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, (const uint32_t[]){ 6 }, 1));
+    struct ipc_buffer *sb = ep_server(40, 110, CAP_R_ALL);
+    struct cspace c40 = task_cs(40), c10 = task_cs(10);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 2, 1) == T_OK);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    run_user();
+    go(40);
+    CHECK(th(40)->reply_state == REPLY_PENDING && th(40)->reply_flags == 0);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    const struct thread *who[] = { th(10), th(40) };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 2);
+    sb->caps[0] = 2;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0) | CAPS(1)) == T_EPERM);   /* P23a */
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 33)) == T_EINVAL);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 1) | (1u << 9)) == T_EINVAL);
+    world_take(&world_b);
+    snapshot(&snap_b, who, 2);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    /* The authority survived: a plain reply still works, exactly once. */
+    test_report_count = 0;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(2, 0)) == T_OK);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(2, 0)) == T_EINVAL);   /* single use */
+    CHECK(c10.slots[6].type == CAP_NULL && tstate(10) == THREAD_RUNNABLE);
+    unpark(40);
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_OK);
+    CHECK(test_reports[0].b == MSG_INFO(2, 0) && ep_ok(e));
+    ut_teardown();
+
+    /* The same with the server waiting first: call_grant comes from the
+     * caller's capability in this order too. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    sb = ep_server(40, 110, CAP_R_ALL);
+    c40 = task_cs(40);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 2, 1) == T_OK);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    go(40);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, (const uint32_t[]){ 6 }, 1));
+    run_user();
+    CHECK(th(40)->reply_state == REPLY_PENDING && th(40)->reply_flags == 0);
+    sb->caps[0] = 2;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0) | CAPS(1)) == T_EPERM);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0)) == T_OK);
+    unpark(40);
+    ut_teardown();
+
+    /* A caller with GRANT whose side no longer fits. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE | G_, 0, (const uint32_t[]){ 6 }, 1));
+    sb = ep_server(40, 110, CAP_R_READ);
+    c40 = task_cs(40);
+    c10 = task_cs(10);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 2, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 3, 1) == T_OK);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    run_user();
+    go(40);
+    CHECK(th(40)->reply_state == REPLY_PENDING && th(40)->reply_flags == REPLY_CALL_GRANT);
+    CHECK(cap_derive_to(&uts, 1, &c10, 6, CAP_R_READ, 0) == T_OK);   /* filled since */
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    e0 = *e;
+    snapshot(&snap_a, who, 2);
+    sb->caps[0] = 2;
+    sb->caps[1] = 3;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0) | CAPS(1)) == T_EBUSY);   /* P24 */
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0) | CAPS(2)) == T_EINVAL);  /* too many */
+    sb->caps[0] = 9;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0) | CAPS(1)) == T_EBADCAP);
+    world_take(&world_b);
+    snapshot(&snap_b, who, 2);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    /* P6a: the caller may lose its buffer while waiting; then data cannot
+     * reach it, but a label-only reply can. */
+    CHECK(thread_unbind(&uts, 10 + T_THR, TS_IPCBUF) == T_OK);
+    CHECK(tstate(10) == THREAD_BLOCKED_REPLY);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 1)) == T_EINVAL);
+    CHECK(th(40)->reply_state == REPLY_PENDING);
+    test_report_count = 0;
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(3, 0)) == T_OK);
+    unpark(40);
+    CHECK(test_report_count == 1 && test_reports[0].b == MSG_INFO(3, 0) && ep_ok(e));
+    ut_teardown();
+}
+
+/* P28, P29, P62, P64: the caller or the server goes away. */
+static void test_reply_gone(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    struct ipc_buffer *sb = ep_server(40, 110, CAP_R_READ);
+    (void)sb;
+    struct cspace c40 = task_cs(40);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+
+    /* Caller suspended while waiting: the authority is marked gone; the
+     * next reply consumes it with T_EDEAD; the caller's call: T_EINTR. */
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, NULL, 0));
+    run_user();
+    go(40);
+    CHECK(tstate(10) == THREAD_BLOCKED_REPLY && th(40)->reply_state == REPLY_PENDING);
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(th(40)->reply_state == REPLY_CALLER_GONE && !th(40)->reply_to && ep_ok(e));
+    CHECK(th(40)->reply_flags == 0 && th(10)->offer.count == 0);
+    CHECK(endpoint_recv(th(40), &c40, 1) == T_EBUSY);    /* still held */
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0)) == T_EDEAD);
+    CHECK(th(40)->reply_state == REPLY_NONE);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0)) == T_EINVAL);
+    CHECK(th(10)->regs.rax == (uint64_t)(int64_t)T_EINTR);
+
+    /* Caller destroyed while waiting: no link to it remains. */
+    CHECK(ep_caller(20, 2, 0x22, CAP_R_WRITE, 0, NULL, 0));
+    run_user();
+    unpark(40);
+    CHECK(th(40)->reply_to == th(20) && tstate(20) == THREAD_BLOCKED_REPLY);
+    CHECK(cap_delete(&uts, 20 + T_THR) == T_OK);
+    CHECK(th(40)->reply_state == REPLY_CALLER_GONE && !th(40)->reply_to && ep_ok(e));
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0)) == T_EDEAD);
+    ut_teardown();
+
+    /* The server suspended, destroyed or exiting with the authority: its
+     * caller is woken with T_EDEAD. */
+    for (unsigned how = 0; how < 3; how++) {
+        CHECK(ut_setup(20));
+        CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+        e = endpoint_of(&ut_store[1]);
+        CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+        nreq = 0;
+        REQ(40, SYS_RECV, 1);
+        if (how != 2)
+            REQ(40, SYS_TEST_BLOCK, TB_PARK);   /* else: exits holding it */
+        CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, NULL, 0));
+        CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+        go(40);
+        test_report_count = 0;
+        go(10);
+        if (how == 0)
+            CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+        else if (how == 1)
+            CHECK(cap_delete(&uts, 40 + T_THR) == T_OK);
+        if (how != 2) {
+            CHECK(tstate(10) == THREAD_RUNNABLE);
+            run_user();
+        }
+        CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EDEAD);
+        CHECK(th(10)->reply_from == NULL && ep_ok(e));
+        if (how != 1)
+            CHECK(th(40)->reply_state == REPLY_NONE && !th(40)->reply_to);
+        ut_teardown();
+    }
+
+    /* A caller aborted while still queued loses its staged call. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE | G_, 0, (const uint32_t[]){ 6, 7 }, 2));
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->offer.count == 2);
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(th(10)->offer.count == 0 && th(10)->ipc_flags == 0 && th(10)->msg.info == 0);
+    CHECK(th(10)->regs.rax == (uint64_t)(int64_t)T_EINTR && ep_ok(e) && !e->senders.head);
+
+    /* P62: a thread without authority cannot answer anyone's caller. */
+    CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+    c40 = task_cs(40);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    CHECK(ep_caller(20, 2, 0x22, CAP_R_WRITE, 0, NULL, 0));
+    run_user();
+    go(40);
+    CHECK(ep_server(50, 111, CAP_R_READ) != NULL);
+    struct cspace c50 = task_cs(50);
+    CHECK(endpoint_reply(th(50), &c50, MSG_INFO(1, 0)) == T_EINVAL);
+    CHECK(tstate(20) == THREAD_BLOCKED_REPLY && th(20)->reply_from == th(40) && ep_ok(e));
+    ut_teardown();
+}
+
+/* P63: reply_recv, both halves validated before either commits. */
+static void test_reply_recv(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    struct ipc_buffer *sb = ep_server(40, 110, CAP_R_READ | G_);
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 1, &c40, 3, CAP_R_WRITE, 0) == T_OK);   /* no READ */
+    sb->recv_count = 1;
+    sb->recv_slots[0] = 7;
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    REQ(40, SYS_REPLY_RECV, 1, MSG_INFO(5, 1));
+    REQ(40, SYS_REPLY, MSG_INFO(6, 0));
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE | G_, 0x10, NULL, 0));
+    run_user();
+    go(40);
+    CHECK(th(40)->reply_to == th(10));
+    /* Queued behind: an undeliverable caller (two capabilities for a
+     * one-slot offer), then a good one. */
+    CHECK(xfer_sender(30, 3, 0x33, (const uint32_t[]){ 2, 3 }, 2));
+    th(30)->regs.r12 = SYS_CALL;
+    CHECK(ep_caller(20, 2, 0x22, CAP_R_WRITE | G_, 0x20, NULL, 0));
+    run_user();
+    CHECK(tstate(30) == THREAD_BLOCKED_SEND && tstate(20) == THREAD_BLOCKED_SEND);
+    CHECK(e->senders.head == th(30));
+
+    /* Refusals: the receive half, then the reply half. Nothing changes,
+     * not even the undeliverable caller (no drain before both pass). */
+    world_tables((const cap_slot_t[]){ 10, 20, 30, 40 }, 4);
+    world_take(&world_a);
+    const struct thread *who[] = { th(10), th(20), th(30), th(40) };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 4);
+    CHECK(endpoint_reply_recv(th(40), &c40, 3, MSG_INFO(5, 0)) == T_EPERM);   /* no READ */
+    sb->recv_count = 2;
+    sb->recv_slots[1] = 7;
+    CHECK(endpoint_reply_recv(th(40), &c40, 1, MSG_INFO(5, 0)) == T_EINVAL);  /* duplicate */
+    sb->recv_count = 1;
+    CHECK(endpoint_reply_recv(th(40), &c40, 1, MSG_INFO(5, 33)) == T_EINVAL); /* reply */
+    sb->caps[0] = 1;                                   /* has GRANT; caller offers 0 */
+    CHECK(endpoint_reply_recv(th(40), &c40, 1, MSG_INFO(5, 0) | CAPS(1)) == T_EINVAL);
+    world_take(&world_b);
+    snapshot(&snap_b, who, 4);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+
+    /* Success: the reply goes to 10, the bad caller is failed, and the
+     * server now holds the authority for 20. */
+    sb->words[0] = 0x55;
+    test_report_count = 0;
+    unpark(40);
+    CHECK(res(40, 2) == T_OK && rsi_out(40, 2) == MSG_INFO(2, 1) && rdi_out(40, 2) == 0x20);
+    CHECK(res(40, 3) == T_OK && tstate(20) == THREAD_INACTIVE);
+    CHECK(test_report_count == 3 && reports_with(T_OK) == 2 && reports_with(T_EINVAL) == 1);
+    CHECK(got(10) == 0x55 && ep_ok(e) && !e->senders.head);
+    ut_teardown();
+}
+
+/* P63: liveness and the shared-cspace slot rule; caller-gone bit 10. */
+static void test_reply_recv_edges(void)
+{
+    /* No sender can ever come: T_EDEAD, and the authority is kept. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+    struct cspace c40 = task_cs(40);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, NULL, 0));
+    run_user();
+    go(40);
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_delete(&c10, 1) == T_OK && cap_delete(&uts, 1) == T_OK);
+    CHECK(endpoint_caps_with(&c40.slots[1], CAP_R_WRITE) == 0);
+    const struct thread *who[] = { th(10), th(40) };
+    snapshot(&snap_a, who, 2);
+    CHECK(endpoint_reply_recv(th(40), &c40, 1, MSG_INFO(1, 0)) == T_EDEAD);
+    snapshot(&snap_b, who, 2);
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(1, 0)) == T_OK && ep_ok(e));
+    unpark(40);
+    ut_teardown();
+
+    /* Caller and server share a cspace: the reply may not fill a slot the
+     * server's own receive has offered. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE | G_, 0, (const uint32_t[]){ 6 }, 1));
+    struct ipc_buffer *sb = ep_server(50, 110, CAP_R_READ);
+    CHECK(thread_unbind(&uts, 50 + T_THR, TS_CSPACE) == T_OK);
+    CHECK(thread_bind(&uts, 50 + T_THR, TS_CSPACE, &uts, 10 + T_CS) == T_OK);
+    c10 = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &c10, 2, CAP_R_READ | G_, 0) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c10, 3, 1) == T_OK);
+    sb->recv_count = 1;
+    sb->recv_slots[0] = 6;
+    sb->caps[0] = 3;
+    nreq = 0;
+    REQ(50, SYS_RECV, 2);
+    REQ(50, SYS_TEST_BLOCK, TB_PARK);
+    REQ(50, SYS_REPLY_RECV, 2, MSG_INFO(1, 0) | CAPS(1));
+    run_user();
+    go(50);
+    CHECK(th(50)->reply_to == th(10) && c10.slots[6].type == CAP_NULL);
+    world_tables((const cap_slot_t[]){ 10, 50 }, 2);
+    world_take(&world_a);
+    const struct thread *who2[] = { th(10), th(50) };
+    snapshot(&snap_a, who2, 2);
+    CHECK(endpoint_reply_recv(th(50), &c10, 2, MSG_INFO(1, 0) | CAPS(1)) == T_EBUSY);
+    world_take(&world_b);
+    snapshot(&snap_b, who2, 2);
+    CHECK(world_same(&world_a, &world_b) && memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0);
+    /* With disjoint slots it goes through and the server blocks. */
+    sb->recv_slots[0] = 7;
+    world_take(&world_a);
+    unpark(50);
+    world_take(&world_b);
+    struct cap *src[] = { &c10.slots[3] }, *dst[] = { &c10.slots[6] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 1));
+    CHECK(tstate(50) == THREAD_BLOCKED_RECV && th(50)->offer.slots[0] == 7 && ep_ok(e));
+    ut_teardown();
+
+    /* A caller-gone authority is consumed by reply_recv; bit 10 arrives
+     * with the receive that completes, even after it blocked. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    REQ(40, SYS_REPLY_RECV, 1, MSG_INFO(1, 0));
+    REQ(40, SYS_REPLY, MSG_INFO(1, 0));
+    CHECK(ep_caller(10, 1, 0x11, CAP_R_WRITE, 0, NULL, 0));
+    run_user();
+    go(40);
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(th(40)->reply_state == REPLY_CALLER_GONE);
+    unpark(40);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && th(40)->ipc_flags == IPC_REPLY_SKIPPED);
+    CHECK(th(40)->reply_state == REPLY_NONE && ep_ok(e));
+    CHECK(ep_caller(20, 2, 0x22, CAP_R_WRITE, 0x77, NULL, 0));
+    test_report_count = 0;
+    run_user();
+    CHECK(res(40, 2) == T_OK && rsi_out(40, 2) == (MSG_INFO(2, 1) | INFO_SKIPPED));
+    CHECK(rdi_out(40, 2) == 0x77 && res(40, 3) == T_OK && th(40)->ipc_flags == 0);
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_OK && ep_ok(e));
+    ut_teardown();
+}
+
+/* P57: the badge of the capability used, captured at the send. */
+static void test_ep_badge(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    struct user_regs r = { .r12 = SYS_SEND, .rdi = 1, .rsi = MSG_INFO(1, 0) };
+    CHECK(spawn(10, P(sys1), false, &r));
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &c10, 1, CAP_R_WRITE, 0xB1) == T_OK);
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->msg.badge == 0xB1);
+    CHECK(cap_delete(&c10, 1) == T_OK);              /* the capability goes */
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    test_report_count = 0;
+    run_user();
+    /* The receiver's report: RAX, RSI (info), RDI (badge). */
+    bool seen = false;
+    for (unsigned i = 0; i < test_report_count; i++)
+        if (test_reports[i].b == MSG_INFO(1, 0) && test_reports[i].c == 0xB1)
+            seen = true;
+    CHECK(seen && ep_ok(e));
+    /* Unbadged: 0. */
+    CHECK(ep_thread(20, true, 2, 0x2, CAP_R_WRITE));
+    CHECK(ep_thread(50, false, 0, 0, CAP_R_READ));
+    test_report_count = 0;
+    run_user();
+    /* The sender's own report keeps its RDI (slot 1); the receiver's is 0. */
+    CHECK(test_report_count == 2 && test_reports[0].c + test_reports[1].c == 1);
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -3249,6 +3788,13 @@ static const struct {
     { "ep_xfer_collision", test_ep_xfer_collision },
     { "ep_xfer_queued", test_ep_xfer_queued },
     { "ep_xfer_drain", test_ep_xfer_drain },
+    { "ep_badge", test_ep_badge },
+    { "call_basic", test_call_basic },
+    { "call_offer", test_call_offer },
+    { "reply_refuse", test_reply_refuse },
+    { "reply_gone", test_reply_gone },
+    { "reply_recv", test_reply_recv },
+    { "reply_recv_edges", test_reply_recv_edges },
     { "cpu_hardening", test_cpu_hardening },
 };
 

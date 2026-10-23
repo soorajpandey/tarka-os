@@ -110,12 +110,14 @@ static int validate_info(uint64_t info)
 
 /* P6, P7, P50: capture once from the sender's IPC buffer; zero beyond the
  * length and the capability count so nothing stale can travel. */
-static void capture(const struct ipc_buffer *b, uint64_t info, struct ipc_msg *m)
+static void capture(const struct ipc_buffer *b, uint64_t info, uint64_t badge,
+                    struct ipc_msg *m)
 {
     unsigned len = MSG_LEN(info), nc = MSG_NCAPS(info);
 
     memset(m, 0, sizeof(*m));
     m->info = info;
+    m->badge = badge;   /* P57 */
     for (unsigned i = 0; i < len; i++)
         m->words[i] = b->words[i];
     for (unsigned i = 0; i < nc; i++)
@@ -196,10 +198,14 @@ static int thread_cspace(struct thread *t, struct cspace *out)
     return cnode_view_cap(&t->bind[TS_CSPACE], out);
 }
 
-/* Commit a rendezvous into a receiver (cannot fail: validated by the
+#define INFO_REPLY_SKIPPED (1ull << 10)   /* P19, P63 */
+
+/* Commit a delivery into a receiver (cannot fail: validated by the
  * caller). P54: derive, then write exactly `length` words, nothing else of
- * the buffer. */
-static void deliver(struct thread *r, const struct ipc_msg *m, const struct xfer_plan *p)
+ * the buffer; RSI = info with the delivered count (and `extra` bits), RDI
+ * = the sender's badge (P57; 0 for a reply). */
+static void deliver(struct thread *r, const struct ipc_msg *m, const struct xfer_plan *p,
+                    uint64_t extra)
 {
     struct ipc_buffer *b = ipcbuf(r);
     unsigned len = MSG_LEN(m->info);
@@ -210,14 +216,17 @@ static void deliver(struct thread *r, const struct ipc_msg *m, const struct xfer
         cap_derive_commit(p->src[i], p->dst[i], CAP_R_ALL, 0);
     for (unsigned i = 0; i < len; i++)
         b->words[i] = m->words[i];
-    r->regs.rsi = m->info | ((uint64_t)p->n << 8);   /* P8: delivered count */
-    r->regs.rdi = 0;            /* badges in messages: not in step 5.4 */
+    r->regs.rsi = m->info | ((uint64_t)p->n << 8) | extra;
+    r->regs.rdi = m->badge;
 }
 
-int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info)
+/* send and call (P13, P51, P58). */
+static int64_t send_common(struct thread *t, struct cspace *cs, cap_slot_t slot,
+                           uint64_t info, bool call)
 {
     const struct cap *c;
     struct ipc_msg m;
+    struct ipc_offer o;
     struct xfer_plan p;
     int rc;
 
@@ -229,14 +238,18 @@ int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint
     const struct ipc_buffer *b = ipcbuf(t);
     if (!b && (MSG_LEN(info) > 0 || MSG_NCAPS(info) > 0))
         return T_EINVAL;   /* P4: data and capabilities need a buffer */
-    if (MSG_NCAPS(info) > 0 && !(c->rights & CAP_R_GRANT))
+    bool grant = (c->rights & CAP_R_GRANT) != 0;
+    if (MSG_NCAPS(info) > 0 && !grant)
         return T_EPERM;    /* P51 */
+    memset(&o, 0, sizeof(o));
+    if (call && b && (rc = capture_offer(b, cs, &o)))
+        return rc;         /* P58: the caller's offer for the reply */
     struct endpoint *e = endpoint_of(c);
     struct thread *r = waitq_first(&e->receivers);
     if (!r && count_with(c, CAP_R_READ, NULL) == 0)
         return T_EDEAD;    /* nobody can ever receive (P27) */
 
-    capture(b, info, &m);
+    capture(b, info, c->badge, &m);
     if ((rc = check_sources(cs, &m, &p)))
         return rc;
 
@@ -249,13 +262,93 @@ int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint
 
         /* Commit. */
         KASSERT(e->senders.head == NULL);  /* never both queues (P38) */
-        deliver(r, &m, &p);
+        uint64_t extra = (r->ipc_flags & IPC_REPLY_SKIPPED) ? INFO_REPLY_SKIPPED : 0;
+        deliver(r, &m, &p, extra);
         thread_wake(r, T_OK);              /* leaves the queue: P41 */
+        if (!call)
+            return T_OK;
+        t->offer = o;
+        ipc_call_link(r, t, grant);        /* straight to BLOCKED_REPLY */
+        return SYS_NORESULT;
+    }
+    /* Commit: block with the message (and a call's offer and flags) held
+     * in the TCB (P46, P58). */
+    t->msg = m;
+    if (call) {
+        t->offer = o;
+        t->ipc_flags = IPC_CALL | (grant ? IPC_CALL_GRANT : 0);
+    }
+    waitq_block(t, &e->senders);
+    return SYS_NORESULT;
+}
+
+int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info)
+{
+    return send_common(t, cs, slot, info, false);
+}
+
+int64_t endpoint_call(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info)
+{
+    return send_common(t, cs, slot, info, true);
+}
+
+/* The receive half (P50, P63 phase 1): READ, a buffer, no reply
+ * authority held (for a plain recv), then the offer. */
+static int recv_prepare(struct thread *t, struct cspace *cs, cap_slot_t slot, bool plain,
+                        const struct cap **c, struct ipc_offer *o)
+{
+    int rc;
+
+    if ((rc = cap_lookup(cs, slot, CAP_ENDPOINT, CAP_R_READ, c)))
+        return rc;
+    const struct ipc_buffer *b = ipcbuf(t);
+    if (!b)
+        return T_EINVAL;   /* P4, P6a: receiving needs a buffer */
+    if (plain && t->reply_state != REPLY_NONE)
+        return T_EBUSY;    /* P15, P17 */
+    return capture_offer(b, cs, o);
+}
+
+/* P53: fail queued senders whose message can no longer be delivered into
+ * offer `o` in cspace `cs`, until the head is deliverable. Returns it,
+ * with its plan in `p`, or NULL. One of the two queue-draining operations
+ * of P37; each failed sender leaves exactly once (I-E2). */
+static struct thread *drain(struct endpoint *e, const struct cspace *cs,
+                            const struct ipc_offer *o, struct xfer_plan *p)
+{
+    struct thread *s;
+
+    while ((s = waitq_first(&e->senders))) {
+        struct cspace scs;
+        int rc = thread_cspace(s, &scs);
+        if (!rc)
+            rc = check_sources(&scs, &s->msg, p);
+        if (!rc)
+            rc = check_fit(cs, o, p);
+        if (!rc)
+            return s;
+        thread_wake(s, rc);
+    }
+    return NULL;
+}
+
+/* Commit a receive: take deliverable head sender `s` (plan `p`), or block
+ * with the offer held in the TCB. */
+static int64_t recv_commit(struct thread *t, struct endpoint *e, struct thread *s,
+                           const struct xfer_plan *p, const struct ipc_offer *o, bool skipped)
+{
+    if (s) {
+        KASSERT(e->receivers.head == NULL);
+        deliver(t, &s->msg, p, skipped ? INFO_REPLY_SKIPPED : 0);
+        if (s->ipc_flags & IPC_CALL)
+            ipc_call_link(t, s, (s->ipc_flags & IPC_CALL_GRANT) != 0);   /* P58 */
+        else
+            thread_wake(s, T_OK);   /* leaving the queue consumes s->msg (P42) */
         return T_OK;
     }
-    /* Commit: block with the message held in the TCB (P46). */
-    t->msg = m;
-    waitq_block(t, &e->senders);
+    t->offer = *o;
+    t->ipc_flags = skipped ? IPC_REPLY_SKIPPED : 0;
+    waitq_block(t, &e->receivers);
     return SYS_NORESULT;
 }
 
@@ -266,45 +359,100 @@ int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot)
     struct xfer_plan p;
     int rc;
 
-    /* Validate. */
-    if ((rc = cap_lookup(cs, slot, CAP_ENDPOINT, CAP_R_READ, &c)))
+    if ((rc = recv_prepare(t, cs, slot, true, &c, &o)))
+        return rc;
+    struct endpoint *e = endpoint_of(c);
+    struct thread *s = drain(e, cs, &o, &p);
+    if (!s && count_with(c, CAP_R_WRITE, NULL) == 0)
+        return T_EDEAD;    /* nobody can ever send (P27) */
+    return recv_commit(t, e, s, &p, &o, false);
+}
+
+/* P61 step 3: check a reply from server `t` to its pending caller. */
+static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
+                       struct ipc_msg *m, struct xfer_plan *p)
+{
+    struct thread *caller = t->reply_to;
+    struct cspace ccs;
+    int rc;
+
+    KASSERT(t->reply_state == REPLY_PENDING && caller);
+    if ((rc = validate_info(info)))
         return rc;
     const struct ipc_buffer *b = ipcbuf(t);
-    if (!b)
-        return T_EINVAL;   /* P4, P6a: receiving needs a buffer */
-    if (t->reply_state != REPLY_NONE)
-        return T_EBUSY;    /* P15, P17 */
-    if ((rc = capture_offer(b, cs, &o)))
-        return rc;         /* P50: the receiver's own error */
-    struct endpoint *e = endpoint_of(c);
+    if (!b && (MSG_LEN(info) > 0 || MSG_NCAPS(info) > 0))
+        return T_EINVAL;
+    if (MSG_NCAPS(info) > 0 && !(t->reply_flags & REPLY_CALL_GRANT))
+        return T_EPERM;    /* P23a: only what call_grant allows */
+    capture(b, info, 0, m);
+    if ((rc = check_sources(cs, m, p)))
+        return rc;
+    if (MSG_LEN(info) > 0 && !ipcbuf(caller))
+        return T_EINVAL;   /* P6a, P18: the caller cannot take data */
+    if ((rc = thread_cspace(caller, &ccs)))
+        return rc;
+    return check_fit(&ccs, &caller->offer, p);
+}
 
-    for (;;) {
-        struct thread *s = waitq_first(&e->senders);
-        if (!s)
-            break;
-        struct cspace scs;
-        rc = thread_cspace(s, &scs);
-        if (!rc)
-            rc = check_sources(&scs, &s->msg, &p);
-        if (!rc)
-            rc = check_fit(cs, &o, &p);
-        if (rc) {
-            /* P53: the head sender's own message no longer validates.
-             * It leaves with its error; it cannot wedge this receiver. */
-            thread_wake(s, rc);
-            continue;
-        }
-        /* Commit. */
-        KASSERT(e->receivers.head == NULL);
-        deliver(t, &s->msg, &p);
-        thread_wake(s, T_OK);   /* leaving the queue consumes s->msg (P42) */
-        return T_OK;
+int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info)
+{
+    struct ipc_msg m;
+    struct xfer_plan p;
+    int rc;
+
+    if (t->reply_state == REPLY_NONE)
+        return T_EINVAL;
+    if (t->reply_state == REPLY_CALLER_GONE) {
+        reply_consume_gone(t);
+        return T_EDEAD;
     }
+    if ((rc = reply_check(t, cs, info, &m, &p)))
+        return rc;         /* the authority is kept (P18) */
+    deliver(t->reply_to, &m, &p, 0);
+    reply_complete(t);
+    return T_OK;
+}
 
-    if (count_with(c, CAP_R_WRITE, NULL) == 0)
-        return T_EDEAD;    /* nobody can ever send (P27) */
-    /* Commit: block with the offer held in the TCB (P50). */
-    t->offer = o;
-    waitq_block(t, &e->receivers);
-    return SYS_NORESULT;
+int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info)
+{
+    const struct cap *c;
+    struct ipc_offer o;
+    struct ipc_msg rm;
+    struct xfer_plan rp, p;
+    int rc;
+
+    /* Phase 1: the receive half. */
+    if ((rc = recv_prepare(t, cs, slot, false, &c, &o)))
+        return rc;
+    /* Phase 2: the reply half, and the two halves' slots kept apart. */
+    bool pending = t->reply_state == REPLY_PENDING;
+    if (pending) {
+        if ((rc = reply_check(t, cs, info, &rm, &rp)))
+            return rc;
+        for (unsigned i = 0; i < rp.n; i++)
+            for (uint32_t j = 0; j < o.count; j++)
+                if (rp.dst[i] == cap_slot(cs, o.slots[j]))
+                    return T_EBUSY;
+    }
+    /* Phases 3 and 4: drain, then liveness, before anything of ours. */
+    struct endpoint *e = endpoint_of(c);
+    struct thread *s = drain(e, cs, &o, &p);
+    if (!s && count_with(c, CAP_R_WRITE, NULL) == 0)
+        return T_EDEAD;
+    /* Phase 5: commit the reply, then receive. */
+    bool skipped = false;
+    if (pending) {
+        deliver(t->reply_to, &rm, &rp, 0);
+        reply_complete(t);
+    } else if (t->reply_state == REPLY_CALLER_GONE) {
+        reply_consume_gone(t);
+        skipped = true;
+    }
+    if (s) {
+        /* The reply's commit cannot have invalidated the head (P63). */
+        struct cspace scs;
+        KASSERT(thread_cspace(s, &scs) == T_OK && check_sources(&scs, &s->msg, &p) == T_OK &&
+                check_fit(cs, &o, &p) == T_OK);
+    }
+    return recv_commit(t, e, s, &p, &o, skipped);
 }

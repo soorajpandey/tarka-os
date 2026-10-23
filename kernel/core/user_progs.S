@@ -326,6 +326,7 @@ END block
 PROG sys1
     movq %r12, %rax
     syscall
+    movq %rdi, %rdx           /* RDI (badge, P57) -> report c */
     movq %rax, %rdi
     REPORT
     EXIT
@@ -346,7 +347,8 @@ END spin
 
 /* Syscall request runner: executes the list of requests at UDATA_VA,
  * 64 bytes each { nr, a0..a5, result }, until nr == -1, then exits.
- * After each syscall: RAX -> result, RSI -> a5 (second result, P8). */
+ * After each syscall: RAX -> result, RSI -> a5 and RDI -> a4 (the
+ * second and third results, P8). */
 PROG runner
     movq $UDATA_VA, %rbx
 1:
@@ -362,6 +364,7 @@ PROG runner
     syscall
     movq %rax, 56(%rbx)
     movq %rsi, 48(%rbx)
+    movq %rdi, 40(%rbx)
     addq $64, %rbx
     jmp 1b
 2:

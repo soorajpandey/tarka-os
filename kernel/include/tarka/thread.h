@@ -56,8 +56,9 @@ struct ipc_msg {
     uint64_t words[MSG_MAX_WORDS];    /* zero beyond the length (P7) */
     uint32_t caps[MSG_MAX_CAPS];      /* sender's slots; zero beyond ncaps (P50) */
     uint32_t reserved;                /* always zero */
+    uint64_t badge;                   /* of the capability sent with (P57) */
 };
-_Static_assert(sizeof(struct ipc_msg) == (1 + MSG_MAX_WORDS) * 8 + 16, "struct ipc_msg must have no padding");
+_Static_assert(sizeof(struct ipc_msg) == (1 + MSG_MAX_WORDS) * 8 + 24, "struct ipc_msg must have no padding");
 
 /* A receiver's captured offer of empty slots (ADR 0009, P24, P50). */
 struct ipc_offer {
@@ -84,6 +85,11 @@ enum reply_state {
     REPLY_CALLER_GONE,      /* authority held, but the caller is gone */
 };
 #define REPLY_CALL_GRANT (1u << 0)  /* the call carried GRANT (P23a) */
+
+/* Staged IPC flags in a waiting thread's TCB (P59). */
+#define IPC_CALL          (1u << 0)  /* BLOCKED_SEND: it is a call */
+#define IPC_CALL_GRANT    (1u << 1)  /* BLOCKED_SEND: ... made with GRANT */
+#define IPC_REPLY_SKIPPED (1u << 2)  /* BLOCKED_RECV: reply_recv found the caller gone */
 
 /* Binding slots (T1, T2). */
 enum {
@@ -125,6 +131,8 @@ struct thread {
     struct thread      *reply_from;  /* caller side: the server answering */
     uint32_t            reply_state; /* enum reply_state */
     uint32_t            reply_flags;
+    uint32_t            ipc_flags;   /* IPC_* (P59) */
+    uint32_t            ipc_reserved;
     struct ipc_msg      msg;         /* a blocked sender's captured message (P6) */
     struct ipc_offer    offer;       /* a blocked receiver's captured slots (P50) */
     struct thread      *reg_next;    /* test builds: registry of live threads */

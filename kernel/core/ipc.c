@@ -39,13 +39,6 @@ static void waitq_remove(struct thread *t)
 
     if (!q)
         return;
-    /* P42: a staged message lives exactly as long as the send wait, however
-     * it ends (rendezvous, T_EDEAD, suspension, destruction). */
-    if (q->kind == THREAD_BLOCKED_SEND)
-        memset(&t->msg, 0, sizeof(t->msg));
-    /* P50: likewise a receiver's staged offer of slots. */
-    if (q->kind == THREAD_BLOCKED_RECV)
-        memset(&t->offer, 0, sizeof(t->offer));
     if (t->wait_prev)
         t->wait_prev->wait_next = t->wait_next;
     else
@@ -56,6 +49,16 @@ static void waitq_remove(struct thread *t)
         q->tail = t->wait_prev;
     t->wait_q = NULL;
     t->wait_next = t->wait_prev = NULL;
+}
+
+/* P42, P50, P59: staged IPC state lives exactly as long as the wait it
+ * belongs to; leaving IPC by any route (wake-up, abort, destruction)
+ * erases all of it. */
+static void ipc_clear_staged(struct thread *t)
+{
+    memset(&t->msg, 0, sizeof(t->msg));
+    memset(&t->offer, 0, sizeof(t->offer));
+    t->ipc_flags = 0;
 }
 
 void waitq_block(struct thread *t, struct waitq *q)
@@ -81,6 +84,7 @@ static void reply_unlink_caller(struct thread *caller)
     KASSERT(server->reply_state == REPLY_PENDING && server->reply_to == caller);
     server->reply_to = NULL;
     server->reply_state = REPLY_CALLER_GONE;   /* P29: authority kept, caller gone */
+    server->reply_flags = 0;                   /* P60 */
     caller->reply_from = NULL;
 }
 
@@ -89,6 +93,7 @@ void thread_wake(struct thread *t, int64_t rax)
     KASSERT(blocked(t->state));
     waitq_remove(t);
     reply_unlink_caller(t);
+    ipc_clear_staged(t);
     t->regs.rax = (uint64_t)rax;   /* P10: result, state and queue together */
     t->state = THREAD_RUNNABLE;
     thread_enqueue(t);
@@ -113,6 +118,36 @@ void reply_link(struct thread *server, struct thread *caller, uint32_t flags)
     caller->state = THREAD_BLOCKED_REPLY;
 }
 
+void ipc_call_link(struct thread *server, struct thread *caller, bool grant)
+{
+    KASSERT((caller->state == THREAD_RUNNING && this_cpu()->current == caller) ||
+            (caller->state == THREAD_BLOCKED_SEND && (caller->ipc_flags & IPC_CALL)));
+    waitq_remove(caller);
+    memset(&caller->msg, 0, sizeof(caller->msg));   /* delivered: P42 */
+    caller->ipc_flags = 0;                           /* the offer stays (P59) */
+    reply_link(server, caller, grant ? REPLY_CALL_GRANT : 0);
+}
+
+void reply_complete(struct thread *server)
+{
+    struct thread *caller = server->reply_to;
+
+    KASSERT(server->reply_state == REPLY_PENDING && caller &&
+            caller->reply_from == server && caller->state == THREAD_BLOCKED_REPLY);
+    caller->reply_from = NULL;
+    server->reply_to = NULL;
+    server->reply_state = REPLY_NONE;
+    server->reply_flags = 0;
+    thread_wake(caller, T_OK);   /* single use: consumed with the wake (P17) */
+}
+
+void reply_consume_gone(struct thread *server)
+{
+    KASSERT(server->reply_state == REPLY_CALLER_GONE && !server->reply_to);
+    server->reply_state = REPLY_NONE;
+    server->reply_flags = 0;
+}
+
 void ipc_detach(struct thread *t, bool destroying)
 {
     bool was_blocked = blocked(t->state);
@@ -131,6 +166,7 @@ void ipc_detach(struct thread *t, bool destroying)
     t->reply_to = NULL;
     t->reply_state = REPLY_NONE;
     t->reply_flags = 0;
+    ipc_clear_staged(t);
 
     /* P30: an interrupted blocking syscall returns T_EINTR on resume. */
     if (was_blocked && !destroying)
@@ -243,16 +279,31 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
         for (unsigned i = nc; i < MSG_MAX_CAPS; i++)
             if (t->msg.caps[i])
                 return false;
-        if (t->msg.reserved)
+        if (t->msg.reserved || (t->state != THREAD_BLOCKED_SEND && t->msg.badge))
             return false;
-        /* 8 (P50): an offer of receive slots is staged only while blocked
-         * receiving; nothing lies beyond its count. */
-        unsigned oc = t->state == THREAD_BLOCKED_RECV ? t->offer.count : 0;
-        if (oc > MSG_MAX_CAPS || (t->state != THREAD_BLOCKED_RECV && t->offer.count))
+        /* 8 (P50, P59): an offer of receive slots is staged only while
+         * receiving, waiting for a reply, or queued as a caller; nothing
+         * lies beyond its count. */
+        bool calling = t->state == THREAD_BLOCKED_SEND && (t->ipc_flags & IPC_CALL);
+        bool may_offer = t->state == THREAD_BLOCKED_RECV ||
+                         t->state == THREAD_BLOCKED_REPLY || calling;
+        unsigned oc = may_offer ? t->offer.count : 0;
+        if (oc > MSG_MAX_CAPS || (!may_offer && t->offer.count))
             return false;
         for (unsigned i = oc; i < MSG_MAX_CAPS; i++)
             if (t->offer.slots[i])
                 return false;
+        /* 9 (P59): flags only in the state they belong to. */
+        uint32_t allowed = t->state == THREAD_BLOCKED_SEND ? (IPC_CALL | IPC_CALL_GRANT)
+                         : t->state == THREAD_BLOCKED_RECV ? IPC_REPLY_SKIPPED : 0;
+        if ((t->ipc_flags & ~allowed) || ((t->ipc_flags & IPC_CALL_GRANT) && !calling))
+            return false;
+        /* 10 (P60): a receiver holds no reply authority; reply flags only
+         * with a pending authority. */
+        if (t->state == THREAD_BLOCKED_RECV && t->reply_state != REPLY_NONE)
+            return false;
+        if (t->reply_flags && t->reply_state != REPLY_PENDING)
+            return false;
         /* Reply authority held as a server. */
         switch (t->reply_state) {
         case REPLY_PENDING:

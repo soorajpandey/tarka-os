@@ -28,6 +28,19 @@ void waitq_wake_all(struct waitq *q, int64_t rax);
  * BLOCKED_REPLY (P14, P16). The caller must not be on any queue. */
 void reply_link(struct thread *server, struct thread *caller, uint32_t flags);
 
+/* A call meets its receiver (P58): `caller` (RUNNING, or a queued caller
+ * whose message has just been delivered) leaves its queue and its staged
+ * message and flags, keeps its offer, and becomes BLOCKED_REPLY on
+ * `server`, which gains reply authority. */
+void ipc_call_link(struct thread *server, struct thread *caller, bool grant);
+
+/* Commit a reply (P61): consume `server`'s PENDING authority and wake
+ * its caller with T_OK. The reply must already be delivered. */
+void reply_complete(struct thread *server);
+
+/* Consume an authority whose caller is gone (P29, P61). */
+void reply_consume_gone(struct thread *server);
+
 /* Leave every queue and reply link (P28-P31). If `t` was blocked and is
  * not being destroyed, its interrupted syscall will return T_EINTR. */
 void ipc_detach(struct thread *t, bool destroying);
