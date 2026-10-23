@@ -20,6 +20,8 @@ enum cap_type {
     CAP_IOPORT,     /* range of x86 I/O ports */
     CAP_CNODE,      /* another capability table */
     CAP_THREAD,     /* thread control */
+    CAP_ADDRESS_SPACE, /* PML4 + shadow (ADR 0007) */
+    CAP_PAGE_TABLE, /* one page-table level + shadow (ADR 0007) */
     CAP_TYPE_COUNT,
 };
 
@@ -47,16 +49,21 @@ struct cap {
     cap_rights_t rights;
     uint64_t     object;   /* kernel object reference (type-specific) */
     union {
-        uint64_t badge;        /* caller-visible tag, set once at derivation */
+        uint64_t badge;        /* CAP_ENDPOINT: caller-visible tag, set once */
         uint64_t ut_watermark; /* CAP_UNTYPED: bytes handed out (ADR 0006) */
+        uint64_t map_state;    /* CAP_FRAME: va | rights | MAPPED;
+                                * CAP_PAGE_TABLE: depth | INSTALLED (ADR 0007) */
     };
     struct cap  *prev;     /* CDT pre-order links */
     struct cap  *next;
     uint32_t     depth;    /* CDT depth; children are parent depth + 1 */
     uint32_t     reserved; /* explicit padding, always zero */
+    uint64_t    *map_entry; /* CAP_FRAME / CAP_PAGE_TABLE: the hardware entry
+                             * this capability filled, or NULL */
+    uint64_t     reserved2; /* explicit padding, always zero */
 };
 
-_Static_assert(sizeof(struct cap) == 48, "struct cap must have no implicit padding");
+_Static_assert(sizeof(struct cap) == 64, "struct cap must have no implicit padding");
 
 /* What user space may learn about a capability. Contains no kernel
  * pointers and no padding, so it is safe to copy out. */
@@ -103,6 +110,13 @@ typedef void (*cap_finaliser_t)(enum cap_type type, uint64_t object);
 
 void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn);
 
+/* Called for every deleted capability of `type` (not only the last one),
+ * while it is still intact and linked, so per-capability state such as a
+ * frame mapping can be undone (ADR 0007, V12). */
+typedef void (*cap_cleanup_t)(struct cap *c);
+
+void cap_set_cleanup(enum cap_type type, cap_cleanup_t fn);
+
 /* Zero `storage` and use it as a cspace. The storage must not hold live
  * capabilities: other CDT nodes may link to them, and zeroing would leave
  * those links dangling. Use cspace_destroy() first. */
@@ -131,8 +145,10 @@ __must_check int cap_identify(const struct cspace *cs, cap_slot_t slot, struct c
 /* Derive a copy of `src` into the empty slot `dst`, possibly in another
  * cspace, with rights narrowed to `src.rights & mask`. Rights can never be
  * widened. Requires CAP_R_GRANT on the source. A non-zero badge may only be
- * set on an unbadged source. The copy becomes a CDT child of the source.
- * Untyped capabilities cannot be copied (ADR 0006, O2): T_EINVAL. */
+ * set on an unbadged source, and only on endpoints. The copy becomes a CDT
+ * child of the source and never inherits per-capability state (a copy of a
+ * mapped frame starts unmapped). Untyped and PageTable capabilities cannot
+ * be copied (ADR 0006 O2, ADR 0007 V10): T_EINVAL. */
 __must_check int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
                                struct cspace *dst_cs, cap_slot_t dst,
                                cap_rights_t mask, uint64_t badge);

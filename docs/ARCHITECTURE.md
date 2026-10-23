@@ -33,6 +33,8 @@
    - initialises the physical frame allocator
    - hands all usable memory except an 8 MiB kernel reserve to root
      Untyped capabilities
+   - records the master PML4 and clears the user bit on every kernel-half
+     top-level entry
 4. In `make test` builds, the self-tests then run and the result is reported
    to QEMU through the isa-debug-exit device.
 
@@ -44,12 +46,12 @@
 | GDT, TSS, IST | `arch/x86_64/gdt.c` | done |
 | Exceptions | `arch/x86_64/idt.c`, `isr.S` | done, all kernel faults panic |
 | CPU hardening | `arch/x86_64/cpu.c` | done |
-| Page-table inspection | `arch/x86_64/paging.c` | query and unmap only |
+| Page-table inspection | `arch/x86_64/paging.c` | query, kernel guard pages |
 | Physical memory | `core/pmm.c` | bitmap allocator |
 | Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
 | Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
-| Address spaces, page tables | | next (ADR 0003) |
-| Threads, scheduler, faults | | planned (ADR 0003) |
+| Address spaces, page tables | `arch/x86_64/vspace.c` | done ([ADR 0007](adr/0007-address-spaces.md)): install/map/unmap/protect, W^X across aliases, teardown in any order |
+| Threads, scheduler, faults | | next (ADR 0003) |
 | Syscalls, IPC, notifications | | planned (ADR 0003) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
@@ -65,6 +67,7 @@
 | [0004](adr/0004-entropy.md) | Entropy pool and ChaCha20 random generator | accepted |
 | [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | accepted |
 | [0006](adr/0006-untyped-retype.md) | Untyped memory, retype, lifetime and reclamation (precise rules O1–O11) | accepted |
+| [0007](adr/0007-address-spaces.md) | Address spaces, page tables, mapping authority, W^X and aliasing, unmapping, TLB invalidation (rules V1–V15) | accepted |
 
 Security invariants and the tests that prove them are listed in
 [SECURITY.md](SECURITY.md#security-invariants).

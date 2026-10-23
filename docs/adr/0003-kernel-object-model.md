@@ -209,7 +209,8 @@ before its subsystem is considered done.
 2. Untyped and `retype`; boot hands all usable memory out as Untyped.
    **Done**, specified in detail by [ADR 0006](0006-untyped-retype.md).
 3. Page-table management for the kernel half; AddressSpace, PageTable and
-   Frame objects; `map` / `unmap`.
+   Frame objects; `map` / `unmap`. **Done**, specified in detail by
+   [ADR 0007](0007-address-spaces.md).
 4. Thread objects, context switch, user-mode entry, syscall entry,
    `copy_*_user`.
 5. Endpoints, Reply, Notifications; capability transfer.

@@ -50,8 +50,8 @@ fails with `T_ENOMEM`.
 modifies nothing until every check has passed:
 
 1. Look up the Untyped (type `CAP_UNTYPED`, right WRITE).
-2. Check the object type is retypeable: `UNTYPED`, `FRAME`, `ENDPOINT`
-   or `CNODE`.
+2. Check the object type is retypeable: `UNTYPED`, `FRAME`, `ENDPOINT`,
+   `CNODE`, `ADDRESS_SPACE` or `PAGE_TABLE`.
 3. Compute the object size:
 
    | Type | `size_bits` argument | Object size |
@@ -60,6 +60,7 @@ modifies nothing until every check has passed:
    | `ENDPOINT` | must be 0 | 64 B |
    | `CNODE` | number of slots is `2^size_bits`, with 1 ≤ `size_bits` ≤ 12 | 2^(`size_bits`+6) B |
    | `UNTYPED` | the child's size, with 12 ≤ `size_bits` < parent's bits | 2^`size_bits` B |
+   | `ADDRESS_SPACE`, `PAGE_TABLE` | must be 0 | 8 KiB (ADR 0007) |
 
 4. Check that `count` is between 1 and 256.
 5. Check that the destination slots `dst .. dst+count-1` exist (with

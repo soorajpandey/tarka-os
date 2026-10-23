@@ -11,6 +11,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/string.h>
+#include <tarka/vspace.h>
 
 _Static_assert(sizeof(struct cap) <= (1u << CAP_SLOT_BITS), "CNode slot size too small");
 
@@ -73,6 +74,9 @@ static unsigned object_bits(enum cap_type type, unsigned size_bits, unsigned ut_
         if (size_bits < 1 || size_bits > CNODE_MAX_SLOT_BITS)
             return 0;
         return size_bits + CAP_SLOT_BITS;
+    case CAP_ADDRESS_SPACE:
+    case CAP_PAGE_TABLE:
+        return size_bits == 0 ? VSPACE_OBJ_BITS : 0;
     case CAP_UNTYPED:
         /* Strictly smaller: a child must never denote the same range as
          * its parent. */
@@ -134,8 +138,16 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     if (type != CAP_UNTYPED)
         memset(phys_to_virt(base), 0, span);
 
-    /* 9. capabilities, as children of the Untyped */
-    cap_rights_t rights = type == CAP_UNTYPED ? (CAP_R_READ | CAP_R_WRITE) : CAP_R_ALL;
+    /* Type-specific initialisation of the zeroed objects. */
+    if (type == CAP_ADDRESS_SPACE) {
+        for (uint32_t i = 0; i < count; i++)
+            vspace_as_init(base + i * obj_size);
+    }
+
+    /* 9. capabilities, as children of the Untyped. Untyped and PageTable
+     * capabilities are never copyable, so they get no GRANT. */
+    cap_rights_t rights = (type == CAP_UNTYPED || type == CAP_PAGE_TABLE)
+                              ? (CAP_R_READ | CAP_R_WRITE) : CAP_R_ALL;
     for (uint32_t i = 0; i < count; i++) {
         struct cap *c = &dst_cs->slots[dst + i];
 

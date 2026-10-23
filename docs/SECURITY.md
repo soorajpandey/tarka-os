@@ -69,7 +69,8 @@ channels beyond the standard Spectre/Meltdown mitigations.
 ## Security invariants
 
 Each invariant is a statement that must always hold. The O-series are
-defined precisely in [ADR 0006](adr/0006-untyped-retype.md). Each one is proven by
+defined precisely in [ADR 0006](adr/0006-untyped-retype.md), the V-rules
+behind U2, U3 and U5 in [ADR 0007](adr/0007-address-spaces.md). Each one is proven by
 a self-test that runs in CI (`make test`), or is marked as planned until
 the code it depends on exists. Adding a subsystem means adding its
 invariants and tests here.
@@ -91,8 +92,9 @@ invariants and tests here.
 | C6 | Deleting the last capability to an object finalises the object exactly once, and never earlier | self-test `cap_revoke` (finaliser hook) | ⚠️ hook tested; object types arrive with ADR 0003 steps 2–5 |
 | C7 | No derivation-tree link ever points to a deleted capability or a destroyed cspace | self-test `cap_revoke` (`cdt_consistent`, `links_within`) | ✅ tested |
 | U1 | A task cannot obtain a capability it was not explicitly given | | planned (ADR 0003) |
-| U2 | A task cannot map kernel memory or another task's memory without a frame capability | | planned (ADR 0003) |
-| U3 | No user mapping is both writable and executable | | planned (ADR 0003) |
+| U2 | A task cannot map kernel memory or another task's memory without a frame capability. Structural: user leaves are only ever Frames, user intermediate entries only PageTables, the kernel half is supervisor-only at the top level (ADR 0007, V1–V4, V9) | self-tests `vspace_deputy`, `vspace_*` audits | ✅ tested |
+| U3 | No user mapping is both writable and executable, and no physical frame is writable through one mapping while executable through another; in-place changes only remove rights (ADR 0007, V5–V8) | self-tests `vspace_perms`, `vspace_alias` | ✅ tested |
+| U5 | Removing a mapping, table or address space leaves no stale entry, shadow pointer or record, and an uninstalled table carries no mappings (ADR 0007, V11, V12, V15) | self-test `vspace_teardown` + structural audit | ✅ tested |
 | U4 | A user-space fault never panics the kernel | | planned (ADR 0003) |
 | O1 | Every physical frame has exactly one owner: the kernel allocator or one Untyped; total memory is conserved | self-test `untyped_ownership` | ✅ tested |
 | O2 | Memory authority is never duplicated: Untypeds cannot be copied | self-test `untyped_rules` | ✅ tested |
@@ -107,7 +109,7 @@ invariants and tests here.
 | O11 | Revocation stays correct when finalisers delete other capabilities | self-test `untyped_revoke` | ✅ tested |
 | D1 | A device cannot DMA outside its assigned IOMMU domain | | planned (ADR 0001) |
 | R1 | Cryptographic randomness is never returned before the generator is seeded | | planned (ADR 0004) |
-| S1 | No physical frame is reused while any CPU may still cache a translation to it | | planned (ADR 0005) |
+| S1 | No physical frame is reused while any CPU may still cache a translation to it | self-test `vspace_teardown` (stale-TLB probe, single CPU) | ⚠️ single CPU tested; shootdown planned (ADR 0005) |
 | B1 | Only signed kernels boot | | planned |
 
 ## Protections in place
@@ -125,6 +127,8 @@ invariants and tests here.
 | Stack canaries, random per boot, low byte zero | `core/stack_protector.c` | K5 |
 | Zero on allocation and on free | `core/pmm.c` | M1 |
 | Untyped memory and retype; no kernel allocation on a task's behalf | `core/untyped.c` | O1–O11 |
+| Kernel half of every address space supervisor-only at the PML4 level | `arch/x86_64/vspace.c` | U2 |
+| Address spaces: user-half-only mapping, global W^X across aliases, shadow back-pointers, full user-TLB flush on every removal | `arch/x86_64/vspace.c` | U2, U3, U5, S1 |
 | Double-free and foreign-frame rejection | `pmm.c` | M2 |
 | Zero-initialised automatic variables | `-ftrivial-auto-var-init=zero` | M1 |
 | No I/O port access from ring 3 by default | TSS I/O bitmap | |
@@ -145,9 +149,9 @@ invariants and tests here.
 
 ## Roadmap
 
-1. **Kernel object model** (ADR 0003): address spaces, threads, IPC (the
-   derivation tree, revocation, Untyped and retype are done). Invariants
-   C6, U1–U4.
+1. **Kernel object model** (ADR 0003): threads, IPC (the derivation tree,
+   revocation, Untyped, retype and address spaces are done). Invariants
+   C6, U1, U4.
 2. **Entropy** (ADR 0004). Invariant R1.
 3. **SMP** (ADR 0005). Invariant S1.
 4. **Fuzzing:** machine-readable syscall descriptions, coverage-guided

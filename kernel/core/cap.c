@@ -7,6 +7,7 @@
 #include <tarka/string.h>
 
 static cap_finaliser_t finalisers[CAP_TYPE_COUNT];
+static cap_cleanup_t cleanups[CAP_TYPE_COUNT];
 
 /* Incremented on every slot deletion. Lets revocation notice that a
  * finaliser deleted further capabilities behind its back (ADR 0006, O11). */
@@ -16,6 +17,12 @@ void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn)
 {
     KASSERT(type > CAP_NULL && type < CAP_TYPE_COUNT);
     finalisers[type] = fn;
+}
+
+void cap_set_cleanup(enum cap_type type, cap_cleanup_t fn)
+{
+    KASSERT(type > CAP_NULL && type < CAP_TYPE_COUNT);
+    cleanups[type] = fn;
 }
 
 void cspace_init(struct cspace *cs, struct cap *storage, uint32_t nslots)
@@ -34,9 +41,16 @@ struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot)
     return &cs->slots[slot];
 }
 
-static bool same_object(const struct cap *a, const struct cap *b)
+bool cap_same_object(const struct cap *a, const struct cap *b)
 {
     return a && b && a->type == b->type && a->object == b->object;
+}
+
+struct cap *cap_object_first(struct cap *c)
+{
+    while (cap_same_object(c->prev, c))
+        c = c->prev;
+    return c;
 }
 
 /*
@@ -47,7 +61,7 @@ static bool same_object(const struct cap *a, const struct cap *b)
  */
 static bool is_final(const struct cap *c)
 {
-    return !same_object(c->prev, c) && !same_object(c->next, c);
+    return !cap_same_object(c->prev, c) && !cap_same_object(c->next, c);
 }
 
 /* Unlink `c` from the CDT. Its descendants move up one level so they
@@ -79,8 +93,14 @@ void cap_insert_child(struct cap *parent, struct cap *child)
 
 static void destroy_slot(struct cap *c)
 {
-    bool final = is_final(c);
     enum cap_type type = c->type;
+
+    /* Undo per-capability state (e.g. a mapping) while the capability is
+     * still intact. */
+    if (cleanups[type])
+        cleanups[type](c);
+
+    bool final = is_final(c);
     uint64_t object = c->object;
 
     cdt_remove(c);
@@ -191,7 +211,7 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
     memset(out, 0, sizeof(*out));
     out->type = c->type;
     out->rights = c->rights;
-    out->badge = c->type == CAP_UNTYPED ? 0 : c->badge;
+    out->badge = c->type == CAP_ENDPOINT ? c->badge : 0;
     return T_OK;
 }
 
@@ -206,8 +226,10 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
         return T_ERANGE;
     if (s->type == CAP_NULL)
         return T_EBADCAP;
-    if (s->type == CAP_UNTYPED)
-        return T_EINVAL; /* memory authority is never duplicated */
+    if (s->type == CAP_UNTYPED || s->type == CAP_PAGE_TABLE)
+        return T_EINVAL; /* memory and page-table authority is never duplicated */
+    if (badge && s->type != CAP_ENDPOINT)
+        return T_EINVAL; /* only endpoints carry badges */
     if (!(s->rights & CAP_R_GRANT))
         return T_EPERM;
     if (d->type != CAP_NULL)
@@ -217,11 +239,15 @@ int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
     if (badge && s->badge)
         return T_EPERM;
 
+
     memset(d, 0, sizeof(*d));
     d->type = s->type;
     d->object = s->object;
     d->rights = s->rights & mask; /* monotonic: rights only ever shrink */
-    d->badge = badge ? badge : s->badge;
+    if (s->type == CAP_ENDPOINT)
+        d->badge = badge ? badge : s->badge;
+    /* Everything else (mapping state, map_entry) stays zero: a copy holds
+     * authority, not the source's mappings. */
     cap_insert_child(s, d);
     return T_OK;
 }

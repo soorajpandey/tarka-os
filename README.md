@@ -21,7 +21,9 @@ commit:
 Status: early. The kernel boots, enables CPU hardening, hands all memory
 out as Untyped capabilities, and creates kernel objects only by retyping
 memory the caller holds. Capabilities form a derivation tree with
-revocation. There is no user space yet. See
+revocation. Address spaces are built from caller-owned page tables, with
+W^X enforced across every alias of a physical frame. There is no user
+space yet. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the roadmap and
 [docs/SECURITY.md](docs/SECURITY.md) for the threat model and the security
 invariants, each with the test that proves it.
