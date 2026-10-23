@@ -122,9 +122,9 @@ invariants and tests here.
 | I-A1 | IPC is atomic: it commits completely or produces no observable change to any cspace, queue, thread state, IPC buffer, reply link or notification | | planned (ADR 0009) |
 | I-T1 | Capabilities move by IPC only with GRANT on the endpoint and on each capability (for replies, the GRANT recorded at call time), into validated empty slots the receiver offered; each is a CDT child of the sender's | | planned (ADR 0009) |
 | I-R1 | Reply authority is single-use, non-transferable, and answers only its own caller | | planned (ADR 0009) |
-| I-S1 | Thread states and IPC queues are always consistent; a blocked thread is never runnable | | planned (ADR 0009) |
-| I-L1 | No thread stays blocked on an operation that can no longer happen; no queue or link refers to a dead object; endpoint/notification capability counts equal the live rights-bearing records | | planned (ADR 0009) |
-| I-N1 | A set notification bit is delivered to exactly one waiter/poller or stays pending until consumed; repeated signals coalesce; only wait/poll consume bits; a signaller sets only its badge's bits | | planned (ADR 0009) |
+| I-S1 | Thread states and IPC queues are always consistent; a blocked thread is never runnable | `ipc_audit()` after every IPC test step (and itself tested against corruption); self-tests `ipc_*`, `notif_*` | ✅ tested |
+| I-L1 | No thread stays blocked on an operation that can no longer happen; no queue or link refers to a dead object; endpoint/notification capability counts equal the live rights-bearing records | self-tests `ipc_states`, `ipc_reply_links`, `notif_liveness`, `notif_destroy` | ⚠️ thread machinery and notifications tested; endpoints in step 5.3 |
+| I-N1 | A set notification bit is delivered to exactly one waiter/poller or stays pending until consumed; repeated signals coalesce; only wait/poll consume bits; a signaller sets only its badge's bits; badges are inherited exactly and only unbadged capabilities mint | self-tests `notif_semantics`, `notif_badges`, `notif_waiters` | ✅ tested |
 | I-F1 | Fault messages carry only the faulting thread's own state; a handler controls a thread only through its Thread capability; fault delivery never recurses | | planned (ADR 0009) |
 | I-B1 | IPC work, message size and queue depth are bounded; IPC never allocates and performs no user-virtual-address dereferences | | planned (ADR 0009) |
 | I-W1 | An IPC buffer counts as a writable alias for W^X | | planned (ADR 0009) |

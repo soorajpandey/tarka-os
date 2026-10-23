@@ -25,6 +25,9 @@ enum {
     SYS_TH_SUSPEND,         /* (thread)                            */
     SYS_TH_READ_FAULT,      /* (thread, out: struct fault_record*) */
     SYS_DEBUG_WRITE,        /* (console, buf, len)                 */
+    SYS_SIGNAL,             /* (notification)                      */
+    SYS_WAIT,               /* (notification) -> RSI: bits         */
+    SYS_POLL,               /* (notification) -> RSI: bits, or 0   */
 };
 
 #define DEBUG_WRITE_MAX 256

@@ -11,6 +11,7 @@
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/string.h>
+#include <tarka/notification.h>
 #include <tarka/thread.h>
 #include <tarka/vspace.h>
 
@@ -103,6 +104,7 @@ static unsigned object_bits(enum cap_type type, unsigned size_bits, unsigned ut_
     case CAP_FRAME:
         return size_bits == 0 ? FRAME_BITS : 0;
     case CAP_ENDPOINT:
+    case CAP_NOTIFICATION:
         return size_bits == 0 ? ENDPOINT_BITS : 0;
     case CAP_CNODE:
         if (size_bits < 1 || size_bits > CNODE_MAX_SLOT_BITS)
@@ -180,6 +182,8 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
             vspace_as_init(pa_add(base, i * obj_size));
         else if (type == CAP_THREAD)
             thread_obj_init(pa_add(base, i * obj_size));
+        else if (type == CAP_NOTIFICATION)
+            notification_obj_init(pa_add(base, i * obj_size));
     }
 
     /* 9. capabilities, as children of the Untyped. Untyped and PageTable

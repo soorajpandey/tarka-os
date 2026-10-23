@@ -27,6 +27,11 @@ struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot);
 
 bool cap_has_children(const struct cap *c);
 
+static inline bool cap_badged_type(uint32_t type)
+{
+    return type == CAP_ENDPOINT || type == CAP_NOTIFICATION;
+}
+
 /* True if both capabilities refer to the same object. */
 bool cap_same_object(const struct cap *a, const struct cap *b);
 

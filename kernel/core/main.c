@@ -2,6 +2,7 @@
 #include <tarka/pmm.h>
 #include <tarka/selftest.h>
 #include <tarka/untyped.h>
+#include <tarka/notification.h>
 #include <tarka/thread.h>
 #include <tarka/user.h>
 #include <tarka/vspace.h>
@@ -84,6 +85,7 @@ __noreturn __no_canary void kmain(void)
     (void)lapic_init();     /* may map MMIO: before the first AddressSpace */
     vspace_boot();
     thread_boot();
+    notification_boot();
     user_boot();
 
 #ifdef TARKA_SELFTEST

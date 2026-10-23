@@ -321,6 +321,16 @@ PROG block
     EXIT
 END block
 
+/* One syscall whose number is in R12 (set by the test), arguments already
+ * in RDI/RSI/RDX; reports RAX and RSI, then exits. */
+PROG sys1
+    movq %r12, %rax
+    syscall
+    movq %rax, %rdi
+    REPORT
+    EXIT
+END sys1
+
 /* Spins long enough for a timer interrupt to arrive in ring 3, then
  * reports how far it got (a = iterations, proving it ran to the end). */
 PROG spin
@@ -335,7 +345,8 @@ PROG spin
 END spin
 
 /* Syscall request runner: executes the list of requests at UDATA_VA,
- * 64 bytes each { nr, a0..a5, result }, until nr == -1, then exits. */
+ * 64 bytes each { nr, a0..a5, result }, until nr == -1, then exits.
+ * After each syscall: RAX -> result, RSI -> a5 (second result, P8). */
 PROG runner
     movq $UDATA_VA, %rbx
 1:
@@ -350,6 +361,7 @@ PROG runner
     movq 48(%rbx), %r9
     syscall
     movq %rax, 56(%rbx)
+    movq %rsi, 48(%rbx)
     addq $64, %rbx
     jmp 1b
 2:

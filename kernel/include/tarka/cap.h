@@ -23,6 +23,7 @@ enum cap_type {
     CAP_ADDRESS_SPACE, /* PML4 + shadow (ADR 0007) */
     CAP_PAGE_TABLE, /* one page-table level + shadow (ADR 0007) */
     CAP_DEBUG_CONSOLE, /* temporary kernel console output (ADR 0008, T24) */
+    CAP_NOTIFICATION, /* signal word + waiters (ADR 0009) */
     CAP_TYPE_COUNT,
 };
 
@@ -50,7 +51,7 @@ struct cap {
     cap_rights_t rights;
     uint64_t     object;   /* kernel object reference (type-specific) */
     union {
-        uint64_t badge;        /* CAP_ENDPOINT: caller-visible tag, set once */
+        uint64_t badge;        /* CAP_ENDPOINT, CAP_NOTIFICATION: tag, set once */
         uint64_t ut_watermark; /* CAP_UNTYPED: bytes handed out (ADR 0006) */
         uint64_t map_state;    /* CAP_FRAME: va | rights | MAPPED;
                                 * CAP_PAGE_TABLE: depth | INSTALLED (ADR 0007) */

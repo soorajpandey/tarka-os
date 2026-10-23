@@ -10,6 +10,7 @@
 
 #include <tarka/cap.h>
 #include <tarka/ipc.h>
+#include <tarka/notification.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
@@ -1236,7 +1237,7 @@ static void test_thread_lifecycle(void)
 #define UDATA_VA   0x401000ull
 #define USTACK_TOP 0x403000ull
 
-#define PROGS(X) X(block) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
+#define PROGS(X) X(sys1) X(block) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
     X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
@@ -2006,6 +2007,257 @@ static void test_ipc_reply_links(void)
     CHECK(AUDIT() && runq_empty());
 }
 
+/* ---- Notifications (ADR 0009, P1, P20-P22, P27, P27a; step 5.2) ---- */
+
+/* Independent count of signal authority: scan every capability table the
+ * test uses, rather than trusting the kernel's walk. */
+static unsigned scan_write_caps(const struct cap *obj, struct cspace *const *css, unsigned ncs)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < ncs; i++)
+        for (uint32_t j = 0; j < css[i]->nslots; j++) {
+            const struct cap *c = &css[i]->slots[j];
+            if (c->type == CAP_NOTIFICATION && c->object == obj->object && (c->rights & CAP_R_WRITE))
+                n++;
+        }
+    return n;
+}
+
+#define W_ (CAP_R_WRITE | CAP_R_GRANT)
+
+/* Structural invariant: a signal that finds a waiter consumes every
+ * pending bit, so waiters and pending bits never coexist. */
+static bool notif_ok(const struct notification *n)
+{
+    struct waitq *q[] = { (struct waitq *)&n->waiters };
+    return !(n->waiters.head && n->pending) && ipc_audit(q, 1);
+}
+
+/* Master notification in uts slot 1 (unbadged, all rights): minting
+ * authority. Badged signal capabilities derive from it. */
+static struct notification *ntfn_setup(void)
+{
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &uts, 1, 1) == T_OK);
+    return notification_of(&ut_store[1]);
+}
+
+static void test_notif_semantics(void)
+{
+    CHECK(ut_setup(20));
+    struct notification *n = ntfn_setup();
+    CHECK(n->waiters.kind == THREAD_BLOCKED_NOTIF && n->pending == 0);
+
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 1, &cs, 1, W_, 0x01) == T_OK);              /* A */
+    CHECK(cap_derive_to(&uts, 1, &cs, 2, W_, 0x04) == T_OK);              /* B */
+    CHECK(cap_derive_to(&uts, 1, &cs, 3, W_, 0x80) == T_OK);              /* C */
+    CHECK(cap_derive_to(&uts, 1, &cs, 4, CAP_R_READ, 0) == T_OK);         /* waiter side */
+    CHECK(cap_derive_to(&uts, 1, &cs, 5, CAP_R_WRITE, 0) == T_OK);        /* unbadged W */
+    CHECK(cap_derive_to(&uts, 1, &cs, 6, CAP_R_READ, 0x02) == T_OK);      /* badged, no W */
+
+    nreq = 0;
+    REQ(10, SYS_SIGNAL, 1, 0x04);       /* 0: A, with a forged "bits" argument */
+    REQ(10, SYS_POLL, 4);               /* 1: only 0x01 */
+    REQ(10, SYS_SIGNAL, 1);             /* 2 */
+    REQ(10, SYS_SIGNAL, 1);             /* 3 */
+    REQ(10, SYS_SIGNAL, 2);             /* 4 */
+    REQ(10, SYS_POLL, 4);               /* 5: 0x05, not three events */
+    REQ(10, SYS_POLL, 4);               /* 6: nothing hidden underneath */
+    REQ(10, SYS_SIGNAL, 5);             /* 7: unbadged: refused */
+    REQ(10, SYS_SIGNAL, 6);             /* 8: badged but no WRITE: refused */
+    REQ(10, SYS_WAIT, 1);               /* 9: no READ: refused */
+    REQ(10, SYS_SIGNAL, 3);             /* 10 */
+    REQ(10, SYS_POLL, 4);               /* 11: only 0x80: 7-9 added nothing */
+    REQ(10, SYS_SIGNAL, 9);             /* 12: empty slot */
+    REQ(10, SYS_WAIT, 4);               /* 13: bits pending? none: would block... */
+    reqs(10)[13].nr = SYS_POLL;         /* ...so poll instead: 0 */
+    run_user();
+
+    static const struct { int64_t rax; uint64_t rsi; bool check_rsi; } want[] = {
+        { T_OK, 0, false }, { T_OK, 0x01, true }, { T_OK, 0, false }, { T_OK, 0, false },
+        { T_OK, 0, false }, { T_OK, 0x05, true }, { T_OK, 0, true }, { T_EPERM, 0, false },
+        { T_EPERM, 0, false }, { T_EPERM, 0, false }, { T_OK, 0, false }, { T_OK, 0x80, true },
+        { T_EBADCAP, 0, false }, { T_OK, 0, true },
+    };
+    CHECK(nreq == ARRAY_SIZE(want));
+    for (unsigned i = 0; i < ARRAY_SIZE(want); i++) {
+        CHECK(res(10, i) == want[i].rax);
+        if (want[i].check_rsi)
+            CHECK(reqs(10)[i].a[5] == want[i].rsi);
+        if (res(10, i) != want[i].rax || (want[i].check_rsi && reqs(10)[i].a[5] != want[i].rsi))
+            kprintf("    request %u: rax %ld rsi %#lx\n", i, res(10, i), reqs(10)[i].a[5]);
+    }
+    CHECK(n->pending == 0 && AUDIT());
+
+    /* Failed signals change nothing at all: exact snapshot, kernel API. */
+    n->pending = 0x22;
+    struct notification before = *n;
+    CHECK(notification_signal(NULL, &cs, 5) == T_EPERM);     /* unbadged */
+    CHECK(notification_signal(NULL, &cs, 4) == T_EPERM);     /* READ only, unbadged */
+    CHECK(notification_signal(NULL, &cs, 6) == T_EPERM);     /* READ only, badged */
+    CHECK(notification_signal(NULL, &cs, 77) == T_ERANGE);
+    CHECK(memcmp(&before, n, sizeof(before)) == 0);
+    n->pending = 0;
+
+    ut_teardown();
+    CHECK(AUDIT());
+}
+
+/* P1: badge semantics across derivation are explicit, not accidental. */
+static void test_notif_badges(void)
+{
+    struct cap_info info;
+
+    CHECK(ut_setup(20));
+    struct notification *n = ntfn_setup();
+    CHECK(cap_derive(&uts, 1, 2, W_, 0x01) == T_OK);       /* A, minted by the master */
+
+    CHECK(cap_derive(&uts, 2, 3, W_, 0) == T_OK);          /* copy of A */
+    CHECK(cap_identify(&uts, 3, &info) == T_OK && info.badge == 0x01);   /* inherited */
+    CHECK(cap_derive(&uts, 2, 4, W_, 0x04) == T_EPERM);    /* A cannot re-badge */
+    CHECK(cap_derive(&uts, 3, 4, W_, 0xFF) == T_EPERM);    /* nor can its copies */
+    CHECK(ut_store[4].type == CAP_NULL);
+    CHECK(cap_derive(&uts, 1, 4, W_, 0x10) == T_OK);       /* only the master mints */
+    CHECK(cap_derive(&uts, 1, 5, W_, 0) == T_OK);          /* unbadged copy of the master */
+    CHECK(cap_identify(&uts, 5, &info) == T_OK && info.badge == 0);
+    CHECK(cap_derive(&uts, 5, 6, W_, 0x20) == T_OK);       /* which can mint too */
+
+    CHECK(notification_signal(NULL, &uts, 3) == T_OK);     /* the copy signals A's bit */
+    CHECK(n->pending == 0x01);
+    CHECK(notification_signal(NULL, &uts, 4) == T_OK && n->pending == 0x11);
+    CHECK(notification_signal(NULL, &uts, 6) == T_OK && n->pending == 0x31);
+    CHECK(notification_signal(NULL, &uts, 5) == T_EPERM && n->pending == 0x31);
+    CHECK(notification_signal(NULL, &uts, 1) == T_EPERM && n->pending == 0x31);
+    ut_teardown();
+}
+
+/* Wait before signal: FIFO waiters, each signal consumed by exactly one
+ * waiter, and bits with no waiter stay pending. */
+static void test_notif_waiters(void)
+{
+    struct user_regs w = { .r12 = SYS_WAIT, .rdi = 1 };
+
+    CHECK(ut_setup(20));
+    struct notification *n = ntfn_setup();
+    CHECK(spawn(30, P(sys1), false, &w));
+    CHECK(spawn(40, P(sys1), false, &w));
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10), c30 = task_cs(30), c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 1, &c30, 1, CAP_R_READ, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &c40, 1, CAP_R_READ, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &cs, 1, W_, 0x01) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &cs, 2, W_, 0x04) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &cs, 3, W_, 0x80) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_SIGNAL, 1);     /* wakes the first waiter with 0x01 */
+    REQ(10, SYS_SIGNAL, 3);     /* wakes the second with 0x80 */
+    REQ(10, SYS_SIGNAL, 2);     /* nobody waits: stays pending */
+
+    /* Run only the waiters first: both block, in order. */
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    run_user();
+    CHECK(tstate(30) == THREAD_BLOCKED_NOTIF && tstate(40) == THREAD_BLOCKED_NOTIF);
+    CHECK(n->waiters.head == th(30) && n->waiters.tail == th(40));
+    CHECK(notif_ok(n));
+
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    run_user();
+    CHECK(test_report_count == 2);
+    CHECK(test_reports[0].a == T_OK && test_reports[0].b == 0x01);
+    CHECK(test_reports[1].a == T_OK && test_reports[1].b == 0x80);
+    CHECK(n->pending == 0x04 && !n->waiters.head);
+    CHECK(notif_ok(n));
+    ut_teardown();
+}
+
+/* P27, P27a: waiters are woken when signal authority is gone, and only
+ * then; the count is of live WRITE records, whatever the CDT shape. */
+static void test_notif_liveness(void)
+{
+    struct user_regs w = { .r12 = SYS_WAIT, .rdi = 1 };
+
+    CHECK(ut_setup(20));
+    struct notification *n = ntfn_setup();
+    CHECK(spawn(30, P(sys1), false, &w));
+    struct cspace c30 = task_cs(30);
+    struct cspace *all[] = { &uts, &c30 };
+    CHECK(cap_derive_to(&uts, 1, &c30, 1, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);
+    CHECK(cap_derive(&uts, 1, 2, W_, 0x01) == T_OK);          /* A, child of master */
+    CHECK(cap_derive(&uts, 2, 3, W_, 0) == T_OK);             /* A', child of A */
+    CHECK(cap_derive(&uts, 1, 4, W_, 0x04) == T_OK);          /* B */
+    CHECK(cap_derive_to(&c30, 1, &c30, 2, CAP_R_READ, 0) == T_OK);  /* more READ */
+    run_user();
+    CHECK(tstate(30) == THREAD_BLOCKED_NOTIF);
+    struct waitq *nq[] = { &n->waiters };
+
+#define COUNTS(k) (notification_signal_caps(&c30.slots[1]) == (k) && scan_write_caps(&c30.slots[1], all, 2) == (k))
+    CHECK(COUNTS(4));
+    /* Deleting the master re-parents its children: the count is still the
+     * number of live WRITE records, and nobody is woken. */
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(COUNTS(3) && tstate(30) == THREAD_BLOCKED_NOTIF && notif_ok(n));
+    CHECK(cap_delete(&uts, 2) == T_OK);                       /* A: A' re-parents */
+    CHECK(COUNTS(2) && tstate(30) == THREAD_BLOCKED_NOTIF);
+    CHECK(cap_delete(&c30, 2) == T_OK);                       /* a READ cap: irrelevant */
+    CHECK(COUNTS(2) && tstate(30) == THREAD_BLOCKED_NOTIF);
+    CHECK(cap_delete(&uts, 4) == T_OK);
+    CHECK(COUNTS(1) && tstate(30) == THREAD_BLOCKED_NOTIF);
+    /* The last signal authority goes: the waiter wakes with T_EDEAD. */
+    CHECK(cap_delete(&uts, 3) == T_OK);
+    CHECK(COUNTS(0) && tstate(30) == THREAD_RUNNABLE && !n->waiters.head);
+    CHECK(ipc_audit(nq, 1));
+    run_user();
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EDEAD);
+
+    /* A later wait fails at once; poll still works and returns nothing. */
+    struct cspace cs;
+    CHECK(spawn(40, P(runner), false, NULL));
+    cs = task_cs(40);
+    CHECK(cap_derive_to(&c30, 1, &cs, 1, CAP_R_READ, 0) == T_OK);
+    nreq = 0;
+    REQ(40, SYS_WAIT, 1);
+    REQ(40, SYS_POLL, 1);
+    run_user();
+    CHECK(res(40, 0) == T_EDEAD && res(40, 1) == T_OK && reqs(40)[1].a[5] == 0);
+#undef COUNTS
+    ut_teardown();
+}
+
+/* Destroying a waiting thread, and the notification itself. */
+static void test_notif_destroy(void)
+{
+    struct user_regs w = { .r12 = SYS_WAIT, .rdi = 1 };
+
+    CHECK(ut_setup(20));
+    struct notification *n = ntfn_setup();
+    CHECK(spawn(30, P(sys1), false, &w));
+    CHECK(spawn(40, P(sys1), false, &w));
+    CHECK(spawn(50, P(sys1), false, &w));
+    for (cap_slot_t b = 30; b <= 50; b += 10) {
+        struct cspace c = task_cs(b);
+        CHECK(cap_derive_to(&uts, 1, &c, 1, CAP_R_READ, 0) == T_OK);
+    }
+    run_user();
+    struct waitq *nq[] = { &n->waiters };
+    CHECK(n->waiters.head == th(30) && n->waiters.tail == th(50));
+    CHECK(cap_delete(&uts, 40 + T_THR) == T_OK);              /* the middle waiter */
+    CHECK(n->waiters.head == th(30) && th(30)->wait_next == th(50) && ipc_audit(nq, 1));
+    /* Destroy the object with waiters: every capability goes. */
+    for (cap_slot_t b = 30; b <= 50; b += 20) {
+        struct cspace c = task_cs(b);
+        CHECK(cap_delete(&c, 1) == T_OK);
+    }
+    CHECK(tstate(30) == THREAD_BLOCKED_NOTIF);   /* the master (WRITE) still exists */
+    CHECK(cap_delete(&uts, 1) == T_OK);          /* last WRITE and last cap */
+    CHECK(tstate(30) == THREAD_RUNNABLE && tstate(50) == THREAD_RUNNABLE);
+    run_user();
+    CHECK(test_report_count == 2 && (int64_t)test_reports[0].a == T_EDEAD &&
+          (int64_t)test_reports[1].a == T_EDEAD);
+    ut_teardown();
+    CHECK(AUDIT());
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -2058,6 +2310,11 @@ static const struct {
     { "ipc_audit_detects", test_ipc_audit_detects },
     { "ipc_states", test_ipc_states },
     { "ipc_reply_links", test_ipc_reply_links },
+    { "notif_semantics", test_notif_semantics },
+    { "notif_badges", test_notif_badges },
+    { "notif_waiters", test_notif_waiters },
+    { "notif_liveness", test_notif_liveness },
+    { "notif_destroy", test_notif_destroy },
     { "cpu_hardening", test_cpu_hardening },
 };
 

@@ -11,6 +11,7 @@
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
+#include <tarka/notification.h>
 #include <tarka/selftest.h>
 #include <tarka/uaccess.h>
 #include <tarka/untyped.h>
@@ -263,6 +264,30 @@ static int64_t sys_debug_write(struct sysctx *c, const struct sysargs *a)
     return (int64_t)len;
 }
 
+static int64_t sys_signal(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return notification_signal(c->t, &c->cs, s);   /* no bits argument: P20 */
+}
+
+static int64_t sys_wait(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return notification_wait(c->t, &c->cs, s, true);
+}
+
+static int64_t sys_poll(struct sysctx *c, const struct sysargs *a)
+{
+    cap_slot_t s;
+
+    SLOT(0, s);
+    return notification_wait(c->t, &c->cs, s, false);
+}
+
 static const sys_fn table[] = {
     [SYS_YIELD] = sys_yield,
     [SYS_EXIT] = sys_exit,
@@ -284,6 +309,9 @@ static const sys_fn table[] = {
     [SYS_TH_SUSPEND] = sys_th_suspend,
     [SYS_TH_READ_FAULT] = sys_th_read_fault,
     [SYS_DEBUG_WRITE] = sys_debug_write,
+    [SYS_SIGNAL] = sys_signal,
+    [SYS_WAIT] = sys_wait,
+    [SYS_POLL] = sys_poll,
 };
 #define NSYS (sizeof(table) / sizeof(table[0]))
 

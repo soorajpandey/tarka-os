@@ -232,7 +232,7 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
     memset(out, 0, sizeof(*out));
     out->type = c->type;
     out->rights = c->rights;
-    out->badge = c->type == CAP_ENDPOINT ? c->badge : 0;
+    out->badge = cap_badged_type(c->type) ? c->badge : 0;
     return T_OK;
 }
 
@@ -242,8 +242,8 @@ static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badg
         return T_EBADCAP;
     if (s->type == CAP_UNTYPED || s->type == CAP_PAGE_TABLE)
         return T_EINVAL; /* memory and page-table authority is never duplicated */
-    if (badge && s->type != CAP_ENDPOINT)
-        return T_EINVAL; /* only endpoints carry badges */
+    if (badge && !cap_badged_type(s->type))
+        return T_EINVAL; /* only endpoints and notifications carry badges */
     if (!(s->rights & CAP_R_GRANT))
         return T_EPERM;
     if (d->type != CAP_NULL)
@@ -258,7 +258,10 @@ static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badg
     d->type = s->type;
     d->object = s->object;
     d->rights = s->rights & mask; /* monotonic: rights only ever shrink */
-    if (s->type == CAP_ENDPOINT)
+    /* Badge rule (ADR 0009, P1): a copy of a badged capability carries
+     * exactly that badge (re-badging was refused above); only an unbadged
+     * capability can mint a badged copy. */
+    if (cap_badged_type(s->type))
         d->badge = badge ? badge : s->badge;
     /* Everything else (mapping state, map_entry) stays zero: a copy holds
      * authority, not the source's mappings. */
