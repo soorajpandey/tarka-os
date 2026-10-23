@@ -60,17 +60,40 @@ static void cap_detach(struct cap *c)
     c->map_entry = NULL;
 }
 
-static void entry_clear(uint64_t *entry)
+/* The metadata of the table (AddressSpace or PageTable) that contains
+ * `entry`: the frame table entry of the table's page (revision 3d, D1). */
+static struct obj_meta *table_meta(const uint64_t *entry)
 {
-    *entry = 0;
-    *shadow_of(entry) = NULL;
+    return frame_meta(virt_to_phys_hhdm((const void *)ALIGN_DOWN((uintptr_t)entry, PAGE_SIZE)));
 }
 
-/* Clear the first `nentries` entries of the table at `depth` (0 = PML4)
- * and, recursively, of every table below it, detaching each capability
- * that filled an entry (V12, V15). Depth is at most 3, so the recursion
- * is bounded. */
-static void subtree_teardown(paddr_t table, unsigned depth, unsigned nentries)
+/* Every entry is filled and cleared through these two, so a table's
+ * filled count is exact (D1, V15'). */
+static void entry_fill(uint64_t *entry, uint64_t value, struct cap *c)
+{
+    struct obj_meta *m = table_meta(entry);
+
+    KASSERT(*entry == 0 && *shadow_of(entry) == NULL && m->filled < ENTRIES);
+    *entry = value;
+    *shadow_of(entry) = c;
+    m->filled++;
+}
+
+static void entry_clear(uint64_t *entry)
+{
+    struct obj_meta *m = table_meta(entry);
+
+    KASSERT(*shadow_of(entry) != NULL && m->filled > 0);
+    *entry = 0;
+    *shadow_of(entry) = NULL;
+    m->filled--;
+}
+
+/* Detach every capability that fills one of the first `nentries` entries
+ * of `table`, and clear those entries. Only this table: a child table
+ * keeps its own entries and becomes inert (V15'). Detaching is not
+ * destroying the subtree. At most 512 entries (UNIT_MAX). */
+static void table_detach_entries(paddr_t table, unsigned nentries)
 {
     uint64_t *t = table_va(table);
 
@@ -78,8 +101,6 @@ static void subtree_teardown(paddr_t table, unsigned depth, unsigned nentries)
         struct cap *child = *shadow_of(&t[i]);
         if (!child)
             continue;
-        if (depth < 3)
-            subtree_teardown(cap_obj_paddr(child), depth + 1, ENTRIES);
         cap_detach(child);
         entry_clear(&t[i]);
     }
@@ -94,24 +115,30 @@ static void frame_cleanup(struct cap *c)
     }
 }
 
-/* V15: a table that is not installed holds no mappings, so removing it
- * from its parent also empties it. Otherwise a populated table could be
- * re-installed in another address space, exposing frames there without
- * anyone using a frame capability for that address space. */
-static void pt_cleanup(struct cap *c)
+/* V15': remove an installed table from its parent. One entry; the table
+ * keeps its own entries and, unreachable from any address-space root, is
+ * inert until it is empty (vspace_install refuses it until then). */
+static void pt_detach(struct cap *c)
 {
     if (c->map_state & MS_INSTALLED) {
-        unsigned depth = c->map_state & MS_DEPTH;
-
         entry_clear(c->map_entry);
         cap_detach(c);
-        subtree_teardown(cap_obj_paddr(c), depth, ENTRIES);
         tlb_flush_user();
     }
 }
 
+/* The PageTable's only capability (V10) is being deleted: detach it from
+ * its parent and detach whatever fills its own entries, nothing deeper
+ * (ADR 0007 V12 as amended by ADR 0010 revision 3d, D1). */
+static void pt_cleanup(struct cap *c)
+{
+    pt_detach(c);
+    table_detach_entries(cap_obj_paddr(c), ENTRIES);
+    tlb_flush_user();
+}
+
 /* PageTable capabilities cannot be copied, so pt_cleanup has always run
- * by now; if the table was never installed it holds nothing. */
+ * by now and the table is empty. */
 static void pt_finalise(enum cap_type type, uint64_t object)
 {
     (void)type;
@@ -125,7 +152,7 @@ static void as_finalise(enum cap_type type, uint64_t object)
     (void)type;
     if (pa_raw(cr3_pa()) == pa_raw(pml4))
         vspace_activate_kernel();
-    subtree_teardown(pml4, 0, USER_ENTRIES);
+    table_detach_entries(pml4, USER_ENTRIES);   /* its own entries only (D1) */
     tlb_flush_user();
 }
 
@@ -255,10 +282,14 @@ int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, uaddr_t va, 
         return T_ENOENT;
     if (*entry & PTE_P)
         return T_EBUSY;
+    /* V15': a populated table is inert and never becomes reachable again.
+     * The count is read here, in the step that makes the table
+     * reachable, not trusted from any earlier check. */
+    if (frame_meta(cap_obj_paddr(ptc))->filled != 0)
+        return T_EBUSY;
 
     /* Intermediate entries are permissive; leaves decide R/W/X. */
-    *entry = pte_make(cap_obj_paddr(ptc), PTE_P | PTE_W | PTE_U);
-    *shadow_of(entry) = ptc;
+    entry_fill(entry, pte_make(cap_obj_paddr(ptc), PTE_P | PTE_W | PTE_U), ptc);
     ptc->map_state = depth | MS_INSTALLED;
     ptc->map_entry = entry;
     return T_OK;
@@ -274,7 +305,7 @@ int vspace_uninstall(struct cspace *cs, cap_slot_t pt)
     struct cap *ptc = cap_slot(cs, pt);
     if (!(ptc->map_state & MS_INSTALLED))
         return T_EINVAL;
-    pt_cleanup(ptc);
+    pt_detach(ptc);   /* V15': one entry; the table keeps its own */
     return T_OK;
 }
 
@@ -307,8 +338,7 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, uaddr_t va,
     if (*entry & PTE_P)
         return T_EBUSY;
 
-    *entry = pte_make(cap_obj_paddr(fc), pte_flags(rights));
-    *shadow_of(entry) = fc;
+    entry_fill(entry, pte_make(cap_obj_paddr(fc), pte_flags(rights)), fc);
     fc->map_state = ua_raw(va) | rights | MS_MAPPED;
     fc->map_entry = entry;
     meta_alias(fc, rights, 1);   /* SC18, C4 */

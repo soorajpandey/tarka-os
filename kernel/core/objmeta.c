@@ -69,7 +69,7 @@ void objmeta_boot(void)
     kprintf("objmeta: frame table %lu KiB for %lu pages\n", pages * PAGE_SIZE >> 10, n);
 }
 
-static struct obj_meta *frame_meta(paddr_t base)
+struct obj_meta *frame_meta(paddr_t base)
 {
     uint64_t i = pa_raw(base) / PAGE_SIZE;
 
@@ -309,13 +309,21 @@ bool meta_del(struct cap *c)
     if (--m->live)
         return false;
 
-    /* The last record: every count it backed is gone with it. A frozen
-     * object cannot lose its last record (SC22b F5). Clear the entry so
-     * that nothing stale survives into the memory's next object. */
+    /* The last record. A frozen object cannot lose its last record
+     * (SC22b F5). The metadata stays until the object's teardown is
+     * complete (meta_retire()): count 0 is not reuse (D0). */
     KASSERT(!(m->flags & OBJ_FROZEN));
-    KASSERT(c->type == CAP_CNODE || (m->n_read == 0 && m->n_write == 0));
-    memset(m, 0, sizeof(*m));
+    KASSERT(!counts_rights(c->type) || (m->n_read == 0 && m->n_write == 0));
     return true;
+}
+
+void meta_retire(struct obj_meta *m)
+{
+    /* Teardown is complete: every per-type count (rights, aliases, filled
+     * entries, the reaper link) is back to 0. Clear the metadata so that
+     * nothing stale survives into the memory's next object. */
+    KASSERT(m->live == 0 && !(m->flags & OBJ_FROZEN) && m->reap_next == 0);
+    memset(m, 0, sizeof(*m));
 }
 
 void meta_alias(struct cap *frame, cap_rights_t rights, int delta)

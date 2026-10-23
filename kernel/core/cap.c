@@ -155,7 +155,8 @@ static void destroy_slot(struct cap *c)
      * live-record count goes from 1 to 0. Nothing about c's place in the
      * CDT enters into it (gate SC31.2). The count changes in the same
      * step as the unlinking (C4). */
-    KASSERT(obj_meta(c) != NULL || !finalisers[type]);
+    struct obj_meta *m = obj_meta(c);
+    KASSERT(m != NULL || !finalisers[type]);
     bool final = meta_del(c);
     uint64_t object = c->object;
 
@@ -166,6 +167,10 @@ static void destroy_slot(struct cap *c)
 
     if (final && finalisers[type])
         finalisers[type](type, object);
+    /* The teardown is complete: only now is the metadata cleared. (A
+     * CNode's is cleared by its drain, which may finish later.) */
+    if (final && m && type != CAP_CNODE)
+        meta_retire(m);
 }
 
 /* SC20 corollary: the next record a revocation of c deletes. It is c's

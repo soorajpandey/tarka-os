@@ -1319,15 +1319,20 @@ static void test_vspace_teardown(void)
     CHECK(vspace_map(&uts, 5, 11, ua(VA0 + 0x1000), RW) == T_OK);
 
     /* Address space first, while active: the CPU falls back to the kernel
-     * tables, and its tables become installable elsewhere. */
+     * tables. Only its own entries are detached (V12 as amended, D1): its
+     * PDPT is uninstalled but keeps the PD installed in it, so it is
+     * inert and cannot be installed until its holder empties it (V15'). */
     CHECK(vspace_activate(&uts, 1) == T_OK);
     CHECK(cap_delete(&uts, 1) == T_OK);
     CHECK(cr3_is_kernel(master));
     CHECK(ut_store[2].map_state == 0 && ut_store[2].map_entry == NULL);
-    CHECK(ut_store[3].map_state == 0 && ut_store[3].map_entry == NULL); /* V15 */
+    CHECK((ut_store[3].map_state & 0x8) && ut_store[3].map_entry != NULL); /* untouched */
     CHECK(cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, 1, 1) == T_OK);
+    CHECK(vspace_install(&uts, 1, 2, ua(VA0), 1) == T_EBUSY);   /* populated */
+    CHECK(vspace_uninstall(&uts, 3) == T_OK);                    /* empty it */
     CHECK(vspace_install(&uts, 1, 2, ua(VA0), 1) == T_OK);
-    CHECK(vspace_audit(&uts, 1));
+    CHECK(vspace_install(&uts, 1, 3, ua(VA0), 2) == T_OK);
+    CHECK(vspace_audit(&uts, 1) && meta_audit());
 
 
     /* V13: the TLB never serves a removed translation. Stay inside one
@@ -1353,19 +1358,35 @@ static void test_vspace_teardown(void)
     CHECK(rc_unmap == T_OK && rc_map == T_OK);
     CHECK(before == 0xAAAA && after == 0xBBBB);
 
-    /* V15: an uninstalled table carries no mappings into another address
-     * space. Populate AS 5's tables, pull its PDPT out, and install it in
-     * AS 1 instead: nothing that was mapped may become visible there. */
+    /* V15': an uninstalled table carries no mappings into another address
+     * space. Populate AS 5's tables and pull its PDPT out. Detaching is
+     * not destroying: everything below stays mapped and installed, but
+     * nothing reaches it any more, and the populated PDPT cannot be
+     * installed in AS 1 until its holders have emptied it, level by
+     * level. Nothing that was mapped ever becomes visible in AS 1. */
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 40, 2) == T_OK);
     CHECK(vspace_map(&uts, 5, 40, ua(VA0 + 0x10000), RW) == T_OK);
     CHECK(vspace_map(&uts, 5, 41, ua(VA0 + 0x11000), RO) == T_OK);
     CHECK(vspace_uninstall(&uts, 6) == T_OK);              /* AS 5's PDPT */
-    CHECK(ut_store[40].map_state == 0 && ut_store[41].map_state == 0);
-    CHECK(ut_store[7].map_state == 0 && ut_store[8].map_state == 0);
+    CHECK(hw_flags(&uts, 5, VA0 + 0x10000) == 0 && hw_flags(&uts, 5, VA0 + 0x11000) == 0);
+    CHECK((ut_store[40].map_state & 0x8) && (ut_store[41].map_state & 0x8));   /* still mapped */
+    CHECK((ut_store[7].map_state & 0x8) && (ut_store[8].map_state & 0x8));     /* still installed */
+    CHECK(vspace_audit(&uts, 5) && meta_audit());
     CHECK(cap_delete(&uts, 2) == T_OK);                    /* free AS 1's slot */
+    CHECK(vspace_install(&uts, 1, 6, ua(VA0), 1) == T_EBUSY);   /* inert */
+    CHECK(vspace_uninstall(&uts, 7) == T_OK);
     CHECK(vspace_install(&uts, 1, 6, ua(VA0), 1) == T_OK);
+    CHECK(vspace_install(&uts, 1, 7, ua(VA0), 2) == T_EBUSY);   /* still holds 8 */
+    CHECK(vspace_uninstall(&uts, 8) == T_OK);
+    CHECK(vspace_install(&uts, 1, 7, ua(VA0), 2) == T_OK);
+    CHECK(vspace_install(&uts, 1, 8, ua(VA0), 3) == T_EBUSY);   /* still maps 40, 41 */
     CHECK(hw_flags(&uts, 1, VA0 + 0x10000) == 0 && hw_flags(&uts, 1, VA0 + 0x11000) == 0);
-    CHECK(vspace_audit(&uts, 1) && vspace_audit(&uts, 5));
+    CHECK(vspace_unmap(&uts, 40) == T_OK && vspace_unmap(&uts, 41) == T_OK);
+    CHECK(vspace_install(&uts, 1, 8, ua(VA0), 3) == T_EBUSY);   /* 11 and 31 too */
+    CHECK(vspace_unmap(&uts, 11) == T_OK && vspace_unmap(&uts, 31) == T_OK);
+    CHECK(vspace_install(&uts, 1, 8, ua(VA0), 3) == T_OK);
+    CHECK(hw_flags(&uts, 1, VA0 + 0x10000) == 0 && hw_flags(&uts, 1, VA0 + 0x11000) == 0);
+    CHECK(vspace_audit(&uts, 1) && vspace_audit(&uts, 5) && meta_audit());
 
     /* Everything at once: revoke the Untyped. */
     CHECK(vspace_activate(&uts, 5) == T_OK);
@@ -4780,7 +4801,14 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
         if (m->alias_w != aw || m->alias_x != ax)
             return meta_mismatch("alias counts", c);
     } else if (c->type == CAP_ADDRESS_SPACE || c->type == CAP_PAGE_TABLE) {
-        /* filled-entry counts: checked by or_tables() */
+        /* D1: the filled count equals the present user entries in the
+         * hardware table itself. */
+        const uint64_t *t = phys_to_virt(cap_obj_paddr(c));
+        uint32_t filled = 0;
+        for (unsigned i = 0; i < (c->type == CAP_ADDRESS_SPACE ? 256u : 512u); i++)
+            filled += (t[i] & PTE_P) != 0;
+        if (m->filled != filled || m->filled_reserved)
+            return meta_mismatch("filled-entry count", c);
     } else if (m->n_read || m->n_write) {
         return meta_mismatch("stray counts", c);   /* incl. a live CNode listed */
     }

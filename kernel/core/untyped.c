@@ -70,6 +70,7 @@ static void cnode_finalise(enum cap_type type, uint64_t object)
 
         pending_cnodes = slots[0].slot_meta.reap_next;   /* pop before emptying */
         slots[0].slot_meta.reap_next = 0;
+        meta_retire(&slots[0].slot_meta);
 
         struct cspace view = { .slots = slots, .nslots = 1u << (bits - CAP_SLOT_BITS) };
         cspace_destroy(&view);                     /* may push more */

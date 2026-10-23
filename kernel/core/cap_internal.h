@@ -81,9 +81,15 @@ uint64_t obj_serial(const struct cap *c);
 bool obj_identity_is(const struct cap *c, uint32_t type, uint64_t object, uint64_t serial);
 
 /* Commit steps (C4): c has just been linked in / is about to be unlinked.
- * meta_del() returns true when c was the object's last record. */
+ * meta_del() returns true when c was the object's last record; the
+ * metadata stays until meta_retire(), when the object's teardown is
+ * complete. */
 void meta_add(struct cap *c);
 bool meta_del(struct cap *c);
+void meta_retire(struct obj_meta *m);
+
+/* The frame metadata table entry of the page at `base` (SC18). */
+struct obj_meta *frame_meta(paddr_t base);
 
 /* Frame alias counts (SC18): a mapping with `rights` appears (+1) or goes
  * (-1); and the V6/P5 test for a new alias that wants `want`. */
