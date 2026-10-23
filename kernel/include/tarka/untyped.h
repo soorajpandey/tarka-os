@@ -44,4 +44,8 @@ __must_check int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type
  * capability operation. Never store it (O10). */
 __must_check int cnode_view(const struct cspace *cs, cap_slot_t slot, struct cspace *out);
 
+/* The same, from a CNode capability held anywhere (e.g. a thread's
+ * cspace binding). */
+__must_check int cnode_view_cap(const struct cap *c, struct cspace *out);
+
 #endif

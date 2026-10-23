@@ -22,6 +22,7 @@ enum cap_type {
     CAP_THREAD,     /* thread control */
     CAP_ADDRESS_SPACE, /* PML4 + shadow (ADR 0007) */
     CAP_PAGE_TABLE, /* one page-table level + shadow (ADR 0007) */
+    CAP_DEBUG_CONSOLE, /* temporary kernel console output (ADR 0008, T24) */
     CAP_TYPE_COUNT,
 };
 

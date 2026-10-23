@@ -1233,7 +1233,7 @@ static void test_thread_lifecycle(void)
 #define UDATA_VA   0x401000ull
 #define USTACK_TOP 0x403000ull
 
-#define PROGS(X) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
+#define PROGS(X) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
     X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
@@ -1256,7 +1256,7 @@ static bool spawn(cap_slot_t b, const char *start, const char *end, bool at_top,
         cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, b + T_AS, 1) != T_OK ||
         cap_retype(&uts, 0, CAP_PAGE_TABLE, 0, &uts, b + T_PT, 3) != T_OK ||
         cap_retype(&uts, 0, CAP_FRAME, 0, &uts, b + T_CODE, 3) != T_OK ||
-        cap_retype(&uts, 0, CAP_CNODE, 2, &uts, b + T_CS, 1) != T_OK ||
+        cap_retype(&uts, 0, CAP_CNODE, 4, &uts, b + T_CS, 1) != T_OK ||
         cap_retype(&uts, 0, CAP_THREAD, 0, &uts, b + T_THR, 1) != T_OK)
         return false;
     if (vspace_install(&uts, b + T_AS, b + T_PT, ua(ALIGN_DOWN(region, 1ull << 39)), 1) ||
@@ -1534,6 +1534,179 @@ static void test_uaccess(void)
     ut_teardown();
 }
 
+/* ---- Syscalls from ring 3 (T20-T24, T27) ---- */
+
+struct sysreq { uint64_t nr, a[6], result; };
+#define REQ_SENTINEL 0x5E5E5E5E5E5E5E5Eull
+#define UBUF       0x402000ull   /* scratch buffers in the stack page */
+
+static struct sysreq *reqs(cap_slot_t b)
+{
+    return phys_to_virt(cap_obj_paddr(&ut_store[b + T_DATA]));
+}
+
+static void *ubuf(cap_slot_t b, uint64_t va)
+{
+    return (uint8_t *)phys_to_virt(cap_obj_paddr(&ut_store[b + T_STACK])) + (va - UBUF);
+}
+
+static unsigned nreq;
+static void req(cap_slot_t b, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                uint64_t a4)
+{
+    struct sysreq *r = &reqs(b)[nreq++];
+    *r = (struct sysreq){ nr, { a0, a1, a2, a3, a4, 0 }, REQ_SENTINEL };
+    reqs(b)[nreq].nr = (uint64_t)-1;
+}
+#define REQ(b, nr, ...) R6(b, nr, ##__VA_ARGS__, 0, 0, 0, 0, 0)
+#define R6(b, nr, a0, a1, a2, a3, a4, ...) req(b, nr, a0, a1, a2, a3, a4)
+
+static int64_t res(cap_slot_t b, unsigned i) { return (int64_t)reqs(b)[i].result; }
+
+static struct cspace task_cs(cap_slot_t b)
+{
+    struct cspace cs = { 0 };
+    CHECK(cnode_view(&uts, b + T_CS, &cs) == T_OK);
+    return cs;
+}
+
+/* T27: rewrite the user's register block right after the kernel copies
+ * it, with a hostile RIP. */
+static void hostile_rewrite(uaddr_t src, size_t len)
+{
+    if (len == sizeof(struct user_regs))
+        ((struct user_regs *)ubuf(10, ua_raw(src)))->rip = 0xFFFFFFFF80000000ull;
+}
+
+static void test_syscalls(void)
+{
+    const char msg[] = "hello from ring 3\n";
+    const uint64_t MSG = UBUF + 0x100, INFO = UBUF + 0x200, REGS_OK = UBUF + 0x300,
+                   REGS_BAD = UBUF + 0x400, REGS_OUT = UBUF + 0x500;
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10);
+
+    /* The task's capabilities: what it may do, and nothing else (T23). */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &cs, 0, 1) == T_OK);       /* 0: Untyped */
+    CHECK(cap_derive_to(&uts, 10 + T_AS, &cs, 1, CAP_R_ALL, 0) == T_OK);    /* 1: own AS */
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &cs, 2, 1) == T_OK);       /* 2: endpoint */
+    CHECK(cap_install(&cs, 3, CAP_DEBUG_CONSOLE, CAP_R_WRITE, 0) == T_OK); /* 3: console */
+    CHECK(cap_derive_to(&uts, 10 + T_DATA, &cs, 4, CAP_R_READ | CAP_R_GRANT, 0) == T_OK); /* 4 */
+    CHECK(cap_derive_to(&uts, 10 + T_CS, &cs, 10, CAP_R_ALL, 0) == T_OK);   /* 10: own cspace */
+
+    /* A second program in the code page, for a thread the task creates. */
+    memcpy((uint8_t *)phys_to_virt(cap_obj_paddr(&ut_store[10 + T_CODE])) + 0x800,
+           prog_hello_start, (size_t)(prog_hello_end - prog_hello_start));
+    memcpy(ubuf(10, MSG), msg, sizeof(msg) - 1);
+    *(struct user_regs *)ubuf(10, REGS_OK) = (struct user_regs){ .rip = UCODE_VA + 0x800,
+                                                                  .rsp = UBUF + 0xF00 };
+    *(struct user_regs *)ubuf(10, REGS_BAD) = (struct user_regs){ .rip = 0xFFFF800000000000ull };
+
+    nreq = 0;
+    REQ(10, SYS_CAP_IDENTIFY, 2, INFO);                      /* 0 */
+    REQ(10, SYS_CAP_IDENTIFY, 9, INFO);                      /* 1: empty */
+    REQ(10, SYS_CAP_IDENTIFY, 99, INFO);                     /* 2: out of range */
+    REQ(10, SYS_CAP_IDENTIFY, 0x100000002ull, INFO);         /* 3: would alias slot 2 */
+    REQ(10, SYS_CAP_IDENTIFY, 2, 0xFFFF800000000000ull);     /* 4: kernel out-pointer */
+    REQ(10, SYS_CAP_IDENTIFY, 2, UCODE_VA);                  /* 5: read-only out-pointer */
+    REQ(10, SYS_CAP_DERIVE, 2, 5, CAP_R_READ, 0);            /* 6 */
+    REQ(10, SYS_CAP_DERIVE, 0, 6, CAP_R_ALL, 0);             /* 7: Untyped not copyable */
+    REQ(10, SYS_RETYPE, 0, CAP_FRAME, 0, 7, 1);              /* 8 */
+    REQ(10, SYS_VS_MAP, 1, 7, 0x404000, RW);                 /* 9 */
+    REQ(10, SYS_VS_MAP, 1, 4, 0x405000, RW);                 /* 10: read-only cap */
+    REQ(10, SYS_VS_MAP, 1, 4, 0x405000, RO);                 /* 11 */
+    REQ(10, SYS_VS_MAP, 1, 7, 0xFFFF800000000000ull, RO);    /* 12: kernel address */
+    REQ(10, SYS_RETYPE, 0, CAP_THREAD, 0, 8, 1);             /* 13 */
+    REQ(10, SYS_TH_BIND, 8, TS_ASPACE, 1);                   /* 14 */
+    REQ(10, SYS_TH_BIND, 8, TS_CSPACE, 10);                  /* 15 */
+    REQ(10, SYS_TH_WRITE_REGS, 8, REGS_OK);                  /* 16: rewritten after copy */
+    REQ(10, SYS_TH_WRITE_REGS, 8, REGS_BAD);                 /* 17 */
+    REQ(10, SYS_TH_RESUME, 8);                               /* 18 */
+    REQ(10, SYS_TH_READ_REGS, 8, REGS_OUT);                  /* 19 */
+    REQ(10, SYS_DEBUG_WRITE, 3, MSG, sizeof(msg) - 1);       /* 20 */
+    REQ(10, SYS_DEBUG_WRITE, 2, MSG, sizeof(msg) - 1);       /* 21: not a console */
+    REQ(10, SYS_DEBUG_WRITE, 3, MSG, DEBUG_WRITE_MAX + 1);   /* 22 */
+    REQ(10, SYS_VS_UNMAP, 7);                                /* 23 */
+    REQ(10, SYS_CAP_DELETE, 5);                              /* 24 */
+    REQ(10, 0x7777);                                         /* 25 */
+    REQ(10, SYS_CAP_REVOKE, 2, 0x100000000ull);              /* 26: budget > 32 bits */
+    REQ(10, SYS_RETYPE, 0, 0x100000000ull + CAP_FRAME, 0, 9, 1); /* 27: type > 32 bits */
+
+    uaccess_test_hook = hostile_rewrite;
+    run_user();
+    uaccess_test_hook = NULL;
+
+    static const int64_t want[] = {
+        T_OK, T_EBADCAP, T_ERANGE, T_ERANGE, T_EFAULT, T_EFAULT, T_OK, T_EINVAL,
+        T_OK, T_OK, T_EPERM, T_OK, T_EINVAL, T_OK, T_OK, T_OK,
+        T_OK, T_EINVAL, T_OK, T_OK, sizeof(msg) - 1, T_EBADCAP, T_EINVAL, T_OK,
+        T_OK, T_EINVAL, T_EINVAL, T_EINVAL,
+    };
+    CHECK(nreq == ARRAY_SIZE(want));
+    for (unsigned i = 0; i < ARRAY_SIZE(want); i++) {
+        CHECK(res(10, i) == want[i]);
+        if (res(10, i) != want[i])
+            kprintf("    request %u: got %ld, want %ld\n", i, res(10, i), want[i]);
+    }
+
+    struct cap_info *info = ubuf(10, INFO);
+    CHECK(info->type == CAP_ENDPOINT && info->rights == CAP_R_ALL);
+    /* T27: the kernel used its copy; the user buffer was rewritten after. */
+    CHECK(((struct user_regs *)ubuf(10, REGS_OK))->rip == 0xFFFFFFFF80000000ull);
+    CHECK(((struct user_regs *)ubuf(10, REGS_OUT))->rip == UCODE_VA + 0x800);
+    /* The thread the task created, from its own Untyped, ran in ring 3. */
+    CHECK(test_report_count == 1 && test_reports[0].a == (GDT_UCODE | 3));
+    CHECK(tstate(10) == THREAD_INACTIVE);
+    ut_teardown();
+}
+
+/* T2, T5: a thread revoking its own address space, and destroying itself,
+ * from inside its own syscall. */
+static void test_syscall_lifecycle(void)
+{
+    uint64_t master = read_cr3() & 0x000FFFFFFFFFF000ull;
+
+    /* Revoke the binding's parent from inside: the thread stops before
+     * the syscall completes and never runs again. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 10 + T_AS, &cs, 1, CAP_R_ALL, 0) == T_OK);
+    CHECK(thread_unbind(&uts, 10 + T_THR, TS_ASPACE) == T_OK);
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_ASPACE, &cs, 1) == T_OK);
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_CAP_REVOKE, 1, 0);
+    REQ(10, SYS_TEST_REPORT, 0xBAD);
+    run_user();
+    CHECK(tstate(10) == THREAD_INACTIVE);
+    CHECK(reqs(10)[1].result == REQ_SENTINEL && test_report_count == 0); /* never ran on */
+    CHECK(cr3_is_kernel(master));
+    ut_teardown();
+
+    /* Delete the thread's only capability from inside its own syscall,
+     * with another thread waiting: no use-after-free, the other runs. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL));
+    CHECK(spawn(20, P(hello), false, NULL));
+    cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 10 + T_THR, &cs, 11, CAP_R_ALL, 0) == T_OK);
+    struct thread *dying = thread_of(&ut_store[10 + T_THR]);
+    CHECK(cap_delete(&uts, 10 + T_THR) == T_OK);   /* the task's copy is the last */
+    nreq = 0;
+    REQ(10, SYS_CAP_DELETE, 11);
+    REQ(10, SYS_TEST_REPORT, 0xBAD);
+    run_user();
+    CHECK(cs.slots[11].type == CAP_NULL);
+    CHECK(dying->regs.rax == 0xDDDDDDDDDDDDDDDDull);  /* no result written to the dead TCB */
+    CHECK(test_report_count == 1 && test_reports[0].d == 0x7a72);  /* only hello reported */
+    CHECK(this_cpu()->current == NULL && cr3_is_kernel(master));
+    CHECK(cdt_consistent(&uts));
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1580,6 +1753,8 @@ static const struct {
     { "user_faults", test_user_faults },
     { "user_sysret_edge", test_user_sysret_edge },
     { "uaccess", test_uaccess },
+    { "syscalls", test_syscalls },
+    { "syscall_lifecycle", test_syscall_lifecycle },
     { "cpu_hardening", test_cpu_hardening },
 };
 

@@ -21,6 +21,10 @@ __must_check int copy_to_user(uaddr_t dst, const void *src, size_t len);
 /* #PF handler hook: true if a kernel-mode fault at `rip` touching `addr`
  * is a recoverable user-copy fault (T35). Pure, for testing. */
 bool copy_fault_recoverable(uint64_t rip, uint64_t addr);
+
+#ifdef TARKA_SELFTEST
+extern void (*uaccess_test_hook)(uaddr_t src, size_t len);
+#endif
 uint64_t copy_fault_landing(void);
 
 #endif

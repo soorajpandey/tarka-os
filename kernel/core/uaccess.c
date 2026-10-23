@@ -20,6 +20,10 @@ static int check_range(uaddr_t u, size_t len)
     return T_OK;
 }
 
+#ifdef TARKA_SELFTEST
+void (*uaccess_test_hook)(uaddr_t src, size_t len);
+#endif
+
 int copy_from_user(void *dst, uaddr_t src, size_t len)
 {
     int rc = check_range(src, len);
@@ -28,6 +32,12 @@ int copy_from_user(void *dst, uaddr_t src, size_t len)
         rc = (int)copy_user_raw(dst, (const void *)(uintptr_t)ua_raw(src), len);
     if (rc != T_OK)
         memset(dst, 0, len <= COPY_MAX ? len : 0);
+#ifdef TARKA_SELFTEST
+    /* T27 test: lets a test change the user buffer after the copy, as a
+     * concurrent thread could. The kernel must act only on its copy. */
+    else if (uaccess_test_hook)
+        uaccess_test_hook(src, len);
+#endif
     return rc;
 }
 

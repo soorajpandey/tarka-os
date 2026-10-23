@@ -140,6 +140,11 @@ static void thread_finalise(enum cap_type type, uint64_t object)
         this_cpu()->current = NULL;
     for (unsigned i = 0; i < TS_COUNT; i++)
         cap_slot_delete(&t->bind[i]);
+#ifdef TARKA_SELFTEST
+    /* Poison the dead register block so tests can prove nothing writes to
+     * a destroyed thread afterwards (e.g. a syscall result). */
+    memset(&t->regs, 0xDD, sizeof(t->regs));
+#endif
 }
 
 void thread_boot(void)

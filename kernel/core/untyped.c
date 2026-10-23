@@ -200,6 +200,14 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     return T_OK;
 }
 
+int cnode_view_cap(const struct cap *c, struct cspace *out)
+{
+    if (c->type != CAP_CNODE)
+        return T_EBADCAP;
+    *out = cnode_of(cap_obj_paddr(c), cap_obj_bits(c));
+    return T_OK;
+}
+
 int cnode_view(const struct cspace *cs, cap_slot_t slot, struct cspace *out)
 {
     const struct cap *c;

@@ -312,6 +312,28 @@ PROG f_ac
     ud2                            /* reached only if #AC was not raised */
 END f_ac
 
+/* Syscall request runner: executes the list of requests at UDATA_VA,
+ * 64 bytes each { nr, a0..a5, result }, until nr == -1, then exits. */
+PROG runner
+    movq $UDATA_VA, %rbx
+1:
+    movq 0(%rbx), %rax
+    cmpq $-1, %rax
+    je 2f
+    movq 8(%rbx), %rdi
+    movq 16(%rbx), %rsi
+    movq 24(%rbx), %rdx
+    movq 32(%rbx), %r10
+    movq 40(%rbx), %r8
+    movq 48(%rbx), %r9
+    syscall
+    movq %rax, 56(%rbx)
+    addq $64, %rbx
+    jmp 1b
+2:
+    EXIT
+END runner
+
 /* T18: placed so that this 2-byte syscall ends exactly at USER_TOP. */
 PROG sysret_edge
     syscall
