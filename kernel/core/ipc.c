@@ -31,6 +31,7 @@ static void waitq_append(struct waitq *q, struct thread *t)
     else
         q->head = t;
     q->tail = t;
+    q->len++;
 }
 
 static void waitq_remove(struct thread *t)
@@ -47,6 +48,8 @@ static void waitq_remove(struct thread *t)
         t->wait_next->wait_prev = t->wait_prev;
     else
         q->tail = t->wait_prev;
+    KASSERT(q->len > 0);
+    q->len--;
     t->wait_q = NULL;
     t->wait_next = t->wait_prev = NULL;
 }
@@ -259,7 +262,7 @@ static bool queue_ok(const struct waitq *q)
         if (++n > 100000)
             return false;   /* a cycle */
     }
-    return prev == q->tail;
+    return prev == q->tail && n == q->len;
 }
 
 static bool in_queue(const struct waitq *q, const struct thread *t)
@@ -304,24 +307,28 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
             return false;
         /* 7 (P42, P46): a message is staged only while blocked sending,
          * and nothing lies beyond its length. */
-        unsigned len = t->state == THREAD_BLOCKED_SEND ? MSG_LEN(t->msg.info) : 0;
-        if (len > MSG_MAX_WORDS || (t->state != THREAD_BLOCKED_SEND && t->msg.info))
+        /* ... or, captured reply, while a reply_recv continuation holds it
+         * (ADR 0010 E5). */
+        bool msg_ok = t->state == THREAD_BLOCKED_SEND || t->cont.kind == CONT_REPLY_RECV;
+        unsigned len = msg_ok ? MSG_LEN(t->msg.info) : 0;
+        if (len > MSG_MAX_WORDS || (!msg_ok && t->msg.info))
             return false;
         for (unsigned i = len; i < MSG_MAX_WORDS; i++)
             if (t->msg.words[i])
                 return false;
-        unsigned nc = t->state == THREAD_BLOCKED_SEND ? MSG_NCAPS(t->msg.info) : 0;
+        unsigned nc = msg_ok ? MSG_NCAPS(t->msg.info) : 0;
         for (unsigned i = nc; i < MSG_MAX_CAPS; i++)
             if (t->msg.caps[i])
                 return false;
-        if (t->msg.reserved || (t->state != THREAD_BLOCKED_SEND && t->msg.badge))
+        if (t->msg.reserved || (!msg_ok && t->msg.badge))
             return false;
         /* 8 (P50, P59): an offer of receive slots is staged only while
          * receiving, waiting for a reply, or queued as a caller; nothing
          * lies beyond its count. */
         bool calling = t->state == THREAD_BLOCKED_SEND && (t->ipc_flags & IPC_CALL);
         bool may_offer = t->state == THREAD_BLOCKED_RECV ||
-                         t->state == THREAD_BLOCKED_REPLY || calling;
+                         t->state == THREAD_BLOCKED_REPLY || calling ||
+                         t->cont.kind == CONT_RECV || t->cont.kind == CONT_REPLY_RECV;
         unsigned oc = may_offer ? t->offer.count : 0;
         if (oc > MSG_MAX_CAPS || (!may_offer && t->offer.count))
             return false;
@@ -344,6 +351,7 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
          * RUNNING thread, of a known kind; none leaves anything behind. */
         static const struct thread_cont no_cont;
         if (t->cont.kind >= CONT_KIND_COUNT ||
+            (t->cont.kind == CONT_RECV && t->cont.aux > 1) ||
             (t->cont.kind != CONT_NONE && t->state != THREAD_RUNNABLE &&
              t->state != THREAD_RUNNING) ||
             (t->cont.kind == CONT_NONE && memcmp(&t->cont, &no_cont, sizeof(no_cont)) != 0))

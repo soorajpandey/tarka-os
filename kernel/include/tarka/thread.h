@@ -44,7 +44,8 @@ enum thread_state {
 struct waitq {
     struct thread *head, *tail;
     uint32_t kind;          /* enum thread_state */
-    uint32_t reserved;
+    uint32_t len;           /* members, maintained (ADR 0010 E2: counting
+                             * by walking would be unbounded) */
 };
 _Static_assert(sizeof(struct waitq) == 24, "struct waitq must have no padding");
 
@@ -128,7 +129,8 @@ struct thread_cont {
     uint32_t kind;     /* enum cont_kind */
     uint32_t slot;     /* the slot named: where to look */
     uint32_t type;     /* the target's identity: type, object, serial */
-    uint32_t initial;  /* CONT_REPLY_RECV: remaining_initial_drain (E2) */
+    uint32_t aux;      /* CONT_REPLY_RECV: remaining_initial_drain (E2);
+                        * CONT_RECV: 1 if a reply_recv found its caller gone */
     uint64_t object;
     uint64_t serial;
 };
@@ -177,6 +179,10 @@ static inline void *thread_xsave_area(struct thread *t)
 {
     return (uint8_t *)t + 4096;
 }
+
+#ifdef TARKA_SELFTEST
+extern uint64_t thread_stop_reaper_units;   /* reaper units done at the last stop */
+#endif
 
 /* Boot: register the binding hook and the thread finaliser. */
 void thread_boot(void);

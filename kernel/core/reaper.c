@@ -174,9 +174,16 @@ static void finish(struct obj_meta *m)
     meta_retire(m);
 }
 
+#ifdef TARKA_SELFTEST
+uint64_t reaper_units_total;
+#endif
+
 /* One unit of work on the head of the list (SC24). */
 static void unit(void)
 {
+#ifdef TARKA_SELFTEST
+    reaper_units_total++;
+#endif
     uint64_t x = head;
     unsigned kind = kind_of(x);
     struct obj_meta *m = meta_of(x);

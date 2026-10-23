@@ -23,6 +23,7 @@
 
 #include "cap_internal.h"
 
+#include <tarka/cont.h>
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
@@ -310,27 +311,21 @@ static int recv_prepare(struct thread *t, struct cspace *cs, cap_slot_t slot, bo
     return capture_offer(b, cs, o);
 }
 
-/* P53: fail queued senders whose message can no longer be delivered into
- * offer `o` in cspace `cs`, until the head is deliverable. Returns it,
- * with its plan in `p`, or NULL. One of the two queue-draining operations
- * of P37; each failed sender leaves exactly once (I-E2). */
-static struct thread *drain(struct endpoint *e, const struct cspace *cs,
-                            const struct ipc_offer *o, struct xfer_plan *p)
+/* P53: can head sender `s` deliver into offer `o` in cspace `cs` now?
+ * T_OK with its plan in `p`, or the error it is failed with. The plan
+ * holds slot pointers, so it is rebuilt in every chunk, never kept
+ * (E0). */
+static int deliverable(struct thread *s, const struct cspace *cs, const struct ipc_offer *o,
+                       struct xfer_plan *p)
 {
-    struct thread *s;
+    struct cspace scs;
+    int rc = thread_cspace(s, &scs);
 
-    while ((s = waitq_first(&e->senders))) {
-        struct cspace scs;
-        int rc = thread_cspace(s, &scs);
-        if (!rc)
-            rc = check_sources(&scs, &s->msg, p);
-        if (!rc)
-            rc = check_fit(cs, o, p);
-        if (!rc)
-            return s;
-        thread_wake(s, rc);
-    }
-    return NULL;
+    if (!rc)
+        rc = check_sources(&scs, &s->msg, p);
+    if (!rc)
+        rc = check_fit(cs, o, p);
+    return rc;
 }
 
 /* Commit a receive: take deliverable head sender `s` (plan `p`), or block
@@ -354,31 +349,30 @@ static int64_t recv_commit(struct thread *t, struct endpoint *e, struct thread *
     return SYS_NORESULT;
 }
 
+/* SC25, E7: capture once (the slot, the endpoint's identity, the offer),
+ * then the drain runs as a continuation, first chunk here. */
 int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot)
 {
     const struct cap *c;
     struct ipc_offer o;
-    struct xfer_plan p;
     int rc;
 
     if ((rc = recv_prepare(t, cs, slot, true, &c, &o)))
         return rc;
-    struct endpoint *e = endpoint_of(c);
-    struct thread *s = drain(e, cs, &o, &p);
-    if (!s && count_with(c, CAP_R_WRITE) == 0)
-        return T_EDEAD;    /* nobody can ever send (P27) */
-    return recv_commit(t, e, s, &p, &o, false);
+    t->offer = o;
+    t->cont = (struct thread_cont){ .kind = CONT_RECV, .slot = slot, .type = c->type,
+                                    .object = c->object, .serial = obj_serial(c) };
+    return cont_after_first(t, endpoint_drain_chunk(t, cs));
 }
 
-/* P61 step 3: check a reply from server `t` to its pending caller. */
-static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
-                       struct ipc_msg *m, struct xfer_plan *p)
+/* P61 step 3, split in two (ADR 0010 E7). Capture reads the server's IPC
+ * buffer, once; validation works on the kernel copy and can be re-run at
+ * the commit point of a chunked reply_recv. */
+static int reply_capture(struct thread *t, uint64_t info, struct ipc_msg *m)
 {
-    struct thread *caller = t->reply_to;
-    struct cspace ccs;
     int rc;
 
-    KASSERT(t->reply_state == REPLY_PENDING && caller);
+    KASSERT(t->reply_state == REPLY_PENDING && t->reply_to);
     if ((rc = validate_info(info)))
         return rc;
     if (t->reply_flags & REPLY_FAULT) {
@@ -390,7 +384,6 @@ static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
             return T_EINVAL;
         memset(m, 0, sizeof(*m));
         m->info = info;
-        memset(p, 0, sizeof(*p));
         return T_OK;
     }
     const struct ipc_buffer *b = ipcbuf(t);
@@ -399,13 +392,47 @@ static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
     if (MSG_NCAPS(info) > 0 && !(t->reply_flags & REPLY_CALL_GRANT))
         return T_EPERM;    /* P23a: only what call_grant allows */
     capture(b, info, 0, m);
+    return T_OK;
+}
+
+static int reply_validate(struct thread *t, const struct cspace *cs, const struct ipc_msg *m,
+                          struct xfer_plan *p)
+{
+    struct thread *caller = t->reply_to;
+    struct cspace ccs;
+    int rc;
+
+    KASSERT(t->reply_state == REPLY_PENDING && caller);
+    if (t->reply_flags & REPLY_FAULT) {
+        memset(p, 0, sizeof(*p));
+        return T_OK;
+    }
     if ((rc = check_sources(cs, m, p)))
         return rc;
-    if (MSG_LEN(info) > 0 && !ipcbuf(caller))
+    if (MSG_LEN(m->info) > 0 && !ipcbuf(caller))
         return T_EINVAL;   /* P6a, P18: the caller cannot take data */
     if ((rc = thread_cspace(caller, &ccs)))
         return rc;
     return check_fit(&ccs, &caller->offer, p);
+}
+
+static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
+                       struct ipc_msg *m, struct xfer_plan *p)
+{
+    int rc = reply_capture(t, info, m);
+
+    return rc ? rc : reply_validate(t, cs, m, p);
+}
+
+/* P63 phase 2: the reply's capabilities never land in a slot the receive
+ * half offered. */
+static int slots_apart(const struct cspace *cs, const struct xfer_plan *rp, const struct ipc_offer *o)
+{
+    for (unsigned i = 0; i < rp->n; i++)
+        for (uint32_t j = 0; j < o->count; j++)
+            if (rp->dst[i] == cap_slot(cs, o->slots[j]))
+                return T_EBUSY;
+    return T_OK;
 }
 
 /* P61 step 4, P71: commit a checked reply. A fault caller gets no
@@ -438,12 +465,16 @@ int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info)
     return T_OK;
 }
 
+/* SC25, E2, E7: validate both halves and capture once (the slot and
+ * identity, the offer, the reply message, and k, the endpoint's own count
+ * of queued senders); then the drain runs as a continuation, first chunk
+ * here. */
 int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info)
 {
     const struct cap *c;
     struct ipc_offer o;
     struct ipc_msg rm;
-    struct xfer_plan rp, p;
+    struct xfer_plan rp;
     int rc;
 
     /* Phase 1: the receive half. */
@@ -454,31 +485,120 @@ int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot
     if (pending) {
         if ((rc = reply_check(t, cs, info, &rm, &rp)))
             return rc;
-        for (unsigned i = 0; i < rp.n; i++)
-            for (uint32_t j = 0; j < o.count; j++)
-                if (rp.dst[i] == cap_slot(cs, o.slots[j]))
-                    return T_EBUSY;
+        if ((rc = slots_apart(cs, &rp, &o)))
+            return rc;
     }
-    /* Phases 3 and 4: drain, then liveness, before anything of ours. */
+    t->offer = o;
+    if (pending)
+        t->msg = rm;
+    t->cont = (struct thread_cont){ .kind = CONT_REPLY_RECV, .slot = slot, .type = c->type,
+                                    .object = c->object, .serial = obj_serial(c),
+                                    .aux = endpoint_of(c)->senders.len };
+    return cont_after_first(t, endpoint_drain_chunk(t, cs));
+}
+
+/* E0: the receive's endpoint, found again by slot and identity, with what
+ * a receive needs. A different endpoint in that slot is not the one
+ * named: T_EBADCAP, never an operation on it. */
+static int recv_resolve(struct thread *t, struct cspace *cs, const struct thread_cont *k,
+                        bool plain, const struct cap **c)
+{
+    int rc;
+
+    if ((rc = cap_lookup(cs, k->slot, CAP_ENDPOINT, CAP_R_READ, c)))
+        return rc;
+    if (!obj_identity_is(*c, k->type, k->object, k->serial))
+        return T_EBADCAP;
+    if (!ipcbuf(t))
+        return T_EINVAL;   /* P4, P6a: unbound between chunks */
+    if (plain && t->reply_state != REPLY_NONE)
+        return T_EBUSY;
+    return T_OK;
+}
+
+#ifdef TARKA_SELFTEST
+uint64_t drain_failed, drain_failed_at_reply;   /* E2 witnesses (tests) */
+#endif
+
+/* One chunk (SC25, E2, E7). Fails at most DRAIN_CHUNK undeliverable
+ * senders, each exactly once (I-E2); before a reply_recv's reply commits,
+ * only as many as its snapshot allows (E2). Then: deliver, block, or
+ * (reply_recv only, snapshot spent) commit the reply and go on as a
+ * plain receive. */
+static int64_t drain_step(struct thread *t, struct cspace *cs)
+{
+    struct thread_cont *k = &t->cont;
+    bool reply = k->kind == CONT_REPLY_RECV;
+    const struct cap *c;
+    struct xfer_plan p;
+    struct thread *s;
+    int rc;
+
+    if ((rc = recv_resolve(t, cs, k, !reply, &c)))
+        return rc;
     struct endpoint *e = endpoint_of(c);
-    struct thread *s = drain(e, cs, &o, &p);
+    for (unsigned failed = 0;; failed++) {
+        if (!(s = waitq_first(&e->senders)) || !(rc = deliverable(s, cs, &t->offer, &p)))
+            break;
+        if (reply && k->aux == 0)
+            break;                    /* E2: the snapshot is spent */
+        if (failed == DRAIN_CHUNK)
+            return CONT_PENDING;      /* a boundary before the next ones */
+        thread_wake(s, rc);           /* failed once: it leaves the queue */
+#ifdef TARKA_SELFTEST
+        drain_failed++;
+#endif
+        if (reply)
+            k->aux--;
+    }
+    bool now = s && rc == T_OK;       /* the head can be delivered */
     if (!s && count_with(c, CAP_R_WRITE) == 0)
-        return T_EDEAD;
-    /* Phase 5: commit the reply, then receive. */
-    bool skipped = false;
-    if (pending) {
-        reply_commit(t, &rm, &rp);
-    } else if (t->reply_state == REPLY_CALLER_GONE) {
-        reply_consume_gone(t);
-        skipped = true;
-    }
-    if (s) {
+        return T_EDEAD;               /* nobody can ever send (P27); nothing committed */
+
+    bool skipped = !reply && k->aux;
+    if (reply) {
+        /* P63 phases 2 and 5, on the captured reply. */
+        if (t->reply_state == REPLY_PENDING) {
+            struct xfer_plan rp;
+            if ((rc = reply_validate(t, cs, &t->msg, &rp)) || (rc = slots_apart(cs, &rp, &t->offer)))
+                return rc;
+            reply_commit(t, &t->msg, &rp);
+#ifdef TARKA_SELFTEST
+            drain_failed_at_reply = drain_failed;
+#endif
+        } else if (t->reply_state == REPLY_CALLER_GONE) {
+            reply_consume_gone(t);
+            skipped = true;
+        }
+        memset(&t->msg, 0, sizeof(t->msg));   /* the reply is consumed */
+        if (s && !now) {
+            /* E2: what remains is an ordinary receive. */
+            *k = (struct thread_cont){ .kind = CONT_RECV, .slot = k->slot, .type = k->type,
+                                       .object = k->object, .serial = k->serial,
+                                       .aux = skipped };
+            return CONT_PENDING;
+        }
         /* The reply's commit cannot have invalidated the head (P63). */
-        struct cspace scs;
-        KASSERT(thread_cspace(s, &scs) == T_OK && check_sources(&scs, &s->msg, &p) == T_OK &&
-                check_fit(cs, &o, &p) == T_OK);
+        KASSERT(!now || deliverable(s, cs, &t->offer, &p) == T_OK);
     }
-    return recv_commit(t, e, s, &p, &o, skipped);
+    if (now) {
+        struct ipc_offer o = t->offer;
+        memset(&t->offer, 0, sizeof(t->offer));   /* delivered: nothing staged */
+        return recv_commit(t, e, s, &p, &o, skipped);
+    }
+    return recv_commit(t, e, NULL, &p, &t->offer, skipped);   /* block with the offer */
+}
+
+int64_t endpoint_drain_chunk(struct thread *t, struct cspace *cs)
+{
+    int64_t rc = drain_step(t, cs);
+
+    /* Finished without blocking: nothing captured may stay staged. */
+    if (rc != CONT_PENDING && rc != SYS_NORESULT) {
+        memset(&t->offer, 0, sizeof(t->offer));
+        memset(&t->msg, 0, sizeof(t->msg));
+    }
+    return rc;
 }
 
 /* P67-P69: a ring-3 exception of the current thread `t` (its fault record

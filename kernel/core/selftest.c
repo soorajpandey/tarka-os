@@ -1680,7 +1680,7 @@ static void test_thread_lifecycle(void)
 #define PROGS(X) X(sys1) X(block) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
     X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge) \
-    X(f_ud_go) X(f_pf_retry) X(f_pf_kernel)
+    X(f_ud_go) X(f_pf_retry) X(f_pf_kernel) X(resend)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
 PROGS(DECL)
 #define P(n) prog_##n##_start, prog_##n##_end
@@ -5891,6 +5891,253 @@ static void test_retype_limit(void)
     ut_teardown();
 }
 
+/* R6, directly: the thread that causes a death is stopped (suspends
+ * itself) or destroyed (deletes its own last Thread capability) in its
+ * very next syscall, before any scheduling boundary has let the reaper
+ * run. The teardown is unaffected: every waiter failed exactly once,
+ * the pin dropped, the memory reusable. */
+static void test_reaper_r6(void)
+{
+    for (int how = 0; how < 2; how++) {
+        CHECK(ut_setup(20));
+        CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 100, 1) == T_OK);   /* Ua */
+        CHECK(cap_retype(&uts, 100, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+        struct endpoint *e = endpoint_of(&ut_store[1]);
+        const cap_slot_t w[] = { 10, 20, 30, 40, 50, 60 };   /* > REAP_CHUNK */
+        for (unsigned i = 0; i < ARRAY_SIZE(w); i++)
+            CHECK(ep_thread(w[i], false, 0, 0, CAP_R_READ));
+        run_user();
+        CHECK(spawn(70, P(runner), false, NULL) && thread_suspend(&uts, 70 + T_THR) == T_OK);
+        struct cspace c70 = task_cs(70);
+        CHECK(cap_derive_to(&uts, 1, &c70, 2, CAP_R_ALL, 0) == T_OK);
+        CHECK(cap_derive_to(&uts, 70 + T_THR, &c70, 3, CAP_R_ALL, 0) == T_OK);
+        for (unsigned i = 0; i < ARRAY_SIZE(w); i++) {
+            struct cspace c = task_cs(w[i]);
+            CHECK(cap_delete(&c, 1) == T_OK);
+        }
+        CHECK(cap_delete(&uts, 1) == T_OK);               /* the deleter's is the last */
+        nreq = 0;
+        REQ(70, SYS_CAP_DELETE, 2);                       /* the death */
+        if (how == 0) {
+            REQ(70, SYS_TH_SUSPEND, 3);                   /* stopped, at once */
+        } else {
+            CHECK(thread_resume(&uts, 70 + T_THR) == T_OK);
+            CHECK(cap_delete(&uts, 70 + T_THR) == T_OK);  /* c70[3] is now the last */
+            REQ(70, SYS_CAP_DELETE, 3);                   /* destroyed, at once */
+        }
+        if (how == 0)
+            CHECK(thread_resume(&uts, 70 + T_THR) == T_OK);
+        reap_trace_n = 0;
+        test_report_count = 0;
+        uint64_t units = reaper_units_total;
+        run_user();
+        if (how == 0)
+            CHECK(tstate(70) == THREAD_INACTIVE);
+        else
+            CHECK(ut_store[70 + T_THR].type == CAP_NULL && c70.slots[3].type == CAP_NULL);
+        /* The deleter was stopped before the reaper's first unit (the last
+         * thread_stop of the run is its own; the waiters exit by
+         * SYS_EXIT), and the reaper did all the work after. */
+        CHECK(thread_stop_reaper_units == units && reaper_units_total > units);
+        CHECK(reap_trace_n > 0 && reaper_idle() && ut_store[100].ut.dying == 0);
+        CHECK(e->meta.flags == 0 && e->meta.serial == 0);   /* retired */
+        CHECK(reports_with(T_EDEAD) == ARRAY_SIZE(w));      /* each waiter once */
+        CHECK(cap_retype(&uts, 100, CAP_FRAME, 0, &uts, 101, 16) == T_OK);  /* reusable */
+        CHECK(slot_paddr(101) == slot_paddr(100) && AUDIT());
+        ut_teardown();
+    }
+}
+
+/* ---- Stage 4: the receive drain as a continuation (ADR 0010 SC25;
+ * revision 3e E0, E2, E7) ---- */
+
+/* Senders sharing task `base`'s address space, code (`resend`) and
+ * cspace, each with only a thread object (uts slot thr) and its own IPC
+ * buffer frame (thr + 1): two slots per sender. Each sends `info` with
+ * capabilities 2 and 3 of the shared cspace, `times` times. */
+static bool light_sender(cap_slot_t base, cap_slot_t thr, uint64_t info, uint64_t times)
+{
+    struct user_regs r = { .rip = UCODE_VA, .rsp = USTACK_TOP, .r12 = SYS_SEND, .rdi = 1,
+                           .rsi = info, .r13 = times };
+    if (cap_retype(&uts, 0, CAP_THREAD, 0, &uts, thr, 1) != T_OK ||
+        cap_retype(&uts, 0, CAP_FRAME, 0, &uts, thr + 1, 1) != T_OK ||
+        thread_bind(&uts, thr, TS_ASPACE, &uts, base + T_AS) != T_OK ||
+        thread_bind(&uts, thr, TS_CSPACE, &uts, base + T_CS) != T_OK ||
+        thread_bind(&uts, thr, TS_IPCBUF, &uts, thr + 1) != T_OK)
+        return false;
+    struct ipc_buffer *b = phys_to_virt(cap_obj_paddr(&ut_store[thr + 1]));
+    b->caps[0] = 2;
+    b->caps[1] = 3;
+    return thread_write_regs(&uts, thr, &r) == T_OK && thread_resume(&uts, thr) == T_OK;
+}
+
+/* The shared task for light senders: `resend` at base, sending on the
+ * endpoint in uts slot `ep` (its cspace slot 1), with capabilities 2 and
+ * 3 to send. It is itself the first sender. */
+static bool sender_base(cap_slot_t base, cap_slot_t ep, uint64_t info, uint64_t times)
+{
+    struct user_regs r = { .r12 = SYS_SEND, .rdi = 1, .rsi = info, .r13 = times };
+    if (!spawn(base, P(resend), false, &r))
+        return false;
+    struct cspace cs = task_cs(base);
+    tbuf(base)->caps[0] = 2;
+    tbuf(base)->caps[1] = 3;
+    return cap_derive_to(&uts, ep, &cs, 1, CAP_R_WRITE | G_, 0) == T_OK &&
+           cap_derive_to(&uts, base + T_CODE, &cs, 2, CAP_R_READ | G_, 0) == T_OK &&
+           cap_derive_to(&uts, base + T_STACK, &cs, 3, CAP_R_READ | G_, 0) == T_OK &&
+           thread_bind(&uts, base + T_THR, TS_IPCBUF, &uts, base + T_DATA) == T_OK;
+}
+
+#define TWO_CAPS (MSG_INFO(9, 0) | CAPS(2))   /* undeliverable into a 1-slot offer */
+static struct ipc_buffer *drain_rbuf;
+static int drain_hook_calls;
+
+static void hook_rewrite_offer(struct thread *t)
+{
+    (void)t;
+    drain_hook_calls++;
+    drain_rbuf->recv_slots[0] = 12;   /* rewritten in user memory: no effect */
+    drain_rbuf->recv_count = 3;
+}
+
+/* SC25, E7: more than DRAIN_CHUNK undeliverable senders, then a
+ * deliverable one. Same outcome as one pass; each failed sender failed
+ * exactly once; spread over chunks; the captured offer is what counts,
+ * whatever user memory says later. */
+static void test_drain_chunks(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(sender_base(10, 1, TWO_CAPS, 1));
+    for (cap_slot_t i = 0; i < 9; i++)                     /* 10 undeliverable */
+        CHECK(light_sender(10, 60 + 2 * i, TWO_CAPS, 1));
+    run_user();
+    CHECK(e->senders.len == 10);
+    CHECK(xfer_sender(30, 7, 0x77, (const uint32_t[]){ 2 }, 1));   /* deliverable */
+    run_user();
+    CHECK(e->senders.len == 11 && e->senders.tail == th(30));
+    drain_rbuf = ep_server(40, 50, CAP_R_READ | G_);
+    drain_rbuf->recv_slots[0] = 9;
+    drain_rbuf->recv_count = 1;
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    uint64_t chunks = cont_chunks_run, failed = drain_failed;
+    drain_hook_calls = 0;
+    cont_test_hook = hook_rewrite_offer;
+    test_report_count = 0;
+    go(40);
+    cont_test_hook = NULL;
+    /* 10 failures: DRAIN_CHUNK in the syscall's chunk, the rest after one
+     * boundary. */
+    CHECK(drain_failed - failed == 10 && cont_chunks_run - chunks == 1 && drain_hook_calls == 1);
+    CHECK(res(40, 0) == T_OK && drain_rbuf->words[0] == 0x77);
+    struct cspace c40 = task_cs(40);
+    CHECK(c40.slots[9].type == CAP_ENDPOINT && c40.slots[12].type == CAP_NULL);   /* the captured offer */
+    CHECK(reports_with(T_EINVAL) == 10 && test_report_count == 11);           /* each failed once */
+    CHECK(!e->senders.head && ep_ok(e) && AUDIT());
+    ut_teardown();
+}
+
+static cap_slot_t aba_slot;
+static void hook_swap_endpoint(struct thread *t)
+{
+    struct cspace cs;
+    (void)t;
+    drain_hook_calls++;
+    /* Between chunks: the endpoint the receive named goes from its slot,
+     * and a different one takes the slot. */
+    CHECK(cnode_view(&uts, 40 + T_CS, &cs) == T_OK);
+    CHECK(cap_delete(&cs, 1) == T_OK);
+    if (aba_slot)
+        CHECK(cap_derive_to(&uts, aba_slot, &cs, 1, CAP_R_READ | G_, 0) == T_OK);
+}
+
+/* E0 for the drain: the endpoint deleted between chunks, alone or with a
+ * new endpoint put in the same slot. The receive ends with the lookup
+ * error and never acts on the new endpoint; what earlier chunks
+ * committed (failed senders) stands. */
+static void test_drain_identity(void)
+{
+    for (int with_new = 0; with_new < 2; with_new++) {
+        CHECK(ut_setup(20));
+        CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 2) == T_OK);   /* E (1), E' (2) */
+        struct endpoint *e = endpoint_of(&ut_store[1]), *e2 = endpoint_of(&ut_store[2]);
+        CHECK(sender_base(10, 1, TWO_CAPS, 1));
+        for (cap_slot_t i = 0; i < 9; i++)
+            CHECK(light_sender(10, 60 + 2 * i, TWO_CAPS, 1));
+        CHECK(xfer_sender(30, 7, 0x77, (const uint32_t[]){ 2 }, 1));        /* on E too */
+        run_user();
+        CHECK(e->senders.len == 11);
+        drain_rbuf = ep_server(40, 50, CAP_R_READ | G_);
+        drain_rbuf->recv_slots[0] = 9;
+        drain_rbuf->recv_count = 1;
+        nreq = 0;
+        REQ(40, SYS_RECV, 1);
+        struct obj_meta m2 = e2->meta;
+        aba_slot = with_new ? 2 : 0;
+        drain_hook_calls = 0;
+        cont_test_hook = hook_swap_endpoint;
+        go(40);
+        cont_test_hook = NULL;
+        CHECK(drain_hook_calls == 1);
+        CHECK(res(40, 0) == T_EBADCAP);   /* gone, or not the one named */
+        /* Eight failed in the first chunk, and stay failed; the rest,
+         * the deliverable one included, are still queued on E. */
+        CHECK(e->senders.len == 3 && e->senders.tail == th(30) && tstate(30) == THREAD_BLOCKED_SEND);
+        /* E' was never touched: no sender delivered or failed through it,
+         * no waiter, counts only the new copy's. */
+        CHECK(!e2->senders.head && !e2->receivers.head);
+        CHECK(e2->meta.live == m2.live + (with_new ? 1 : 0));
+        CHECK(th(40)->cont.kind == CONT_NONE && th(40)->offer.count == 0 && AUDIT());
+        ut_teardown();
+    }
+}
+
+/* E2: senders that keep coming back (each failed sender re-sends) cannot
+ * delay the caller's reply beyond the k senders queued when reply_recv
+ * began; the rest is the server's own receive work. */
+static void test_drain_reply_bound(void)
+{
+    enum { K = 10, TIMES = 4 };
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 2) == T_OK);   /* E1 (1), E2 (2) */
+    struct endpoint *e2 = endpoint_of(&ut_store[2]);
+    /* The caller, on E1, blocked waiting for a server. */
+    CHECK(ep_caller(20, 5, 0x55, CAP_R_WRITE | G_, 0, (const uint32_t[]){ 6 }, 1));
+    run_user();
+    CHECK(tstate(20) == THREAD_BLOCKED_SEND);
+    /* K undeliverable senders on E2, each coming back TIMES times. */
+    CHECK(sender_base(10, 2, TWO_CAPS, TIMES));
+    for (cap_slot_t i = 0; i < K - 1; i++)
+        CHECK(light_sender(10, 60 + 2 * i, TWO_CAPS, TIMES));
+    run_user();
+    CHECK(e2->senders.len == K);
+    /* The server: receives the call on E1, then reply_recv on E2 with a
+     * one-slot offer. */
+    drain_rbuf = ep_server(40, 50, CAP_R_READ | G_);
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 2, &c40, 2, CAP_R_READ | G_, 0) == T_OK);
+    drain_rbuf->recv_slots[0] = 9;
+    drain_rbuf->recv_count = 1;
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_REPLY_RECV, 2, MSG_INFO(0x66, 0));
+    uint64_t failed = drain_failed;
+    drain_failed_at_reply = 0;
+    test_report_count = 0;
+    go(40);
+    /* The reply committed after exactly the K senders of the snapshot,
+     * although they kept coming back throughout. */
+    CHECK(drain_failed_at_reply - failed == K);
+    CHECK(drain_failed - failed == K * TIMES);           /* every attempt failed once */
+    CHECK(tstate(20) == THREAD_INACTIVE && reports_with(T_OK) >= 1);   /* the caller got it */
+    CHECK(res(40, 0) == T_OK && tstate(40) == THREAD_BLOCKED_RECV);    /* now just receiving */
+    CHECK(!e2->senders.head && AUDIT());
+    ut_teardown();
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -5974,6 +6221,10 @@ static const struct {
     { "revoke_cancel", test_revoke_cancel },
     { "revoke_syscall", test_revoke_syscall },
     { "retype_limit", test_retype_limit },
+    { "drain_chunks", test_drain_chunks },
+    { "drain_identity", test_drain_identity },
+    { "drain_reply_bound", test_drain_reply_bound },
+    { "reaper_r6", test_reaper_r6 },
     { "cpu_hardening", test_cpu_hardening },
 };
 

@@ -6,6 +6,7 @@
 
 #include "cap_internal.h"
 
+#include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/string.h>
@@ -28,6 +29,9 @@ static int64_t chunk(struct thread *t)
     switch (t->cont.kind) {
     case CONT_REVOKE:
         return cap_revoke_chunk(&cs, &t->cont);
+    case CONT_RECV:
+    case CONT_REPLY_RECV:
+        return endpoint_drain_chunk(t, &cs);
     default:
         panic("cont: kind %u", t->cont.kind);
     }
@@ -41,23 +45,24 @@ static void yield(struct thread *t)
 
 int64_t cont_after_first(struct thread *t, int64_t rc)
 {
-    if (t->state != THREAD_RUNNING) {
-        /* The operation stopped its own thread (it deleted its binding or
-         * its thread): cont_abandon has already run. */
-        KASSERT(t->cont.kind == CONT_NONE);
-        return rc == CONT_PENDING ? SYS_NORESULT : rc;
-    }
     if (rc == CONT_PENDING) {
+        if (t->state != THREAD_RUNNING) {
+            /* It stopped its own thread (deleted its binding or its
+             * thread): cont_abandon has already run. */
+            KASSERT(t->cont.kind == CONT_NONE);
+            return SYS_NORESULT;
+        }
         KASSERT(t->cont.kind != CONT_NONE);
         yield(t);
         return SYS_NORESULT;
     }
-    cont_clear(t);
+    cont_clear(t);   /* finished: with a result, blocked, or stopped */
     return rc;
 }
 
 #ifdef TARKA_SELFTEST
 uint64_t cont_chunks_run;   /* chunks run at dispatch (tests) */
+void (*cont_test_hook)(struct thread *t);   /* before each such chunk */
 #endif
 
 void cont_run(struct thread *t)
@@ -65,19 +70,20 @@ void cont_run(struct thread *t)
     KASSERT(t->state == THREAD_RUNNING && t->cont.kind != CONT_NONE);
 #ifdef TARKA_SELFTEST
     cont_chunks_run++;
+    if (cont_test_hook)
+        cont_test_hook(t);
 #endif
     int64_t rc = chunk(t);
 
-    if (t->state != THREAD_RUNNING) {
-        KASSERT(t->cont.kind == CONT_NONE);   /* stopped by its own chunk */
-        return;
-    }
     if (rc == CONT_PENDING) {
-        yield(t);   /* a scheduling boundary before the next chunk */
+        if (t->state == THREAD_RUNNING)
+            yield(t);   /* a scheduling boundary before the next chunk */
+        else
+            KASSERT(t->cont.kind == CONT_NONE);   /* stopped by its own chunk */
         return;
     }
-    cont_clear(t);
-    if (rc != SYS_NORESULT)
+    cont_clear(t);   /* finished: with a result, blocked, or stopped */
+    if (t->state == THREAD_RUNNING && rc != SYS_NORESULT)
         t->regs.rax = (uint64_t)rc;   /* only the final chunk writes a result */
 }
 

@@ -50,6 +50,7 @@ bool reaper_list_next(uint64_t *cursor, unsigned *kind, const struct obj_meta **
 /* A trace of reaper decisions, so tests can check D2's proof at run
  * time: every unit records the serial of the object it worked on and
  * what it did. */
+extern uint64_t reaper_units_total;   /* units ever performed */
 #define REAP_TRACE_MAX 512
 enum reap_act { REAP_REAL = 1, REAP_REQUEUE, REAP_DONE };
 struct reap_event { uint64_t serial; uint32_t act; uint32_t kind; };

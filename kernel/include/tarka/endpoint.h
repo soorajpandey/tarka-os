@@ -47,4 +47,12 @@ int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot
 __must_check int endpoint_fault(struct thread *t);
 int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot);
 
+/* The receive drain as a continuation (ADR 0010 SC25, revision 3e E2,
+ * E7): one chunk of t's CONT_RECV or CONT_REPLY_RECV. */
+#define DRAIN_CHUNK 8
+int64_t endpoint_drain_chunk(struct thread *t, struct cspace *cs);
+#ifdef TARKA_SELFTEST
+extern uint64_t drain_failed, drain_failed_at_reply;
+#endif
+
 #endif

@@ -350,6 +350,24 @@ PROG sys1
     EXIT
 END sys1
 
+/* The same syscall (r12, with rdi and rsi) r13 times, then report the
+ * last result and exit: a sender that comes back after every failure
+ * (ADR 0010 E2's adversary). */
+PROG resend
+    movq %rdi, %rbx
+    movq %rsi, %rbp
+1:
+    movq %rbx, %rdi
+    movq %rbp, %rsi
+    movq %r12, %rax
+    syscall
+    decq %r13
+    jnz 1b
+    movq %rax, %rdi
+    REPORT
+    EXIT
+END resend
+
 /* Spins long enough for a timer interrupt to arrive in ring 3, then
  * reports how far it got (a = iterations, proving it ran to the end). */
 PROG spin

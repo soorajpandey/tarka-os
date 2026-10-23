@@ -31,6 +31,7 @@ void cont_abandon(struct thread *t, bool destroying);
 
 #ifdef TARKA_SELFTEST
 extern uint64_t cont_chunks_run;
+extern void (*cont_test_hook)(struct thread *t);
 #endif
 
 #endif

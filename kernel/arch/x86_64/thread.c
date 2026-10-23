@@ -16,6 +16,7 @@
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
+#include <tarka/reaper.h>
 #include <tarka/string.h>
 #include <tarka/vspace.h>
 
@@ -104,8 +105,15 @@ bool thread_runnable_safe(const struct thread *t)
 /* Stop a thread: it leaves the run queue and will not run again until
  * resumed. If it is running on this CPU, the CPU leaves its address
  * space now, before whatever is being deleted can be freed. */
+#ifdef TARKA_SELFTEST
+uint64_t thread_stop_reaper_units;   /* reaper units done at the last stop */
+#endif
+
 static void thread_stop(struct thread *t, enum thread_state to, bool destroying)
 {
+#ifdef TARKA_SELFTEST
+    thread_stop_reaper_units = reaper_units_total;
+#endif
     /* ADR 0009 P28-P31: leave every queue and reply link first. A thread
      * stopped in the middle of a blocking syscall gets T_EINTR as that
      * syscall's result when it is resumed (unless it is being destroyed). */
