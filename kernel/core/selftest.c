@@ -258,11 +258,12 @@ static bool cdt_consistent(const struct cspace *cs)
                 return false;
             continue;
         }
-        if (c->slot_flags != 0 || c->pending_link != 0 || c->reserved0)
+        if (c->slot_flags != 0 || c->slot_aux != 0)
             return false;
         if (memcmp(&c->slot_meta, &zero_meta, sizeof(zero_meta)) != 0)
             return false;
-        if (c->type != CAP_UNTYPED && memcmp(&c->ut_meta, &zero_meta, sizeof(zero_meta)) != 0)
+        static const struct ut_meta zero_ut;
+        if (c->type != CAP_UNTYPED && memcmp(&c->ut, &zero_ut, sizeof(zero_ut)) != 0)
             return false;
         if (!cdt_list_ok(cdt_list_head(c)))
             return false;
@@ -3125,7 +3126,7 @@ static bool world_transferred(const struct world *a, const struct world *b,
                 return false;                              /* was empty */
             if (now->type != s->type || now->object != s->object ||
                 now->rights != s->rights || now->badge != (badged ? s->badge : 0) ||
-                now->map_entry || now->slot_flags || now->pending_link ||
+                now->map_entry || now->slot_flags || now->slot_aux ||
                 b->parent[i] != s)
                 return false;
             continue;
@@ -4680,8 +4681,6 @@ static const struct obj_meta *or_stored(const struct cap *c)
     uint64_t obj;
 
     switch (c->type) {
-    case CAP_UNTYPED:
-        return &c->ut_meta;
     case CAP_FRAME:
     case CAP_ADDRESS_SPACE:
     case CAP_PAGE_TABLE:
@@ -4702,6 +4701,24 @@ static const struct obj_meta *or_stored(const struct cap *c)
     default:
         return NULL;
     }
+}
+
+/* An object's carver and serial, read where SC19a and D3 put them: an
+ * Untyped's in its record, everyone else's in its metadata. */
+static const struct cap *or_carver(const struct cap *c)
+{
+    if (c->type == CAP_UNTYPED)
+        return c->ut.carver;
+    const struct obj_meta *m = or_stored(c);
+    return m ? m->carver : NULL;
+}
+
+static uint64_t or_serial(const struct cap *c)
+{
+    if (c->type == CAP_UNTYPED)
+        return c->ut.serial;
+    const struct obj_meta *m = or_stored(c);
+    return m ? m->serial : 0;
 }
 
 static bool or_contains(const struct cap *ut, const struct cap *c)
@@ -4738,12 +4755,23 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
     }
     if (c->type == CAP_DEBUG_CONSOLE)
         return true;   /* no object, no metadata (SC19a) */
+    if (or_serial(c) == 0 || or_serial(c) >= objmeta_test_next_serial())
+        return meta_mismatch("serial not issued", c);
+    if (c->type == CAP_UNTYPED) {
+        /* O2: one record, which carries the metadata. */
+        if (live != 1)
+            return meta_mismatch("Untyped with several records", c);
+        if (c->ut.flags & ~OBJ_FROZEN)
+            return meta_mismatch("Untyped flags", c);
+        return true;   /* a root may have no carver */
+    }
     const struct obj_meta *m = or_stored(c);
     if (!m)
         return meta_mismatch("no metadata", c);
     if (m->live != live)
         return meta_mismatch("live count", c);
-    if (m->flags & ~OBJ_FROZEN)
+    uint32_t bits = c->type == CAP_CNODE ? cap_obj_bits(c) << OBJ_BITS_SHIFT : 0;
+    if ((m->flags & ~OBJ_FROZEN) != bits)
         return meta_mismatch("flags", c);
     if (c->type == CAP_ENDPOINT || c->type == CAP_NOTIFICATION) {
         if (m->n_read != nr || m->n_write != nw)
@@ -4751,11 +4779,11 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
     } else if (c->type == CAP_FRAME) {
         if (m->alias_w != aw || m->alias_x != ax)
             return meta_mismatch("alias counts", c);
+    } else if (c->type == CAP_ADDRESS_SPACE || c->type == CAP_PAGE_TABLE) {
+        /* filled-entry counts: checked by or_tables() */
     } else if (m->n_read || m->n_write) {
-        return meta_mismatch("stray counts", c);
+        return meta_mismatch("stray counts", c);   /* incl. a live CNode listed */
     }
-    if (c->type == CAP_UNTYPED && live != 1)
-        return meta_mismatch("Untyped with several records", c);
     if (c->type == CAP_TEST_TOKEN) {
         ++*token_objs;
         return m->carver == NULL || meta_mismatch("token carver", c);
@@ -4769,6 +4797,36 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
     return true;
 }
 
+static uint64_t or_serials[ORACLE_MAX];
+static unsigned or_nserial;
+
+static void or_sort_serials(void)
+{
+    /* Insertion-free heapsort over or_serials[0, or_nserial). */
+    unsigned n = or_nserial;
+    for (unsigned start = n / 2; start-- > 0;) {
+        for (unsigned i = start;;) {
+            unsigned big = i, l = 2 * i + 1, r = l + 1;
+            if (l < n && or_serials[l] > or_serials[big]) big = l;
+            if (r < n && or_serials[r] > or_serials[big]) big = r;
+            if (big == i) break;
+            uint64_t t = or_serials[i]; or_serials[i] = or_serials[big]; or_serials[big] = t;
+            i = big;
+        }
+    }
+    for (unsigned end = n; end > 1; end--) {
+        uint64_t t = or_serials[0]; or_serials[0] = or_serials[end - 1]; or_serials[end - 1] = t;
+        for (unsigned i = 0, m = end - 1;;) {
+            unsigned big = i, l = 2 * i + 1, r = l + 1;
+            if (l < m && or_serials[l] > or_serials[big]) big = l;
+            if (r < m && or_serials[r] > or_serials[big]) big = r;
+            if (big == i) break;
+            uint64_t u = or_serials[i]; or_serials[i] = or_serials[big]; or_serials[big] = u;
+            i = big;
+        }
+    }
+}
+
 static bool meta_audit(void)
 {
     static const struct obj_meta zero;
@@ -4777,6 +4835,7 @@ static bool meta_audit(void)
     unsigned frame_objs = 0, token_objs = 0, threads = 0, thread_objs = 0;
     bool ok = true;
 
+    or_nserial = 0;
     or_collect();
     if (or_overflow) {
         kprintf("    meta_audit: too many records\n");
@@ -4790,10 +4849,12 @@ static bool meta_audit(void)
             return meta_mismatch("record found twice", or_rec[k]);
     for (unsigned k = 0; k < or_n && ok; k++) {
         const struct cap *c = or_rec[k];
-        const struct obj_meta *cm = c->type == CAP_DEBUG_CONSOLE ? NULL : or_stored(c);
-        if (cm && cm->carver &&
-            !(or_has(cm->carver) && cm->carver->type == CAP_UNTYPED && or_contains(cm->carver, c)))
+        const struct cap *cv = c->type == CAP_DEBUG_CONSOLE ? NULL : or_carver(c);
+        if (cv && !(or_has(cv) && cv->type == CAP_UNTYPED && or_contains(cv, c)))
             ok = meta_mismatch("carver is not a live Untyped holding the object", c);
+        /* SC21: an object is created after the Untyped it is carved from. */
+        if (ok && cv && or_serial(cv) >= or_serial(c))
+            ok = meta_mismatch("serial not after its carver's", c);
     }
 
     /* By object: each group is one object's records. */
@@ -4804,9 +4865,20 @@ static bool meta_audit(void)
             ;
         ok = or_group(lo, hi, &frame_objs, &token_objs);
         thread_objs += or_rec[lo]->type == CAP_THREAD;
+        if (or_rec[lo]->type != CAP_DEBUG_CONSOLE) {
+            KASSERT(or_nserial < ORACLE_MAX);
+            or_serials[or_nserial++] = or_serial(or_rec[lo]);
+        }
     }
     if (!ok)
         return false;
+    /* D3: no two objects share a serial. */
+    or_sort_serials();
+    for (unsigned k = 1; k < or_nserial; k++)
+        if (or_serials[k] == or_serials[k - 1]) {
+            kprintf("    meta_audit: serial %lu used twice\n", or_serials[k]);
+            return false;
+        }
 
     /* Nothing is stored for an object with no records: every non-zero
      * frame table entry and token entry belongs to an object found above,
@@ -4883,7 +4955,8 @@ static void test_meta_counts(void)
     CHECK(cap_retype(&uts, 10, CAP_FRAME, 0, &uts, 14, 1) == T_OK);
     CHECK(cap_retype(&uts, 0, CAP_THREAD, 0, &uts, 15, 1) == T_OK);
     CHECK(cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, 16, 1) == T_OK);
-    CHECK(or_stored(&ut_store[10])->carver == &ut_store[0]);
+    CHECK(ut_store[10].ut.carver == &ut_store[0]);
+    CHECK(ut_store[10].ut.serial > ut_store[0].ut.serial);
     for (cap_slot_t k = 11; k <= 14; k++)
         CHECK(or_stored(&ut_store[k])->live == 1 && or_stored(&ut_store[k])->carver == &ut_store[10]);
     CHECK(or_stored(&ut_store[11]) != or_stored(&ut_store[12]));   /* per object */

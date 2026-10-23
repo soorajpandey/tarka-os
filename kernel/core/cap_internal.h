@@ -7,7 +7,7 @@
 #include <tarka/cap.h>
 
 /* Zero a slot's capability, keeping the slot's own properties
- * (slot_flags, pending_link, slot_meta). Every writer of a slot uses
+ * (slot_flags, slot_aux, slot_meta). Every writer of a slot uses
  * this. */
 void cap_slot_clear(struct cap *c);
 
@@ -55,7 +55,8 @@ static inline bool cap_badged_type(uint32_t type)
 void objmeta_boot(void);
 
 /* The metadata of c's object, at its type's fixed location; NULL for a
- * type without one (debug console). */
+ * type without one (debug console) and for an Untyped, whose metadata is
+ * the struct ut_meta in its record. */
 struct obj_meta *obj_meta(const struct cap *c);
 
 /* SC22a F2: c's object, or an Untyped on its carving chain, is frozen. */
@@ -65,8 +66,19 @@ bool obj_frozen(const struct cap *c);
  * T_ERANGE if the live count has no room. Called by cap_derive_check. */
 __must_check int meta_check_new(const struct cap *s);
 
-/* A freshly retyped (or boot) object: record its carving Untyped. */
-void meta_new_object(struct cap *c, struct cap *carver);
+/* A freshly retyped (or boot) object: record its carving Untyped and its
+ * serial (from serial_take(), after serial_check()). */
+void meta_new_object(struct cap *c, struct cap *carver, uint64_t serial);
+
+/* Serials (SC21, D3): T_ENOMEM unless n more remain; then take them one
+ * at a time. Never reused, never wrapped. */
+__must_check int serial_check(uint64_t n);
+uint64_t serial_take(void);
+
+/* c's object's serial (0 for the debug console), and the one identity
+ * predicate (D0): same type, address and serial. */
+uint64_t obj_serial(const struct cap *c);
+bool obj_identity_is(const struct cap *c, uint32_t type, uint64_t object, uint64_t serial);
 
 /* Commit steps (C4): c has just been linked in / is about to be unlinked.
  * meta_del() returns true when c was the object's last record. */
@@ -83,6 +95,8 @@ bool cap_is_ipcbuf_binding(const struct cap *c);
 void objmeta_test_freeze(const struct cap *c, bool frozen);
 bool objmeta_token_entry(unsigned i, uint64_t *object, const struct obj_meta **m);
 bool objmeta_frame_entry(uint64_t i, const struct obj_meta **m);
+void objmeta_test_set_serial(uint64_t next);
+uint64_t objmeta_test_next_serial(void);
 #endif
 
 /* The CDT as a balanced-bracket list (ADR 0010, SC20). */

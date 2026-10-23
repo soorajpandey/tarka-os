@@ -57,8 +57,8 @@ static void cnode_finalise(enum cap_type type, uint64_t object)
     struct cspace cn = cnode_of(pa(object & ~CAP_OBJ_BITS_MASK),
                                 (unsigned)(object & CAP_OBJ_BITS_MASK));
 
-    KASSERT(cn.slots[0].pending_link == 0);
-    cn.slots[0].pending_link = pending_cnodes;
+    KASSERT(cn.slots[0].slot_meta.reap_next == 0);
+    cn.slots[0].slot_meta.reap_next = pending_cnodes;
     pending_cnodes = (uint64_t)(uintptr_t)cn.slots | (object & CAP_OBJ_BITS_MASK);
     if (draining)
         return; /* the loop below, further up the stack, will get to it */
@@ -68,8 +68,8 @@ static void cnode_finalise(enum cap_type type, uint64_t object)
         struct cap *slots = (struct cap *)(uintptr_t)(pending_cnodes & ~CAP_OBJ_BITS_MASK);
         unsigned bits = (unsigned)(pending_cnodes & CAP_OBJ_BITS_MASK);
 
-        pending_cnodes = slots[0].pending_link;   /* pop before emptying */
-        slots[0].pending_link = 0;
+        pending_cnodes = slots[0].slot_meta.reap_next;   /* pop before emptying */
+        slots[0].slot_meta.reap_next = 0;
 
         struct cspace view = { .slots = slots, .nslots = 1u << (bits - CAP_SLOT_BITS) };
         cspace_destroy(&view);                     /* may push more */
@@ -165,6 +165,11 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     if (obj_frozen(ut))
         return T_EBUSY;
 
+    /* 5b. serials (SC21, revision 3d D3): never reused, so creation fails
+     * once they run out */
+    if ((rc = serial_check(count)))
+        return rc;
+
     /* 6. reset rule (O7) */
     if (!cap_has_children(ut))
         ut->ut_watermark = 0;
@@ -203,12 +208,11 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     for (uint32_t i = 0; i < count; i++) {
         struct cap *c = &dst_cs->slots[dst + i];
 
-        KASSERT(c->pending_link == 0);
         cap_slot_clear(c);
         c->type = type;
         c->rights = rights;
         c->object = cap_obj_encode(pa_add(base, i * obj_size), obj_bits);
-        meta_new_object(c, ut);   /* the carving back-pointer (SC22a) */
+        meta_new_object(c, ut, serial_take());   /* carver (SC22a), serial (SC21) */
         cap_insert_child(ut, c);
         meta_add(c);              /* C4 */
     }

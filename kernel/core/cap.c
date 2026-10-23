@@ -17,13 +17,12 @@ void cap_set_binding_hook(cap_binding_hook_t fn)
 
 void cap_slot_clear(struct cap *c)
 {
-    uint32_t flags = c->slot_flags;
-    uint64_t link = c->pending_link;
+    uint32_t flags = c->slot_flags, aux = c->slot_aux;
     struct obj_meta meta = c->slot_meta;
 
     memset(c, 0, sizeof(*c));
     c->slot_flags = flags;
-    c->pending_link = link;
+    c->slot_aux = aux;
     c->slot_meta = meta;
 }
 
@@ -244,7 +243,6 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
     if (c->type != CAP_NULL)
         return T_EBUSY;
 
-    KASSERT(c->pending_link == 0);
     cap_slot_clear(c);
     c->type = type;
     c->rights = rights;
@@ -252,8 +250,10 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
     cdt_make_root(c);
     /* A root Untyped is a new object with no carver: the top of every
      * carving chain (SC22a). */
-    if (type == CAP_UNTYPED)
-        meta_new_object(c, NULL);
+    if (type == CAP_UNTYPED) {
+        KASSERT(serial_check(1) == T_OK);   /* boot: the counter is fresh */
+        meta_new_object(c, NULL, serial_take());
+    }
     meta_add(c);
     return T_OK;
 }
@@ -317,7 +317,6 @@ int cap_derive_check(const struct cap *s, const struct cap *d, uint64_t badge)
 void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
 {
     KASSERT(d != NULL && cap_derive_check(s, d, badge) == T_OK);
-    KASSERT(d->pending_link == 0);
     cap_slot_clear(d);
     d->type = s->type;
     d->object = s->object;

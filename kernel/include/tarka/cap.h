@@ -68,7 +68,7 @@ struct cdt_elem {
 struct cap;
 struct obj_meta {
     uint32_t live;   /* live capability records to the object, any rights */
-    uint32_t flags;  /* OBJ_FROZEN */
+    uint32_t flags;  /* OBJ_*; for a CNode, also its size (OBJ_BITS) */
     union {
         struct {     /* CAP_ENDPOINT, CAP_NOTIFICATION (SC17) */
             uint32_t n_read;   /* live records carrying READ */
@@ -78,14 +78,33 @@ struct obj_meta {
             uint32_t alias_w;  /* writable mappings + IPC-buffer bindings */
             uint32_t alias_x;  /* executable mappings */
         };
+        struct {     /* CAP_ADDRESS_SPACE, CAP_PAGE_TABLE (revision 3d, D1) */
+            uint32_t filled;   /* filled (user) entries in its table */
+            uint32_t filled_reserved;
+        };
+        uint64_t reap_next;    /* CAP_CNODE: the reaper link (SC24) */
     };
-    struct cap *carver; /* the Untyped record it was carved from; NULL for
-                         * a boot root Untyped (SC22a carving chain) */
+    struct cap *carver; /* the Untyped record it was carved from (SC22a
+                         * carving chain, SC23 dying count) */
+    uint64_t serial;    /* never reused (SC21, revision 3d D3) */
 };
 
-#define OBJ_FROZEN 0x1u   /* a revocation is emptying a subtree under it */
+#define OBJ_FROZEN     0x1u    /* a revocation is emptying a subtree under it */
+#define OBJ_BITS_SHIFT 8       /* CAP_CNODE: object size bits, set at retype */
+#define OBJ_BITS_MASK  (0xFFu << OBJ_BITS_SHIFT)
 
-_Static_assert(sizeof(struct obj_meta) == 24, "struct obj_meta must have no padding");
+_Static_assert(sizeof(struct obj_meta) == 32, "struct obj_meta must have no padding");
+
+/* An Untyped's metadata, in its own record. It has no live count: an
+ * Untyped has exactly one record (O2), whose existence is its count. */
+struct ut_meta {
+    uint32_t flags;     /* OBJ_FROZEN */
+    uint32_t dying;     /* dying objects carved from it (SC23) */
+    struct cap *carver; /* the Untyped it was carved from; NULL for a root */
+    uint64_t serial;
+};
+
+_Static_assert(sizeof(struct ut_meta) == 24, "struct ut_meta must have no padding");
 
 struct cap {
     uint32_t     type;     /* enum cap_type */
@@ -102,16 +121,14 @@ struct cap {
     uint32_t     slot_flags; /* property of the slot, not of the capability in
                               * it: 0 for ordinary slots; SLOT_BINDING | index
                               * for a thread's binding slots (ADR 0008, T2) */
-    uint32_t     reserved0;  /* zero */
+    uint32_t     slot_aux;   /* property of the slot: in slot 0 of a dying
+                              * CNode, the reaper's cursor; zero elsewhere */
     uint64_t    *map_entry; /* CAP_FRAME / CAP_PAGE_TABLE: the hardware entry
                              * this capability filled, or NULL */
-    uint64_t     pending_link; /* property of the slot: zero, except in slot 0 of
-                                * a CNode waiting to be drained (ADR 0008,
-                                * T33), see cnode_finalise() */
     struct obj_meta slot_meta; /* property of the slot: in slot 0 of a CNode
                                 * object, that CNode's metadata (SC19a);
                                 * zero everywhere else */
-    struct obj_meta ut_meta;   /* CAP_UNTYPED: the Untyped's own metadata
+    struct ut_meta  ut;        /* CAP_UNTYPED: the Untyped's own metadata
                                 * (unique record, O2); zero otherwise */
 } __aligned(128);
 
@@ -119,7 +136,7 @@ struct cap {
  * The alignment also lets a list element tell which bracket it is. */
 _Static_assert(sizeof(struct cap) == 128, "struct cap must be exactly 128 bytes");
 _Static_assert(_Alignof(struct cap) == 128, "struct cap must be 128-byte aligned");
-_Static_assert(offsetof(struct cap, ut_meta) + sizeof(struct obj_meta) == 128,
+_Static_assert(offsetof(struct cap, ut) + sizeof(struct ut_meta) == 128,
                "struct cap must have no implicit padding");
 
 #define SLOT_BINDING     0x80000000u

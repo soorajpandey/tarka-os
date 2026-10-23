@@ -7,7 +7,8 @@
  *   Endpoint, Notification, Thread   in the object
  *   CNode                            slot 0's slot_meta
  *   Frame, AddressSpace, PageTable   the frame table entry of its base page
- *   Untyped                          its own (unique) record's ut_meta
+ *   Untyped                          its own (unique) record's `ut`, a
+ *                                    struct ut_meta (no live count: O2)
  *   test token (test builds)         a small table keyed by object value
  *   debug console                    none: no object, no finaliser
  *
@@ -34,6 +35,22 @@
  * never freed, never grown. */
 static struct obj_meta *frame_table;
 static uint64_t frame_table_n;
+
+/* SC21, revision 3d D3: one counter for every object, only increasing.
+ * Serial 0 means "no object" (the debug console). */
+static uint64_t next_serial = 1;
+
+int serial_check(uint64_t n)
+{
+    /* Serials next_serial .. UINT64_MAX - 1 remain; never wrap. */
+    return n <= UINT64_MAX - next_serial ? T_OK : T_ENOMEM;
+}
+
+uint64_t serial_take(void)
+{
+    KASSERT(next_serial < UINT64_MAX);   /* serial_check() came first */
+    return next_serial++;
+}
 
 void objmeta_boot(void)
 {
@@ -77,6 +94,7 @@ static struct obj_meta *token_lookup(uint64_t object, bool create)
         if (!token_meta[i].m.live) {
             memset(&token_meta[i], 0, sizeof(token_meta[i]));
             token_meta[i].object = object;
+            token_meta[i].m.serial = serial_take();
             return &token_meta[i].m;
         }
     panic("objmeta: test token table full");
@@ -89,6 +107,16 @@ bool objmeta_token_entry(unsigned i, uint64_t *object, const struct obj_meta **m
     *object = token_meta[i].object;
     *m = &token_meta[i].m;
     return true;
+}
+
+void objmeta_test_set_serial(uint64_t next)
+{
+    next_serial = next;
+}
+
+uint64_t objmeta_test_next_serial(void)
+{
+    return next_serial;
 }
 
 bool objmeta_frame_entry(uint64_t i, const struct obj_meta **m)
@@ -104,8 +132,6 @@ static struct obj_meta *lookup(const struct cap *c, bool create)
 {
     (void)create;
     switch (c->type) {
-    case CAP_UNTYPED:
-        return (struct obj_meta *)&c->ut_meta;
     case CAP_FRAME:
     case CAP_ADDRESS_SPACE:
     case CAP_PAGE_TABLE:
@@ -132,6 +158,25 @@ struct obj_meta *obj_meta(const struct cap *c)
     return lookup(c, false);
 }
 
+uint64_t obj_serial(const struct cap *c)
+{
+    const struct obj_meta *m;
+
+    if (c->type == CAP_UNTYPED)
+        return c->ut.serial;
+    m = obj_meta(c);
+    return m ? m->serial : 0;
+}
+
+/* D0, D3: identity is address and serial, compared together, for every
+ * type. The type is part of it too: one address never holds two live
+ * objects, but a stale value can name any type. */
+bool obj_identity_is(const struct cap *c, uint32_t type, uint64_t object, uint64_t serial)
+{
+    return c->type != CAP_NULL && c->type == type && c->object == object &&
+           obj_serial(c) == serial;
+}
+
 static bool counts_rights(uint32_t type)
 {
     return type == CAP_ENDPOINT || type == CAP_NOTIFICATION;
@@ -146,18 +191,26 @@ bool cap_is_ipcbuf_binding(const struct cap *c)
 
 bool obj_frozen(const struct cap *c)
 {
-    const struct obj_meta *m = obj_meta(c);
+    const struct cap *u;
 
     /* F2: the object's own flag, then each Untyped on its carving chain.
      * Each link is strictly smaller than the one above it, so there are
      * at most CHAIN_MAX of them. */
-    for (unsigned links = 0; m; links++) {
+    if (c->type == CAP_UNTYPED) {
+        u = c;
+    } else {
+        const struct obj_meta *m = obj_meta(c);
+        if (!m)
+            return false;
         if (m->flags & OBJ_FROZEN)
             return true;
-        if (!m->carver)
-            break;
-        KASSERT(links < CHAIN_MAX && m->carver->type == CAP_UNTYPED);
-        m = &m->carver->ut_meta;
+        u = m->carver;
+    }
+    for (unsigned links = 0; u; links++) {
+        KASSERT(links < CHAIN_MAX && u->type == CAP_UNTYPED);
+        if (u->ut.flags & OBJ_FROZEN)
+            return true;
+        u = u->ut.carver;
     }
     return false;
 }
@@ -173,25 +226,44 @@ int meta_check_new(const struct cap *s)
     return T_OK;
 }
 
-void meta_new_object(struct cap *c, struct cap *carver)
+void meta_new_object(struct cap *c, struct cap *carver, uint64_t serial)
 {
+    KASSERT(carver == NULL || carver->type == CAP_UNTYPED);
+    KASSERT(serial != 0);
+    if (c->type == CAP_UNTYPED) {
+        /* A fresh record (cap_slot_clear). */
+        KASSERT(c->ut.flags == 0 && c->ut.dying == 0 && c->ut.carver == NULL &&
+                c->ut.serial == 0);
+        c->ut.carver = carver;
+        c->ut.serial = serial;
+        return;
+    }
+
     struct obj_meta *m = obj_meta(c);
 
-    /* Retype's memory is fresh (O6) and frame table entries are cleared
-     * when their object's last record goes, so nothing stale is here. */
+    /* Retype's memory is fresh (O6) and metadata is cleared when its
+     * object's teardown completes, so nothing stale is here. */
     KASSERT(m != NULL);
-    KASSERT(m->live == 0 && m->flags == 0 && m->n_read == 0 && m->n_write == 0 &&
-            m->carver == NULL);
-    KASSERT(carver == NULL || carver->type == CAP_UNTYPED);
+    KASSERT(m->live == 0 && m->flags == 0 && m->reap_next == 0 && m->carver == NULL &&
+            m->serial == 0);
     m->carver = carver;
+    m->serial = serial;
+    if (c->type == CAP_CNODE)
+        m->flags = cap_obj_bits(c) << OBJ_BITS_SHIFT;
 }
 
 void meta_add(struct cap *c)
 {
-    struct obj_meta *m = lookup(c, true);
+    struct obj_meta *m;
 
+    if (c->type == CAP_UNTYPED) {
+        KASSERT(c->ut.serial != 0);   /* its one record: meta_new_object() */
+        return;
+    }
+    m = lookup(c, true);
     if (!m)
         return;
+    KASSERT(m->serial != 0);
     KASSERT(m->live < UINT32_MAX);
     m->live++;
     if (counts_rights(c->type)) {
@@ -207,8 +279,16 @@ void meta_add(struct cap *c)
 
 bool meta_del(struct cap *c)
 {
-    struct obj_meta *m = obj_meta(c);
+    struct obj_meta *m;
 
+    if (c->type == CAP_UNTYPED) {
+        /* Its only record, so always the last: O8 (amended) and F7 make
+         * sure nothing is carved from it, alive or dying, and that no
+         * revocation still has it frozen. */
+        KASSERT(!(c->ut.flags & OBJ_FROZEN) && c->ut.dying == 0);
+        return true;
+    }
+    m = obj_meta(c);
     if (!m)
         return false;
     KASSERT(m->live > 0);   /* C2 */
@@ -232,7 +312,8 @@ bool meta_del(struct cap *c)
     /* The last record: every count it backed is gone with it. A frozen
      * object cannot lose its last record (SC22b F5). Clear the entry so
      * that nothing stale survives into the memory's next object. */
-    KASSERT(m->n_read == 0 && m->n_write == 0 && !(m->flags & OBJ_FROZEN));
+    KASSERT(!(m->flags & OBJ_FROZEN));
+    KASSERT(c->type == CAP_CNODE || (m->n_read == 0 && m->n_write == 0));
     memset(m, 0, sizeof(*m));
     return true;
 }
@@ -265,12 +346,18 @@ bool meta_alias_conflict(const struct cap *frame, cap_rights_t want)
 #ifdef TARKA_SELFTEST
 void objmeta_test_freeze(const struct cap *c, bool frozen)
 {
-    struct obj_meta *m = obj_meta(c);
+    uint32_t *flags;
 
-    KASSERT(m != NULL);
+    if (c->type == CAP_UNTYPED) {
+        flags = (uint32_t *)&c->ut.flags;
+    } else {
+        struct obj_meta *m = obj_meta(c);
+        KASSERT(m != NULL);
+        flags = &m->flags;
+    }
     if (frozen)
-        m->flags |= OBJ_FROZEN;
+        *flags |= OBJ_FROZEN;
     else
-        m->flags &= ~OBJ_FROZEN;
+        *flags &= ~OBJ_FROZEN;
 }
 #endif
