@@ -1,12 +1,16 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3c, `2c517b1`; step 6). Revision 3d (stage 3
-findings, section "Revision 3d") is **proposed**, not yet accepted. Rule numbers SC1..SC32 are
+Status: accepted (revision 3d; step 6). Revision 3c was `2c517b1`;
+revision 3d (section "Revision 3d") amends it with the stage 3 findings. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3d** (proposed): three gaps found while planning stage 3,
-  with proposed fixes (D1-D3), and the stage 3 plan (D4-D9).
+- **Revision 3d** (this one): three gaps found while planning stage 3,
+  with their fixes (D1-D3), the identity/lifetime separation (D0), and
+  the stage 3 plan (D4-D9). Proposed in `8be48cf`; accepted after
+  review with two conditions, both written in: D1's invariant with
+  "detach is not destruction", and a well-founded termination proof
+  for D2.
 - **Revision 1** (`5502c54`): first draft.
 - **Revision 2** (`1fd873c`): idle thread, continuations, counters, W.
 - **Revision 3c** (this one) specifies the freeze lifecycle (SC22b): the
@@ -1266,10 +1270,26 @@ everything it depends on exists.
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
 
-## Revision 3d (proposed): stage 3 findings and plan
+## Revision 3d: stage 3 findings and plan
 
 Planning stage 3 against the code found three places where revision 3c
-does not hold as written. Each has a proposed fix; none is implemented.
+does not hold as written (D1-D3). Each fix below is accepted; stage 3
+implements them.
+
+**D0. Identity, capability finality and memory lifetime are separate
+questions,** each answered by exactly one piece of state. No piece of
+state may stand in for another: a zero count is not reuse, a matching
+address is not identity, a queue position is not ownership.
+
+| Question | The only authoritative state |
+|---|---|
+| Is this the same object? | address and serial, compared together (D3) |
+| Does any capability to it remain? | its live-record count (SC19a) |
+| Can a new capability to it be created? | not dying (R3), and not frozen on its carving chain (SC22a) |
+| Can its memory be reused? | its teardown is complete: the reaper's completing unit has dropped its Untyped's dying count (R0, R4, amended O7) |
+| Can an Untyped be deleted or reset? | no descendants and a dying count of 0 (amended O7, O8) |
+| Can a detached table be installed? | its filled-entry count is 0 (D1) |
+| In what order does the reaper work? | its list order, which decides only scheduling, never ownership or lifetime (D2) |
 
 **D1. Address-space teardown is not bounded by `UNIT_MAX`.** SC24 and
 SC26 take the most expensive single deletion to be an AddressSpace or
@@ -1281,8 +1301,24 @@ at most three, but the width is not: one uninstall can visit every
 installed table below it, up to 256·512·512 tables' worth of entries.
 That is a cost a user chooses, inside one entry, and it would break W.
 
-*Proposed fix (amends ADR 0007 V12 and V15):* removing a table detaches
-only that table and never walks below it.
+*Fix (amends ADR 0007 V12 and V15):* removing a table detaches only that
+table and never walks below it. **Detaching is not destroying the
+subtree.** Everything below a detached table stays exactly as it was,
+owned through the same capability relationships: each lower table is
+still installed in its parent and each frame still mapped, and their
+holders keep every right to unmap, uninstall and delete them. Only
+reachability changes: no address-space root leads there any more.
+
+**The invariant (V15', checked by the audit):**
+- A populated table that is not installed is inert: it is reachable from
+  no AddressSpace and no CPU can translate through it.
+- It cannot be installed into any address space.
+- It becomes installable only when its filled-entry count is 0.
+- `vspace_install()` reads the count itself, in the same non-preemptible
+  step that writes the parent entry, before the table becomes reachable.
+  It never relies on an earlier check by a caller.
+
+In detail:
 - **V15' (replacing V15). A populated table that is not installed is
   inert and cannot be installed.**
   - Uninstalling a table, or deleting its parent, clears one entry and
@@ -1303,7 +1339,7 @@ only that table and never walks below it.
   install check), kept in its frame metadata table entry where a Frame
   keeps its alias counts. A frame mapped in an inert table still counts
   as an alias (SC18), which is conservative: its holder can unmap it.
-- *Alternative considered:* a reaper-driven emptying state for detached
+- *Rejected alternative:* a reaper-driven emptying state for detached
   tables. It needs a reaper link and cursor per table (frame table
   entries grow again) and a new waiting state for install. V15' is
   smaller and needs no kernel-owned work.
@@ -1318,24 +1354,60 @@ dying objects may be listed behind the CNode on the same reaper. Revision
 contradict each other. Deleting U anyway is not an option: every dying
 object's back-pointer names U's record, which would dangle.
 
-*Proposed fix (amends R7):* **requeue, never wait.** If the reaper's
-next unit on a dying CNode would delete an Untyped U with no descendants
-but a non-zero dying count, the unit instead moves the CNode to the tail
-of its reaper list (O(1), counted as a unit).
-- **Progress.** U has no descendants, so nothing carved from U is live,
-  so U's dying count can only fall. All of U's dying objects are now
-  ahead of the CNode. Each is finished before the CNode is reached
-  again, unless it requeues too.
-- **No cycle of requeues.** A requeue of C on U waits only for objects
-  carved from U. There is no capability move, and an Untyped cannot be
-  copied, so U's record was created in C's slot after C existed. Every
-  object carved from U was created after U. So every object a requeue
-  waits for is strictly younger than the requeued object, and a chain
-  of requeues follows strictly increasing creation times. It cannot
-  close into a cycle.
-- **Bound.** Each requeue is O(1) work at a boundary (R5 still holds).
-  The total delay is the teardown of U's dying objects: work that U's
-  holder delegated (R8).
+*Fix (amends R7):* **requeue, never wait.** If the reaper's next unit
+on a dying CNode would delete an Untyped U with no descendants but a
+non-zero dying count, the unit instead moves the CNode to the tail of
+its reaper list (O(1), counted as a unit). The list order only decides
+what the reaper does next. Ownership and lifetime stay with the dying
+counts and O8 (D0).
+
+**Termination proof.** It uses the serials of D3: every object,
+Untyped included, gets one at creation from a counter that only
+increases, so a smaller serial means an earlier creation. Write
+X ⇒ Y ("X waits for Y") when a dying CNode X is requeued on an Untyped
+U whose record is in one of X's slots, and Y is a dying object carved
+from U.
+
+1. **A waited-for object is younger than the waiter.** If X ⇒ Y through
+   U, then serial(X) < serial(U) < serial(Y).
+   - serial(X) < serial(U): an Untyped capability is never copied (O2)
+     and no operation moves a record, so U's only record has been in
+     X's slot since U was created. Records in a CNode's slots can be
+     created only after the CNode exists: retype, derivation and
+     transfer all write into existing slots, and boot install writes
+     only into the root cspace, which is not a CNode object.
+   - serial(U) < serial(Y): Y was carved from U by a retype that used
+     U's capability, so U already existed.
+2. **⇒ has no cycles.** Serials strictly increase along every ⇒ chain,
+   so a chain can never return to where it started.
+3. **The set of objects X can wait for is fixed and finite once X is
+   dying.** No capability refers to X, so nothing but the reaper reaches
+   X's slots. So no retype can use an Untyped whose record is in X, and
+   everything ever to be carved from it already exists. The same holds
+   for every dying CNode further down ⇒. So the closure Dep*(X), all
+   objects reachable from X along ⇒, is a fixed finite set. Its total
+   remaining teardown work is also finite: no capability refers to a
+   dying object, so no waiter or record is ever added to one (R3, R7).
+4. **The dependency set only shrinks.** While X is requeued on U, U has
+   no descendants: nothing carved from U is live, so nothing new can die
+   from U, and U's dying count only falls (each fall is a teardown
+   completing).
+5. **At least one unit of real work separates any two requeues of X.**
+   Take, among the unfinished objects of Dep*(X), the one with the
+   largest serial, M. Everything M could wait for has a larger serial
+   (step 1). So it is finished, or not in Dep*(X), and M never requeues.
+   After X's requeue every other listed object is ahead of X, M
+   included. So before X is reached again, the reaper reaches M and does
+   at least one unit of M's real teardown (a waiter woken or a slot
+   deleted).
+6. **X finishes.** By steps 3 and 5, X is requeued at most as many times
+   as there are units of real work in Dep*(X), a finite number. Once its
+   dependencies are finished, U's dying count is 0 (step 4) and X
+   proceeds. Every requeue is one O(1) unit at a scheduling boundary, so
+   R5 still holds.
+7. **The delay is delegated work.** Everything X waits for was carved
+   from Untypeds that X's own slots held. That is work its holders chose
+   to create (R8).
 
 The same situation at user level needs no change: `cap_delete` on such
 an Untyped returns `T_EBUSY`, a plain retryable error.
@@ -1345,8 +1417,12 @@ must make room.** SC21 gives serials to endpoints, notifications and
 CNodes. But SC16 and F6 identify a revocation's target by (address,
 serial), and a revocation can target a record of any type. So every
 object with metadata needs a serial.
-- **Proposed:** `struct obj_meta` gains a 64-bit serial and becomes 32
-  bytes.
+- **The rule:** every kernel object that capabilities can name has a
+  serial that is never reused, and identity has one predicate for every
+  type, `same_object(a, b)`: same address **and** same serial. No
+  caller needs to know which types carry serials, because all of them
+  do.
+- `struct obj_meta` gains the 64-bit serial and becomes 32 bytes.
   - The frame metadata table grows to 32 bytes per page: 2.0 MiB at
     256 MiB of RAM (0.8%), up from 1.5 MiB.
   - Endpoints, notifications and threads have room in the object.
@@ -1430,6 +1506,11 @@ and boundaries. This is a single call site, not scheduler work.
   - the serial not compared
   - a serial reused
   - the requeue of D2 replaced by waiting, or by deleting U early
+  - `vspace_install()` not reading the filled-entry count, or a filled
+    count not maintained on map, unmap, install or uninstall (D1)
+  - a detach that walks below the detached table (caught by the work
+    bound once SC27 exists, and before that by a test that the lower
+    tables keep their entries)
 
 **D8. Audits added in stage 3 (the oracle stays independent).**
 - For every Untyped, the dying count equals the number of listed dying
@@ -1445,8 +1526,8 @@ and boundaries. This is a single call site, not scheduler work.
   AddressSpace.
 
 **D9. Cost accounting.** Fixed kernel memory, recorded in
-`ARCHITECTURE.md`: the frame metadata table (1.5 MiB at 256 MiB today;
-2.0 MiB with D3). Endpoints and notifications are 128 bytes.
+`ARCHITECTURE.md`: the frame metadata table (1.5 MiB at 256 MiB at
+stage 2; 2.0 MiB from stage 3, with D3). Endpoints and notifications are 128 bytes.
 
 ## Implementation notes
 

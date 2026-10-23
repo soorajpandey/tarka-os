@@ -141,6 +141,13 @@ copy's mapping.
   the active address space, switches the CPU to the kernel's master PML4
   first.
 
+  *Amended by ADR 0010 revision 3d (D1), implemented at its stage 3:*
+  deleting a PageTable removes it from its parent and clears **its own**
+  entries only (at most 512), marking each direct child capability as no
+  longer mapped or installed. Deleting an AddressSpace does the same for
+  its 256 user entries. Lower tables are not walked: they become inert
+  (V15') and keep their contents.
+
 After any deletion, no hardware entry and no shadow pointer refers to a
 deleted capability, and no capability refers to a deleted table.
 
@@ -152,6 +159,26 @@ table could install it into a different address space and expose every
 frame in it there, without anyone using a frame capability for that
 address space, bypassing V9. The subtree is at most three levels deep, so
 teardown is bounded.
+
+*Superseded by V15' (ADR 0010 revision 3d, D1; implemented at its stage
+3).* "At most three levels deep" bounds the depth of that teardown, not
+its width: one uninstall could walk every table below it, so the work
+of one entry was chosen by the caller. The replacement keeps V15's
+purpose without walking:
+
+**V15'. A populated table that is not installed is inert and cannot be
+installed.**
+- Uninstalling a table, or deleting its parent, clears one entry and
+  flushes the TLB. **Detaching is not destroying the subtree:** the
+  table keeps its entries, every lower table stays installed in it and
+  every frame stays mapped, all owned by the same capabilities as
+  before, whose holders can still unmap, uninstall and delete them.
+  Nothing is reachable through it: no address-space root leads to it.
+- Each table keeps a count of its filled entries. `vspace_install()`
+  refuses a table whose count is not 0 with `T_EBUSY`. It reads the
+  count itself, in the same step that makes the table reachable.
+- So nobody can expose a table's frames in another address space by
+  moving the table, because a populated table never moves.
 
 ### TLB invalidation
 

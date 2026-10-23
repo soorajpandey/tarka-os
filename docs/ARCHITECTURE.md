@@ -72,7 +72,7 @@ user space as Untyped:
 | What | Size | Notes |
 |---|---|---|
 | Frame bitmaps (`core/pmm.c`) | 2 bits per page | `used` and `managed` |
-| Frame metadata table (`core/objmeta.c`) | 24 bytes per page: 1.5 MiB at 256 MiB of RAM (0.6%) | ADR 0010 SC18; 32 bytes per page (2.0 MiB) if revision 3d's D3 is accepted |
+| Frame metadata table (`core/objmeta.c`) | 24 bytes per page: 1.5 MiB at 256 MiB of RAM (0.6%) | ADR 0010 SC18; becomes 32 bytes per page (2.0 MiB, 0.8%) at stage 3 to hold a serial for every object (revision 3d, D3) |
 | Kernel reserve | 8 MiB (`KERNEL_RESERVE_FRAMES`) | kernel page tables, stacks and other `pmm_alloc()` use |
 
 Per-object kernel state lives in memory the object's creator supplied
