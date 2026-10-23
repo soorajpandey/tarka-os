@@ -160,6 +160,13 @@ void vspace_activate_kernel(void)
     load_cr3(master_pml4);
 }
 
+void vspace_activate_cap(const struct cap *as)
+{
+    KASSERT(as->type == CAP_ADDRESS_SPACE);
+    if (pa_raw(cr3_pa()) != pa_raw(cap_obj_paddr(as)))
+        load_cr3(cap_obj_paddr(as));
+}
+
 int vspace_activate(struct cspace *cs, cap_slot_t as)
 {
     const struct cap *a;

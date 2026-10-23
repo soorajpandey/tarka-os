@@ -8,6 +8,7 @@
 #define CR0_TS   (1ull << 3)
 #define CR0_NE   (1ull << 5)
 #define CR0_WP   (1ull << 16)
+#define CR0_AM   (1ull << 18)
 #define CR4_OSFXSR     (1ull << 9)
 #define CR4_OSXMMEXCPT (1ull << 10)
 #define CR4_OSXSAVE    (1ull << 18)

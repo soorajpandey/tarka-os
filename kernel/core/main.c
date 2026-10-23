@@ -3,6 +3,7 @@
 #include <tarka/selftest.h>
 #include <tarka/untyped.h>
 #include <tarka/thread.h>
+#include <tarka/user.h>
 #include <tarka/vspace.h>
 
 #include <limine.h>
@@ -81,6 +82,7 @@ __noreturn __no_canary void kmain(void)
     untyped_boot();
     vspace_boot();
     thread_boot();
+    user_boot();
 
 #ifdef TARKA_SELFTEST
     selftest_run();

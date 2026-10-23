@@ -99,6 +99,10 @@ __must_check int thread_get_state(struct cspace *cs, cap_slot_t thr, uint32_t *o
 /* Scheduler interface (step 4: a minimal FIFO run queue). */
 struct thread *runq_pop(void);
 bool runq_empty(void);
+void thread_enqueue(struct thread *t);
+
+/* T4: may this thread's saved state be loaded and run? */
+bool thread_runnable_safe(const struct thread *t);
 
 /* The thread object behind a Thread capability (kernel use only). */
 struct thread *thread_of(const struct cap *c);

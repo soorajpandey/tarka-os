@@ -28,6 +28,10 @@ __must_check int vspace_protect(struct cspace *cs, cap_slot_t frame, cap_rights_
 __must_check int vspace_activate(struct cspace *cs, cap_slot_t as);
 void vspace_activate_kernel(void);
 
+/* Load the AddressSpace named by a capability (kernel use: the return
+ * path, where the capability is a thread's binding). */
+void vspace_activate_cap(const struct cap *as);
+
 /* Structural audit of one AddressSpace (ADR 0007 tests): kernel half equal
  * to the master and supervisor-only; every user entry backed by a shadow
  * pointer to the capability that filled it, and vice versa; every leaf a

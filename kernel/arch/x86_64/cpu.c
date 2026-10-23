@@ -32,7 +32,10 @@ void cpu_init(void)
     cpuid(0, 0, &max_leaf, &b, &c, &d);
     cpuid(0x80000000u, 0, &max_ext, &b, &c, &d);
 
-    write_cr0(read_cr0() | CR0_WP);
+    /* AM: alignment checking for ring 3 when the user sets RFLAGS.AC, so
+     * misalignment is a reportable user fault (#AC). It never applies in
+     * ring 0, where AC is always clear (ADR 0008, T32). */
+    write_cr0(read_cr0() | CR0_WP | CR0_AM);
     cpu_sec.wp = true;
 
     if (max_ext >= 0x80000001u) {
@@ -67,6 +70,10 @@ void cpu_init(void)
 
     if (!cpu_sec.nx)
         panic("CPU lacks NX support; refusing to boot without W^X");
+    /* The user boundary depends on SMEP and SMAP (K3, ADR 0008 T32), and
+     * every entry stub executes clac, which needs SMAP. */
+    if (!cpu_sec.smep || !cpu_sec.smap)
+        panic("CPU lacks SMEP/SMAP; refusing to boot without user-memory isolation");
 
     kprintf("cpu: WP=%d NX=%d SMEP=%d SMAP=%d UMIP=%d RDRAND=%d\n",
             cpu_sec.wp, cpu_sec.nx, cpu_sec.smep, cpu_sec.smap, cpu_sec.umip,

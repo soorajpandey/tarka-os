@@ -4,6 +4,7 @@
 #include "gdt.h"
 
 #include <tarka/kernel.h>
+#include <tarka/selftest.h>
 
 struct idt_entry {
     uint16_t off_lo;
@@ -22,7 +23,7 @@ struct idtr {
 
 static struct idt_entry idt[256];
 
-extern const uint64_t isr_table[32];
+extern const uint64_t isr_table[256];
 
 static const char *const exc_names[32] = {
     "#DE divide error", "#DB debug", "NMI", "#BP breakpoint",
@@ -35,13 +36,13 @@ static const char *const exc_names[32] = {
     "#HV hypervisor injection", "#VC VMM communication", "#SX security", "reserved",
 };
 
-static void set_gate(int vec, uint64_t handler, uint8_t ist)
+static void set_gate(int vec, uint64_t handler, uint8_t ist, unsigned dpl)
 {
     idt[vec] = (struct idt_entry){
         .off_lo = handler & 0xFFFF,
         .sel = GDT_KCODE,
         .ist = ist,
-        .type_attr = 0x8E, /* present, DPL0, 64-bit interrupt gate */
+        .type_attr = (uint8_t)(0x8E | (dpl << 5)), /* present, 64-bit interrupt gate */
         .off_mid = (handler >> 16) & 0xFFFF,
         .off_hi = handler >> 32,
     };
@@ -49,23 +50,24 @@ static void set_gate(int vec, uint64_t handler, uint8_t ist)
 
 void idt_init(void)
 {
-    for (int i = 0; i < 32; i++)
-        set_gate(i, isr_table[i], 0);
-    set_gate(2, isr_table[2], IST_NMI);
-    set_gate(8, isr_table[8], IST_DOUBLE_FAULT);
-    set_gate(18, isr_table[18], IST_MC);
+    /* Interrupt gates (IF cleared on entry) for every vector. DPL 0, so
+     * `int n` from user mode raises #GP, except #BP: `int3` is how user
+     * code (debuggers) asks for a breakpoint, and it must arrive as #BP. */
+    for (int i = 0; i < 256; i++)
+        set_gate(i, isr_table[i], 0, 0);
+    set_gate(3, isr_table[3], 0, 3);
+    set_gate(2, isr_table[2], IST_NMI, 0);
+    set_gate(8, isr_table[8], IST_DOUBLE_FAULT, 0);
+    set_gate(18, isr_table[18], IST_MC, 0);
 
     struct idtr idtr = { .limit = sizeof(idt) - 1, .base = (uint64_t)idt };
     __asm__ volatile("lidt %0" : : "m"(idtr));
 }
 
-void isr_dispatch(struct trap_frame *tf)
+static __noreturn void fatal(const struct trap_frame *tf, const char *where)
 {
-    const char *name = tf->vector < 32 ? exc_names[tf->vector] : "unknown";
+    const char *name = tf->vector < 32 ? exc_names[tf->vector] : "interrupt";
 
-    /* No exception is recoverable yet; every fault in kernel mode is a bug.
-     * Once user space exists, user faults will be delivered to the faulting
-     * task's fault-handler endpoint instead of panicking the kernel. */
     if (tf->vector == 14) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -79,5 +81,32 @@ void isr_dispatch(struct trap_frame *tf)
             tf->rip, tf->cs, tf->rflags, tf->rsp, tf->ss);
     kprintf("rax=%#lx rbx=%#lx rcx=%#lx rdx=%#lx\n", tf->rax, tf->rbx, tf->rcx, tf->rdx);
     kprintf("rsi=%#lx rdi=%#lx rbp=%#lx\n", tf->rsi, tf->rdi, tf->rbp);
-    panic("unhandled exception %lu: %s (error %#lx)", tf->vector, name, tf->error);
+    panic("unhandled exception %lu in %s: %s (error %#lx)", tf->vector, where, name, tf->error);
+}
+
+/* Entries that interrupted kernel code (ring 0). The kernel runs with
+ * interrupts disabled, so only stray interrupt vectors are tolerated;
+ * every exception is a kernel bug (T30). */
+void isr_dispatch(struct trap_frame *tf)
+{
+    if (tf->vector >= 32)
+        return; /* spurious: nothing is configured to raise it */
+    fatal(tf, "kernel mode");
+}
+
+/* NMI, #DF and #MC, from any context, on their own IST stacks (T32). */
+void paranoid_dispatch(struct trap_frame *tf);
+void paranoid_dispatch(struct trap_frame *tf)
+{
+    if (tf->vector == 2) {
+#ifdef TARKA_SELFTEST
+        uint64_t rflags;
+        __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+        entry_obs.nmis++;
+        entry_obs.nmi_last_rflags = rflags;
+        entry_obs.nmi_last_from_user = (tf->cs & 3) == 3;
+#endif
+        return;
+    }
+    fatal(tf, tf->vector == 8 ? "double fault" : "machine check");
 }

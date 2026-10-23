@@ -15,12 +15,15 @@
 #include <tarka/string.h>
 #include <tarka/thread.h>
 #include <tarka/untyped.h>
+#include <tarka/user.h>
+#include <tarka/syscall.h>
 #include <tarka/vspace.h>
 
 #include "cap_internal.h"
 
 #include "../arch/x86_64/cpu.h"
 #include "../arch/x86_64/paging.h"
+#include "../arch/x86_64/gdt.h"
 #include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/qemu.h"
 #include "../arch/x86_64/stacks.h"
@@ -1223,6 +1226,233 @@ static void test_thread_lifecycle(void)
     CHECK(runq_empty());
 }
 
+/* ---- Ring 3 (ADR 0008) ---- */
+
+#define UCODE_VA   0x400000ull
+#define UDATA_VA   0x401000ull
+#define USTACK_TOP 0x403000ull
+
+#define PROGS(X) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
+    X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
+    X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
+#define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
+PROGS(DECL)
+#define P(n) prog_##n##_start, prog_##n##_end
+
+/* A complete task in uts slots b..b+8: AS, three page tables, code / data /
+ * stack frames, a cspace and a thread, made runnable. With `at_top`, the
+ * program is placed so that it ends exactly at USER_TOP. */
+enum { T_AS, T_PT, T_CODE = 4, T_DATA, T_STACK, T_CS, T_THR, T_SLOTS };
+
+static bool spawn(cap_slot_t b, const char *start, const char *end, bool at_top,
+                  struct user_regs *init)
+{
+    uint64_t region = at_top ? USER_TOP - (2ull << 20) : UCODE_VA;
+    uint64_t code_va = at_top ? USER_TOP - PAGE_SIZE : UCODE_VA;
+    size_t len = (size_t)(end - start);
+
+    if (len > PAGE_SIZE ||
+        cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, b + T_AS, 1) != T_OK ||
+        cap_retype(&uts, 0, CAP_PAGE_TABLE, 0, &uts, b + T_PT, 3) != T_OK ||
+        cap_retype(&uts, 0, CAP_FRAME, 0, &uts, b + T_CODE, 3) != T_OK ||
+        cap_retype(&uts, 0, CAP_CNODE, 2, &uts, b + T_CS, 1) != T_OK ||
+        cap_retype(&uts, 0, CAP_THREAD, 0, &uts, b + T_THR, 1) != T_OK)
+        return false;
+    if (vspace_install(&uts, b + T_AS, b + T_PT, ua(ALIGN_DOWN(region, 1ull << 39)), 1) ||
+        vspace_install(&uts, b + T_AS, b + T_PT + 1, ua(ALIGN_DOWN(region, 1ull << 30)), 2) ||
+        vspace_install(&uts, b + T_AS, b + T_PT + 2, ua(region), 3))
+        return false;
+
+    uint8_t *code = phys_to_virt(cap_obj_paddr(&ut_store[b + T_CODE]));
+    memcpy(code + (at_top ? PAGE_SIZE - len : 0), start, len);
+    if (vspace_map(&uts, b + T_AS, b + T_CODE, ua(code_va), RX) ||
+        (!at_top && (vspace_map(&uts, b + T_AS, b + T_DATA, ua(UDATA_VA), RW) ||
+                     vspace_map(&uts, b + T_AS, b + T_STACK, ua(USTACK_TOP - PAGE_SIZE), RW))))
+        return false;
+
+    if (thread_bind(&uts, b + T_THR, TS_ASPACE, &uts, b + T_AS) ||
+        thread_bind(&uts, b + T_THR, TS_CSPACE, &uts, b + T_CS))
+        return false;
+    struct user_regs r = init ? *init : (struct user_regs){ 0 };
+    r.rip = at_top ? USER_TOP - len : code_va;
+    r.rsp = USTACK_TOP;
+    return thread_write_regs(&uts, b + T_THR, &r) == T_OK &&
+           thread_resume(&uts, b + T_THR) == T_OK;
+}
+
+static uint32_t tstate(cap_slot_t b)
+{
+    uint32_t st;
+    return thread_get_state(&uts, b + T_THR, &st) == T_OK ? st : 0xFFFFFFFF;
+}
+
+static struct fault_record tfault(cap_slot_t b)
+{
+    struct fault_record f;
+    if (thread_read_fault(&uts, b + T_THR, &f) != T_OK)
+        f = (struct fault_record){ .vector = 0xFFFF };
+    return f;
+}
+
+static void run_user(void)
+{
+    test_report_count = 0;
+    sched_run();
+}
+
+static void test_user_basics(void)
+{
+    uint64_t viol = entry_obs.violations;
+
+    /* Privilege and flags from ring 3. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL));
+    run_user();
+    CHECK(test_report_count == 1);
+    CHECK(test_reports[0].a == (GDT_UCODE | 3) && test_reports[0].b == (GDT_UDATA | 3));
+    CHECK((test_reports[0].c & RFLAGS_IF) && !(test_reports[0].c & (3u << 12)));
+    CHECK(test_reports[0].d == 0x7a72);
+    CHECK(tstate(10) == THREAD_INACTIVE);       /* exited */
+    CHECK(cr3_is_kernel(read_cr3() & 0x000FFFFFFFFFF000ull) && this_cpu()->current == NULL);
+    ut_teardown();
+
+    /* T7, T28: a new thread finds nothing of anyone else's. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(fresh), false, NULL));
+    run_user();
+    CHECK(test_report_count == 1);
+    CHECK(test_reports[0].a == 0 && test_reports[0].b == 0);
+    CHECK(test_reports[0].c == 0x037F && test_reports[0].d == MXCSR_DEFAULT);
+    ut_teardown();
+
+    /* T6: vector and x87 state across a switch, in both directions. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(fpu_a), false, NULL));
+    CHECK(spawn(20, P(fpu_b), false, NULL));
+    run_user();
+    CHECK(test_report_count == 2);
+    CHECK(test_reports[0].d == 2 && test_reports[0].a == 0 && test_reports[0].b == 0);
+    CHECK(((test_reports[0].c >> 11) & 7) == 0);
+    CHECK(test_reports[1].d == 1 && test_reports[1].a == 0x1122334455667788ull &&
+          test_reports[1].b == 0x1122334455667788ull);
+    CHECK(test_reports[1].c == 0x400921FB54442D18ull); /* pi */
+    ut_teardown();
+
+    /* T20, T18: 2000 round trips preserve every register, via SYSRET. */
+    uint64_t sysrets = entry_obs.sysret_returns;
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(preserve), false, NULL));
+    run_user();
+    CHECK(test_report_count == 1 && test_reports[0].a == 0 && test_reports[0].b == 2000);
+    CHECK(entry_obs.sysret_returns - sysrets >= 2000);
+    ut_teardown();
+
+    /* T31: unknown syscall numbers are errors, not faults. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(badsys), false, NULL));
+    run_user();
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EINVAL);
+    CHECK(tstate(10) == THREAD_INACTIVE);
+    ut_teardown();
+
+    CHECK(entry_obs.violations == viol);
+}
+
+/* T9, T15, T32: AC never reaches the kernel; FS/GS bases are the thread's. */
+static void test_user_entry_state(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(ac), false, NULL));
+    run_user();
+    CHECK(test_report_count == 1 && test_reports[0].a == 0xac);
+    CHECK(test_reports[0].user_rflags & (1u << 18));          /* user had AC */
+    CHECK(!(test_reports[0].kernel_rflags & (1u << 18)));     /* kernel did not */
+    CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6);
+    CHECK(entry_obs.last_user_rflags & (1u << 18));           /* exception path too */
+    CHECK(!(entry_obs.last_rflags & (1u << 18)) && !(entry_obs.last_rflags & (1u << 10)));
+    ut_teardown();
+
+    CHECK(ut_setup(20));
+    struct user_regs r = { .fs_base = UDATA_VA, .gs_base = UDATA_VA + 8 };
+    CHECK(spawn(10, P(segbase), false, &r));
+    uint64_t *data = phys_to_virt(cap_obj_paddr(&ut_store[10 + T_DATA]));
+    data[0] = 0xF5F5F5F5ull;
+    data[1] = 0x65656565ull;
+    run_user();
+    CHECK(test_report_count == 1);
+    CHECK(test_reports[0].a == 0xF5F5F5F5ull && test_reports[0].b == 0x65656565ull);
+    CHECK(rdmsr(MSR_GS_BASE) == (uint64_t)this_cpu());        /* kernel GS restored */
+    ut_teardown();
+}
+
+/* T29: every user fault faults the thread, never the kernel. */
+static void test_user_faults(void)
+{
+    /* `alt` is what QEMU's software emulator (TCG) produces where it
+     * deviates from hardware: page faults for non-canonical accesses, and no
+     * #XM or #AC at all (the programs then reach their trailing ud2). The
+     * thread is faulted and the kernel survives either way; the hardware
+     * vectors still need confirming on real hardware or KVM. */
+    static const struct {
+        const char *s, *e;
+        uint64_t vector, alt;
+    } cases[] = {
+        { P(f_ud), 6, 6 },  { P(f_bp), 3, 3 },  { P(f_de), 0, 0 },  { P(f_pf_read), 14, 14 },
+        { P(f_pf_write), 14, 14 }, { P(f_pf_exec), 14, 14 }, { P(f_gp_hlt), 13, 13 },
+        { P(f_gp_io), 13, 13 }, { P(f_gp_int), 13, 13 }, { P(f_gp_noncanon), 13, 14 },
+        { P(f_ss), 12, 14 }, { P(f_xm), 19, 6 }, { P(f_ac), 17, 6 },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        CHECK(ut_setup(20));
+        CHECK(spawn(10, cases[i].s, cases[i].e, false, NULL));
+        run_user();
+        struct fault_record f = tfault(10);
+        CHECK(tstate(10) == THREAD_FAULTED);
+        CHECK(f.vector == cases[i].vector || f.vector == cases[i].alt);
+        if (f.vector != cases[i].vector)
+            kprintf("    note: fault case %zu raised vector %lu (hardware: %lu)\n", i, f.vector,
+                    cases[i].vector);
+        if (cases[i].s == prog_f_pf_read_start)
+            CHECK(f.addr == 0x10 && (f.error & 7) == 4);        /* user, read, not present */
+        if (cases[i].s == prog_f_pf_write_start)
+            CHECK(f.addr >= UCODE_VA && f.addr < UCODE_VA + PAGE_SIZE && (f.error & 7) == 7);
+        if (cases[i].s == prog_f_pf_exec_start)
+            CHECK(f.addr == UDATA_VA && (f.error & 16) && (f.error & 5) == 5);
+        ut_teardown();
+    }
+
+    /* Two faulting threads and a healthy one: the healthy one still runs. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(f_ud), false, NULL));
+    CHECK(spawn(20, P(hello), false, NULL));
+    CHECK(spawn(30, P(f_gp_hlt), false, NULL));
+    run_user();
+    CHECK(tstate(10) == THREAD_FAULTED && tstate(30) == THREAD_FAULTED);
+    CHECK(tstate(20) == THREAD_INACTIVE && test_report_count == 1);
+    ut_teardown();
+}
+
+/* T17, T18: a syscall in the last two bytes of user space. Its return
+ * address is USER_TOP, which is non-canonical: SYSRET there would fault in
+ * ring 0 on the user's stack (CVE-2012-0217). The kernel must neither
+ * SYSRET nor IRETQ to it; the thread is faulted instead. */
+static void test_user_sysret_edge(void)
+{
+    uint64_t sysrets = entry_obs.sysret_returns, irets = entry_obs.iret_returns;
+    struct user_regs r = { .rax = SYS_TEST_REPORT, .rdi = 0xED6E };
+
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(sysret_edge), true, &r));
+    run_user();
+    CHECK(test_report_count == 1 && test_reports[0].a == 0xED6E); /* the syscall ran */
+    CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == VEC_BAD_STATE);
+    CHECK(tfault(10).rip == USER_TOP);
+    CHECK(entry_obs.sysret_returns == sysrets);           /* never SYSRET */
+    CHECK(entry_obs.iret_returns == irets + 1);           /* only the initial entry */
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1264,6 +1494,10 @@ static const struct {
     { "percpu_fpu", test_percpu_fpu },
     { "thread_regs", test_thread_regs },
     { "thread_lifecycle", test_thread_lifecycle },
+    { "user_basics", test_user_basics },
+    { "user_entry_state", test_user_entry_state },
+    { "user_faults", test_user_faults },
+    { "user_sysret_edge", test_user_sysret_edge },
     { "cpu_hardening", test_cpu_hardening },
 };
 

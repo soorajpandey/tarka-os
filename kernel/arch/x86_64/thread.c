@@ -78,8 +78,13 @@ bool user_regs_valid(const struct user_regs *r)
            (r->rflags & ~(uint64_t)RFLAGS_USER_MASK) == 0;
 }
 
+void thread_enqueue(struct thread *t)
+{
+    runq_push(t);
+}
+
 /* T4: the conditions for being runnable. */
-static bool runnable_safe(const struct thread *t)
+bool thread_runnable_safe(const struct thread *t)
 {
     return t->bind[TS_ASPACE].type == CAP_ADDRESS_SPACE &&
            t->bind[TS_CSPACE].type == CAP_CNODE &&
@@ -231,7 +236,7 @@ int thread_resume(struct cspace *cs, cap_slot_t thr)
         return rc;
     if (t->state == THREAD_RUNNABLE || t->state == THREAD_RUNNING)
         return T_EBUSY;
-    if (!runnable_safe(t))
+    if (!thread_runnable_safe(t))
         return T_EPERM;             /* T4 */
     t->state = THREAD_RUNNABLE;
     t->ret_path = RETURN_IRET;
