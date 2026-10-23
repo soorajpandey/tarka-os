@@ -1,15 +1,22 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3d; step 6). Revision 3c was `2c517b1`;
-revision 3d (section "Revision 3d") amends it with the stage 3 findings.
-Revision 3e (section "Revision 3e", stage 4 findings) is **proposed**,
-not yet accepted. Rule numbers SC1..SC32 are
+Status: accepted (revision 3e; step 6). Revision 3c was `2c517b1`.
+Revisions 3d and 3e (sections "Revision 3d" and "Revision 3e") amend it
+with the stage 3 and stage 4 findings. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3e** (proposed): four gaps found while planning stage 4
-  (E1-E4), and the stage 4 plan (E5-E9).
-- **Revision 3d**: three gaps found while planning stage 3,
+- **Revision 3e** (this one): four gaps found while planning stage 4
+  (E1-E4), the stage 4 plan (E5-E10), and E0 as stage 4's master
+  invariant. Proposed in `fef2565`; accepted after review, with these
+  added from it:
+  - E1's eight properties stated outright
+  - E2's invariant worded exactly, its snapshot taken from the
+    endpoint's own queue and carried as a cursor
+  - E3's measure proved lexicographic: a chunk with no progress needs
+    reaper progress before the next one
+  - E4's impossible states listed
+- **Revision 3d** (`b748a52`): three gaps found while planning stage 3,
   with their fixes (D1-D3), the identity/lifetime separation (D0), and
   the stage 3 plan (D4-D9). Proposed in `8be48cf`; accepted after
   review with two conditions, both written in: D1's invariant with
@@ -17,7 +24,7 @@ History:
   for D2.
 - **Revision 1** (`5502c54`): first draft.
 - **Revision 2** (`1fd873c`): idle thread, continuations, counters, W.
-- **Revision 3c** (this one) specifies the freeze lifecycle (SC22b): the
+- **Revision 3c** (`2c517b1`) specifies the freeze lifecycle (SC22b): the
   invariant F1 on every CDT mutation; ownership; a second revocation;
   cancellation and `T_EINTR`; reaper-owned freezes; enclosing
   revocations; and the carving-chain proof. The freeze design and the
@@ -1274,19 +1281,37 @@ everything it depends on exists.
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
 
-## Revision 3e (proposed): stage 4 findings and plan
+## Revision 3e: stage 4 findings and plan
 
 Planning stage 4 (continuations, the receive drain, revocation with the
 freeze, the retype limit) against the code found four places where the
-accepted text does not hold as written (E1-E4). None is implemented.
+accepted text does not hold as written (E1-E4). The fixes below are
+accepted; stage 4 implements them.
 
-**E0. The rule every part below follows.** A continuation never owns an
-object. It holds values: captured inputs, a slot number, an identity
-(type, address, serial: D0, D3) and a logical cursor. Every chunk
-resolves the slot again in the thread's current cspace, compares the
-identity with `obj_identity_is()`, and only then touches the object. A
-mismatch ends the operation with the error a fresh lookup would give,
-or with `T_EINTR` if the operation was cancelled (E1).
+**E0. Stage 4's master invariant.** A continuation contains no kernel
+object pointer. It contains only immutable values and logical progress
+state:
+- the captured inputs
+- a slot number
+- an identity (type, address, serial: D0, D3)
+- a cursor
+
+Every chunk resolves its target again and validates its identity before
+it touches the target. The slot is only where to look; the identity is
+what to find. Every stage 4 operation is an instance of one pattern:
+
+```
+capture inputs -> store values -> continuation
+  each chunk: resolve the slot -> validate identity, lifecycle, freeze
+              -> bounded work -> commit progress
+              -> finish (write the result) or keep the continuation
+```
+
+A mismatch ends the operation:
+- with the error a fresh lookup would give
+- or, for a revocation whose root mark has gone, with `T_EINTR` (E1)
+
+It never ends with a wrong object.
 
 **E1. A frozen object has no room to record its owner.** F3 says "the
 frozen object records its owner as an internal reference", and F5
@@ -1325,6 +1350,28 @@ revocation's **root record**, not on the object.
   and the freeze if they are still its own, and discards the
   continuation.
 
+**E1's properties, each enforced and audited:**
+1. `CAP_R_REVOKING` is kernel-only.
+2. It is never copied by derivation, never transferred by IPC, never
+   reported by `cap_identify`, and a user rights mask cannot set it.
+3. A marked root is deleted only through the cancellation or abandonment
+   funnel: `cap_delete` on it returns `T_EBUSY`. Every other deletion
+   path (an enclosing revocation, the reaper) cancels first.
+4. An object has at most one marked root record, because F4 refuses a
+   second revocation of a frozen object.
+5. The continuation holds the root's identity (type, address, serial),
+   not only its slot.
+6. A chunk resumes only if the record at the slot exists, has that
+   identity, **and** is marked; otherwise `T_EINTR`.
+7. Cancellation clears the mark and releases the freeze in one step,
+   which nothing can observe half-done (the kernel is not preemptible).
+   After that step the continuation can never act again: its next
+   resolution fails by property 6.
+8. A record created later in the same slot is never taken for the root:
+   it carries no mark (properties 2 and 6). Its identity also differs,
+   unless it is another record of the same object, and then the
+   missing mark alone decides.
+
 **E2. A chunked `reply_recv` would let strangers delay someone else's
 reply without bound.** SC25 commits `reply_recv`'s reply only after the
 drain. One pass drained the senders present at the call. A chunked
@@ -1347,29 +1394,70 @@ waits too. That breaks SC14's "no third party is affected".
   chunks, with k fixed when the call began. That is what one pass
   gave, chunked.
 
+**E2's invariant, exactly:** the part of `reply_recv` that can delay the
+atomic commit of the reply is bounded by the endpoint's sender queue as
+it was when `reply_recv` was invoked. Senders that arrive later belong
+to the ordinary receive that follows the commit.
+- **k is taken once,** in the first chunk, from the endpoint's own
+  queue: the kernel counts the queued senders. Nothing from the caller
+  is used, and it is never recomputed.
+- **It is carried as a cursor,** `remaining_initial_drain`, which only
+  decreases (one per failed sender). The reply commits when the cursor
+  reaches 0, the head is deliverable, or the queue is empty, whichever
+  comes first.
+
 **E3. Revocation's progress measure ignores stage 3.** SC30 measures a
 revocation by the records left in its subtree. Since stage 3, a
 revocation can reach an Untyped whose dying objects are still being torn
 down (amended O8). It cannot delete that Untyped yet, so the chunk
 deletes nothing and the measure does not fall.
 
-*Proposed fix (amends SC30):*
-- The measure becomes the pair (records in the subtree, reaper units
-  still owed by the dying objects of the Untypeds the revocation is
-  blocked on), compared lexicographically.
-- A chunk that deletes nothing ends at once and yields. The reaper
-  runs at every boundary, so the second component falls between any
-  two such chunks.
-- Neither component can grow:
-  - the first, by the freeze
-  - the second, because the blocking Untyped has no descendants, so
-    nothing new can die from it (D2 step 4)
+*Fix (amends SC30):* the measure is the pair M = (R, B), compared
+lexicographically (first R, then B):
+- **R:** the records in the revocation's subtree.
+- **B:** while the revocation is blocked on an Untyped V (no
+  descendants, dying count non-zero), the number of reaper units the
+  reaper will still perform before V's dying count reaches 0. Otherwise
+  B is 0.
+
+**Proof that M strictly decreases between any two chunks:**
+1. **R never grows** while the revocation runs: the freeze admits no new
+   record into the subtree (SC22a, F1).
+2. **B is a finite natural number.** V has no descendants, so nothing
+   new can die from V, and V's dying objects are finished after finitely
+   many reaper units (D2 steps 3-6, R7).
+3. **A chunk that deletes a record** decreases R. B may then take any
+   value: the order is lexicographic.
+4. **A chunk that deletes nothing** does so only because the next victim
+   is such a V. It ends at once: the thread yields to the tail of the
+   run queue, so a scheduling boundary passes before its next chunk.
+5. **At every boundary** the reaper performs at least one unit while its
+   list is non-empty (R5, `REAP_CHUNK` ≥ 1), and the list is non-empty
+   while V's dying count is non-zero. So B falls by at least 1 before
+   the next chunk, and R does not grow (step 1).
+
+So no two consecutive chunks leave M unchanged. The sequence of
+"revoke chunk, no deletion, no reaper progress, revoke chunk" cannot
+occur, and the revocation finishes.
 
 **E4. The dispatch path needs one hook.** SC16 says a dispatched thread
 with a continuation runs its next chunk instead of entering user mode.
 Today `schedule()` always enters user mode. Stage 4 adds that one branch
-there, and an audit rule: a continuation exists only on a RUNNABLE or
-RUNNING thread. This is the continuation machinery, not stage 5
+there: a dispatched thread with a continuation runs one bounded chunk;
+otherwise it enters user mode as before.
+
+The audit rule: a continuation exists only on a RUNNABLE or RUNNING
+thread. These combinations are impossible, and the audit checks each:
+- BLOCKED (any kind) with a continuation
+- INACTIVE with a continuation
+- FAULTED with a continuation (a continuation never runs user code, so
+  it cannot fault)
+- a dying or destroyed thread with a continuation (`thread_stop()` runs
+  before a thread's finaliser completes)
+
+Every stop (suspend, exit, destruction, binding loss) goes through the
+one funnel, `thread_stop()` → abandonment (E1, F6), before the state
+changes. This is the continuation machinery, not stage 5
 scheduler work: there are no per-CPU queues, no idle thread and no
 timer.
 
