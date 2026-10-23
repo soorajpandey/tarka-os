@@ -1,14 +1,21 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3e; step 6). Revision 3c was `2c517b1`.
-Revisions 3d and 3e (sections "Revision 3d" and "Revision 3e") amend it
-with the stage 3 and stage 4 findings. Revision 3f (section "Revision
-3f", stage 5 findings) is **proposed**, not yet accepted. Rule numbers SC1..SC32 are
+Status: accepted (revision 3f; step 6). Revision 3c was `2c517b1`.
+Revisions 3d, 3e and 3f (sections "Revision 3d", "Revision 3e" and
+"Revision 3f") amend it with the stage 3, 4 and 5 findings. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3f** (proposed): the stage 5 audit of SC1-SC8 and SC29
-  against the code: gaps G1-G5, and the stage 5 plan (G6-G10).
+- **Revision 3f** (this one): the stage 5 audit of SC1-SC8 and SC29
+  against the code: gaps G1-G5, the stage 5 plan (G6-G10), and the
+  pairing rule G11. Proposed in `3b0c7fc`; accepted after review, with
+  these added from it:
+  - G3's lifetime ordering for a thread that destroys itself
+  - G4's line between the pre-HLT test escape and the real halt
+  - G5's O(1) limited to the scheduler's own state change
+  - G8's audit derived independently of the scheduler's bookkeeping
+  - G9's refusals that change nothing
+  - G11 (new)
 - **Revision 3e** (`16091f1`): four gaps found while planning stage 4
   (E1-E4), the stage 4 plan (E5-E10), and E0 as stage 4's master
   invariant. Proposed in `fef2565`; accepted after review, with these
@@ -1284,12 +1291,12 @@ everything it depends on exists.
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
 
-## Revision 3f (proposed): stage 5 findings and plan
+## Revision 3f: stage 5 findings and plan
 
 Stage 5 implements thread ownership, the transitions and the idle
 thread (SC1-SC8, SC29), with no timer and no migration. The audit
-of the accepted text against the code found five gaps (G1-G5). None is
-implemented.
+of the accepted text against the code found five gaps (G1-G5). The
+fixes below are accepted; stage 5 implements them.
 
 **G1. SC6's transition table is incomplete.** The code makes transitions
 the table does not list:
@@ -1343,8 +1350,14 @@ the only writer.
 - **`current` is never NULL** after boot. When nothing else runs,
   `current` is the idle thread, and CR3 is the kernel's master page
   table.
-- **Self-destruction.** A thread that destroys itself hands `current`
-  to the idle thread in the same step.
+- **Self-destruction is an ownership transfer, then destruction.** A
+  thread that destroys itself (its last Thread capability deleted in its
+  own syscall) is stopped and hands `current` to the idle thread before
+  anything in its TCB is torn down: its bindings, the poisoned register
+  block in test builds, or the object's memory. No code after the
+  handoff touches the old TCB through `current`; the syscall's result is
+  written only if `current` is still the caller. A mutant that tears
+  down first and hands off after must be caught.
 - **Between a block or stop and the next dispatch,** within one kernel
   entry, `current` still names the thread that blocked or stopped. SC1
   and SC2 are checked at scheduling boundaries (SC7), where
@@ -1361,10 +1374,15 @@ exit to happen "only through the idle thread, so the halt-and-wake path
 is always exercised". That second half cannot hold while no wake source
 is armed.
 
-*Proposed fix:*
-- In test builds, the idle thread returns to the self-test driver at
-  the point where it would halt with no wake source armed (a flag the
-  tests own). It is the only way out.
+*Fix:* two different things, kept apart.
+- **The real idle behaviour,** in every build:
+  `sti; hlt` → interrupt → kernel entry → the loop runs again.
+- **The test-driver escape,** test builds only, is not a halt and does
+  not stand in for one. The driver may regain control only at the
+  pre-HLT boundary: the run queue and reaper are empty, `current` is
+  the idle thread, and no wake source is armed. If a wake source is
+  armed, the idle thread always halts and wakes first; the escape can
+  never bypass an armed halt-and-wake sequence.
 - The halt-and-wake path itself gets a test. It arms a wake source (a
   self-IPI, and the LAPIC one-shot), enters the idle loop, halts, and
   checks that the interrupt arrived in the idle thread's interrupt
@@ -1373,7 +1391,11 @@ is armed.
 
 **G5. The scheduler's own work has no stated bound.** SC26 bounds what
 each syscall's work may cost, but not the scheduler's own operations.
-*Proposed fix:* every primitive is O(1) and states so:
+*Fix:* every primitive is O(1). That means the scheduler's own state
+change, not everything the operation that called it causes. For
+example, `sched_stop` is O(1), but destroying a thread may make objects
+dying: that teardown is bounded separately, by the reaper (SC24) and
+continuations (SC16).
 - **The queue operations** are doubly linked, with no search.
 - **`sched_stop`** is `cont_abandon` (O(1), E1) plus `ipc_detach`
   (O(1): it unlinks one queue entry and one reply link, and wakes at
@@ -1413,10 +1435,25 @@ audit. It checks:
 - **SC29:** every queue's length is at most the number of live threads,
   with no repeats and symmetric links. This replaces the fixed loop
   limit.
+- **Independence.** The expected owner of each thread is derived from
+  structures the audit walks itself, not from the scheduler's own
+  bookkeeping:
+  - it counts each thread's occurrences by walking every run queue and
+    wait queue link by link
+  - it checks `current` per CPU
+  - it then compares with `t->state`, and the queue's stored length with
+    the walk
+
+  So a bug in the bookkeeping cannot vouch for itself.
 
 **G9. Tests:**
 - every edge of the G1 table, each from-state it refuses, and each
-  impossible pair
+  impossible pair, such as BLOCKED → BLOCKED through `sched_block`,
+  INACTIVE → RUNNING, IDLE → BLOCKED, FAULTED → RUNNING, and a destroyed
+  thread → RUNNABLE. Each primitive returns `T_EINVAL` for a from-state
+  outside its edge. The test checks that the thread's state, run-queue
+  membership, queue lengths and `current` are byte-for-byte unchanged.
+  Kernel callers assert success.
 - `current` never NULL at a boundary, including across self-destruction
   and self-suspension
 - the idle thread's halt and wake (G4)
@@ -1445,6 +1482,27 @@ audit. It checks:
   - `home_cpu` changed
 - **Gate:** the build gate must fail on a state write outside
   `sched.c`.
+- **Self-destruction:** the teardown ordered before the `current`
+  handoff.
+- **Test escape:** the escape taken while a wake source is armed.
+
+**G11. One primitive commits each pair.** Every scheduler mutation has
+exactly one transition primitive. It commits the state and the
+scheduler-owned membership together, so neither can happen without the
+other:
+- RUNNABLE → RUNNING: removed from the run queue, state set, `current`
+  set.
+- RUNNING → BLOCKED_*: state set; the thread is no longer runnable. The
+  caller has already linked the thread into its IPC wait queue, which
+  IPC owns (P9).
+- BLOCKED_* → RUNNABLE: state set and appended to the home run queue.
+  IPC has already unlinked the thread from its wait queue.
+- any → INACTIVE: abandonment, IPC detach, removal from the run queue,
+  the state, and the `current` handoff if it is running.
+
+No helper outside `sched.c` changes run-queue membership, so a state
+change without its queue change, or the reverse, cannot be written. The
+build gate enforces this.
 
 ## Revision 3e: stage 4 findings and plan
 
