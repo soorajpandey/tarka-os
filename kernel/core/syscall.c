@@ -8,6 +8,7 @@
 
 #include <tarka/syscall.h>
 
+#include <tarka/cont.h>
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/endpoint.h>
@@ -18,6 +19,7 @@
 #include <tarka/untyped.h>
 #include <tarka/vspace.h>
 
+#include "cap_internal.h"
 #include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/serial.h"
 
@@ -96,14 +98,18 @@ static int64_t sys_cap_delete(struct sysctx *c, const struct sysargs *a)
     return cap_delete(&c->cs, s);
 }
 
+/* ADR 0010 SC22, revision 3e E6: runs to completion as a continuation.
+ * The old budget argument is ignored: the kernel chooses the chunk. */
 static int64_t sys_cap_revoke(struct sysctx *c, const struct sysargs *a)
 {
     cap_slot_t s;
-    uint32_t budget;
+    int rc;
 
     SLOT(0, s);
-    U32(1, budget);
-    return cap_revoke(&c->cs, s, budget);
+    rc = cap_revoke_begin(&c->cs, s, &c->t->cont);
+    if (rc == CONT_PENDING)
+        rc = cap_revoke_chunk(&c->cs, &c->t->cont);   /* the first chunk */
+    return cont_after_first(c->t, rc);
 }
 
 static int64_t sys_retype(struct sysctx *c, const struct sysargs *a)

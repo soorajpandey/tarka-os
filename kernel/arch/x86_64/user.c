@@ -13,6 +13,7 @@
 
 #include <tarka/endpoint.h>
 #include <tarka/errno.h>
+#include <tarka/cont.h>
 #include <tarka/kernel.h>
 #include <tarka/reaper.h>
 #include <tarka/selftest.h>
@@ -153,6 +154,15 @@ static __noreturn void schedule(void)
             }
             t->state = THREAD_RUNNING;
             cpu->current = t;
+        }
+        /* ADR 0010 SC16, E4: a thread with a continuation runs its next
+         * chunk instead of entering user mode. */
+        if (t->cont.kind != CONT_NONE) {
+            cont_run(t);
+            if (t->state != THREAD_RUNNING) {
+                t = NULL;
+                continue;
+            }
         }
         try_exit_to_user(t);   /* returns only if t was faulted */
         t = NULL;

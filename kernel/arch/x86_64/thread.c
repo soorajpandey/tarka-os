@@ -12,6 +12,7 @@
 #include "percpu.h"
 
 #include <stddef.h>
+#include <tarka/cont.h>
 #include <tarka/errno.h>
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
@@ -108,6 +109,7 @@ static void thread_stop(struct thread *t, enum thread_state to, bool destroying)
     /* ADR 0009 P28-P31: leave every queue and reply link first. A thread
      * stopped in the middle of a blocking syscall gets T_EINTR as that
      * syscall's result when it is resumed (unless it is being destroyed). */
+    cont_abandon(t, destroying);   /* F6, E1: the one funnel, first */
     ipc_detach(t, destroying);
     runq_remove(t);
     t->state = to;

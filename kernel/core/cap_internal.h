@@ -23,6 +23,17 @@ __must_check int cap_derive_into(struct cap *src, struct cap *dst, cap_rights_t 
 /* Delete the capability in a slot (any slot), running every hook. */
 void cap_slot_delete(struct cap *c);
 
+/* Revocation as a thread continuation (SC22, revision 3e E1, E3, E6).
+ * begin: checks, then marks the root, freezes the object and fills `k`
+ * (CONT_PENDING), or returns a result at once. chunk: at most
+ * REVOKE_CHUNK deletions; T_OK when done, T_EINTR if cancelled,
+ * CONT_PENDING otherwise. abandon: release the freeze if still owned. */
+#define REVOKE_CHUNK 8
+struct thread_cont;
+__must_check int cap_revoke_begin(struct cspace *cs, cap_slot_t slot, struct thread_cont *k);
+__must_check int cap_revoke_chunk(struct cspace *cs, const struct thread_cont *k);
+void cap_revoke_abandon(struct cspace *cs, const struct thread_cont *k);
+
 /* One reaper unit on a slot of a dying CNode (SC24, F7, D2). */
 #define REAP_SLOT_EMPTIED  0   /* the slot is empty now */
 #define REAP_SLOT_PROGRESS 1   /* one record deleted; the slot still holds an Untyped */
@@ -105,6 +116,7 @@ bool cap_is_ipcbuf_binding(const struct cap *c);
 
 #ifdef TARKA_SELFTEST
 void objmeta_test_freeze(const struct cap *c, bool frozen);
+extern unsigned objmeta_test_freezes;   /* freezes set by the hook, still set */
 bool objmeta_token_entry(unsigned i, uint64_t *object, const struct obj_meta **m);
 bool objmeta_frame_entry(uint64_t i, const struct obj_meta **m);
 void objmeta_test_set_serial(uint64_t next);

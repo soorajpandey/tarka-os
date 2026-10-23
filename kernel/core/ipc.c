@@ -121,6 +121,9 @@ void thread_wake(struct thread *t, int64_t rax)
     thread_enqueue(t);
 }
 
+#ifdef TARKA_SELFTEST
+/* Unbounded, so test-only: the kernel fails waiters one per reaper unit
+ * (ADR 0010 SC24). */
 void waitq_wake_all(struct waitq *q, int64_t rax)
 {
     struct thread *t;
@@ -128,6 +131,7 @@ void waitq_wake_all(struct waitq *q, int64_t rax)
     while ((t = q->head))
         thread_wake(t, rax);
 }
+#endif
 
 void reply_link(struct thread *server, struct thread *caller, uint32_t flags)
 {
@@ -335,6 +339,14 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
             return false;
         if ((t->reply_flags & REPLY_FAULT) &&
             ((t->reply_flags & REPLY_CALL_GRANT) || !t->reply_to || t->reply_to->offer.count))
+            return false;
+        /* 12 (ADR 0010 E4): a continuation exists only on a RUNNABLE or
+         * RUNNING thread, of a known kind; none leaves anything behind. */
+        static const struct thread_cont no_cont;
+        if (t->cont.kind >= CONT_KIND_COUNT ||
+            (t->cont.kind != CONT_NONE && t->state != THREAD_RUNNABLE &&
+             t->state != THREAD_RUNNING) ||
+            (t->cont.kind == CONT_NONE && memcmp(&t->cont, &no_cont, sizeof(no_cont)) != 0))
             return false;
         /* 11 (P64): stopping is terminal for reply authority. */
         if (t->state == THREAD_INACTIVE && (t->reply_state != REPLY_NONE || t->reply_to))

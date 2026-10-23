@@ -363,9 +363,15 @@ void objmeta_test_freeze(const struct cap *c, bool frozen)
         KASSERT(m != NULL);
         flags = &m->flags;
     }
+    if (frozen && !(*flags & OBJ_FROZEN))
+        objmeta_test_freezes++;
+    else if (!frozen && (*flags & OBJ_FROZEN))
+        objmeta_test_freezes--;
     if (frozen)
         *flags |= OBJ_FROZEN;
     else
         *flags &= ~OBJ_FROZEN;
 }
+
+unsigned objmeta_test_freezes;
 #endif

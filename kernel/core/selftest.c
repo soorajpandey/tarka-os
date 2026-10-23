@@ -14,6 +14,7 @@
 #include <tarka/notification.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/cont.h>
 #include <tarka/pmm.h>
 #include <tarka/reaper.h>
 #include <tarka/string.h>
@@ -2075,7 +2076,8 @@ static void test_syscalls(void)
     REQ(10, SYS_VS_UNMAP, 7);                                /* 23 */
     REQ(10, SYS_CAP_DELETE, 5);                              /* 24 */
     REQ(10, 0x7777);                                         /* 25 */
-    REQ(10, SYS_CAP_REVOKE, 2, 0x100000000ull);              /* 26: budget > 32 bits */
+    REQ(10, SYS_CAP_REVOKE, 2, 0x100000000ull);              /* 26: the old budget
+                                                              * argument is ignored (E6) */
     REQ(10, SYS_RETYPE, 0, 0x100000000ull + CAP_FRAME, 0, 9, 1); /* 27: type > 32 bits */
 
     uaccess_test_hook = hostile_rewrite;
@@ -2086,7 +2088,7 @@ static void test_syscalls(void)
         T_OK, T_EBADCAP, T_ERANGE, T_ERANGE, T_EFAULT, T_EFAULT, T_OK, T_EINVAL,
         T_OK, T_OK, T_EPERM, T_OK, T_EINVAL, T_OK, T_OK, T_OK,
         T_OK, T_EINVAL, T_OK, T_OK, sizeof(msg) - 1, T_EBADCAP, T_EINVAL, T_OK,
-        T_OK, T_EINVAL, T_EINVAL, T_EINVAL,
+        T_OK, T_EINVAL, T_OK, T_EINVAL,
     };
     CHECK(nreq == ARRAY_SIZE(want));
     for (unsigned i = 0; i < ARRAY_SIZE(want); i++) {
@@ -4848,12 +4850,24 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
         return true;   /* no object, no metadata (SC19a) */
     if (or_serial(c) == 0 || or_serial(c) >= objmeta_test_next_serial())
         return meta_mismatch("serial not issued", c);
+    /* E1: a frozen object has a marked root among its own records (or
+     * the freeze came from the test hook); a marked root's object is
+     * frozen. */
+    bool marked = false;
+    for (unsigned k = lo; k < hi; k++)
+        if (or_rec[k]->rights & CAP_R_REVOKING) {
+            if (marked)
+                return meta_mismatch("two marked roots for one object (E1.4)", c);
+            marked = true;
+        }
     if (c->type == CAP_UNTYPED) {
         /* O2: one record, which carries the metadata. */
         if (live != 1)
             return meta_mismatch("Untyped with several records", c);
         if (c->ut.flags & ~OBJ_FROZEN)
             return meta_mismatch("Untyped flags", c);
+        if (marked != !!(c->ut.flags & OBJ_FROZEN) && !objmeta_test_freezes)
+            return meta_mismatch("Untyped freeze without its root, or a root without it", c);
         return true;   /* a root may have no carver */
     }
     const struct obj_meta *m = or_stored(c);
@@ -4861,6 +4875,8 @@ static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *t
         return meta_mismatch("no metadata", c);
     if (m->live != live)
         return meta_mismatch("live count", c);
+    if (marked != !!(m->flags & OBJ_FROZEN) && !objmeta_test_freezes)
+        return meta_mismatch("freeze without its root, or a root without it (E1)", c);
     uint32_t bits = c->type == CAP_CNODE ? cap_obj_bits(c) << OBJ_BITS_SHIFT : 0;
     /* R3: an object with a record is never dying. Only a live endpoint or
      * notification may be listed, and only with a doomed direction. */
@@ -4984,6 +5000,30 @@ static bool meta_audit(void)
             kprintf("    meta_audit: serial %lu used twice\n", or_serials[k]);
             return false;
         }
+
+    /* E1: every marked root belongs to exactly one revocation
+     * continuation, found from the thread's side by slot and identity;
+     * and every revocation continuation finds its marked root. */
+    unsigned marked = 0, owners = 0;
+    for (unsigned k = 0; k < or_n; k++)
+        marked += (or_rec[k]->rights & CAP_R_REVOKING) != 0;
+    for (const struct thread *t = thread_registry_first(); t; t = t->reg_next) {
+        struct cspace tcs;
+        if (t->cont.kind != CONT_REVOKE)
+            continue;
+        owners++;
+        if (cnode_view_cap(&t->bind[TS_CSPACE], &tcs) != T_OK || t->cont.slot >= tcs.nslots ||
+            !(tcs.slots[t->cont.slot].rights & CAP_R_REVOKING) ||
+            !obj_identity_is(&tcs.slots[t->cont.slot], t->cont.type, t->cont.object,
+                             t->cont.serial)) {
+            kprintf("    meta_audit: a revocation continuation without its marked root\n");
+            return false;
+        }
+    }
+    if (marked != owners) {
+        kprintf("    meta_audit: %u marked roots, %u revocation continuations\n", marked, owners);
+        return false;
+    }
 
     /* D8: the reaper's list, against the Untypeds found by the scan.
      * Every entry is listed once and flagged as listed; a dying entry has
@@ -5568,6 +5608,289 @@ static void test_serial_exhaustion(void)
     CHECK(AUDIT());
 }
 
+/* ---- Stage 4: revocation as a continuation (ADR 0010 SC22, SC22a,
+ * F1-F7; revision 3e E0, E1, E3, E6) ---- */
+
+/* Apply every deletion the kernel made since the last call to the model:
+ * a slot that went empty takes itself out, its children re-parented. */
+static unsigned big_sync(const struct cspace *cs)
+{
+    unsigned gone = 0;
+    for (int g = 0; g < BIG_N; g++) {
+        if (big_par[g] == M_EMPTY || cs->slots[g].type != CAP_NULL)
+            continue;
+        for (int h = 0; h < BIG_N; h++)
+            if (big_par[h] == g)
+                big_par[h] = big_par[g];
+        big_par[g] = M_EMPTY;
+        gone++;
+    }
+    return gone;
+}
+
+static void big_build(struct cspace *cs, uint64_t token)
+{
+    cspace_init(cs, big_store, BIG_N);
+    CHECK(cap_install(cs, 0, CAP_TEST_TOKEN, CAP_R_ALL, token) == T_OK);
+    big_par[0] = M_ROOT;
+    for (int i = 1; i <= 1500; i++) {                  /* chain 0 > 1 > ... > 1500 */
+        CHECK(cap_derive(cs, (cap_slot_t)(i - 1), (cap_slot_t)i, CAP_R_ALL, 0) == T_OK);
+        big_par[i] = (int16_t)(i - 1);
+    }
+    for (int i = 1501; i < BIG_N; i++) {                /* fan under the root */
+        CHECK(cap_derive(cs, 0, (cap_slot_t)i, CAP_R_ALL, 0) == T_OK);
+        big_par[i] = 0;
+    }
+}
+
+/* SC22, E1, E6, at the kernel API, chunk by chunk: the mark, the freeze,
+ * exactly REVOKE_CHUNK deletions per chunk with the tree equal to the
+ * reference forest after each, F4 and F5 refusals, and abandonment. */
+static void test_revoke_chunks(void)
+{
+    struct cspace cs;
+    struct thread_cont k = { 0 }, k2 = { 0 };
+    struct cap_info info;
+    const struct cap *c;
+
+    big_build(&cs, 0x3000);
+    CHECK(big_agrees(&cs) && meta_audit());
+    CHECK(cap_revoke_begin(&cs, 0, &k) == CONT_PENDING);
+    CHECK(k.kind == CONT_REVOKE && k.slot == 0 && k.type == CAP_TEST_TOKEN &&
+          k.object == 0x3000 && k.serial == obj_serial(&cs.slots[0]));
+    CHECK(cs.slots[0].rights == (CAP_R_ALL | CAP_R_REVOKING));
+    CHECK(obj_frozen(&cs.slots[0]) && obj_frozen(&cs.slots[1500]));
+    /* E1 properties 1-3: never shown, never copied, the root stays. */
+    CHECK(cap_identify(&cs, 0, &info) == T_OK && info.rights == CAP_R_ALL);
+    CHECK(cap_lookup(&cs, 0, CAP_TEST_TOKEN, CAP_R_REVOKING, &c) == T_OK);  /* kernel view */
+    CHECK(cap_delete(&cs, 0) == T_EBUSY && cap_revoke(&cs, 0, 1) == T_EBUSY);
+    /* F4: a second revocation of the object, from any of its records. */
+    CHECK(cap_revoke_begin(&cs, 0, &k2) == T_EBUSY && k2.kind == CONT_NONE);
+    CHECK(cap_revoke_begin(&cs, 1, &k2) == T_EBUSY && k2.kind == CONT_NONE);
+    /* SC22a: nothing derives into the subtree, from any of its records. */
+    struct cspace other;
+    static struct cap other_store[4];
+    cspace_init(&other, other_store, 4);
+    CHECK(cap_derive_to(&cs, 1500, &other, 0, CAP_R_ALL, 0) == T_EBUSY);
+    CHECK(cap_derive_to(&cs, 0, &other, 0, CAP_R_ALL, 0) == T_EBUSY);
+    CHECK(meta_audit() == false);   /* a mark with no owning thread: the audit sees it */
+
+    unsigned left = BIG_N - 1, chunks = 0;
+    bool exact = true, agrees = true;
+    int rc;
+    while ((rc = cap_revoke_chunk(&cs, &k)) == CONT_PENDING) {
+        unsigned gone = big_sync(&cs);
+        exact &= gone == REVOKE_CHUNK;
+        left -= gone;
+        chunks++;
+        if (chunks % 32 == 0)
+            agrees &= big_agrees(&cs);
+        exact &= obj_frozen(&cs.slots[0]) && (cs.slots[0].rights & CAP_R_REVOKING);
+    }
+    unsigned last = big_sync(&cs);
+    left -= last;
+    CHECK(rc == T_OK && exact && agrees && last <= REVOKE_CHUNK && left == 0);
+    CHECK(chunks == (BIG_N - 1) / REVOKE_CHUNK);
+    /* Done: the mark and the freeze are gone with the operation. */
+    CHECK(cs.slots[0].rights == CAP_R_ALL && !obj_frozen(&cs.slots[0]));
+    CHECK(!cap_has_children(&cs.slots[0]) && meta_audit());
+
+    /* Abandonment (F6): released, deleted records stay deleted, and the
+     * continuation can never act again (E1 property 7). */
+    cspace_destroy(&cs);
+    big_build(&cs, 0x3001);
+    CHECK(cap_revoke_begin(&cs, 0, &k) == CONT_PENDING);
+    CHECK(cap_revoke_chunk(&cs, &k) == CONT_PENDING && cap_revoke_chunk(&cs, &k) == CONT_PENDING);
+    CHECK(big_sync(&cs) == 2 * REVOKE_CHUNK);
+    cap_revoke_abandon(&cs, &k);
+    CHECK(cs.slots[0].rights == CAP_R_ALL && !obj_frozen(&cs.slots[0]) && meta_audit());
+    CHECK(cap_revoke_chunk(&cs, &k) == T_EINTR && big_sync(&cs) == 0);
+    CHECK(big_agrees(&cs));
+    /* E1 property 8: a later record in the root's slot, even of the same
+     * object, is never taken for the root. */
+    CHECK(cap_derive(&cs, 1600, 3071, CAP_R_ALL, 0) == T_OK || cs.slots[3071].type != CAP_NULL);
+    cspace_destroy(&cs);
+    big_build(&cs, 0x3002);
+    CHECK(cap_revoke_begin(&cs, 1600, &k) == CONT_PENDING || !cap_has_children(&cs.slots[1600]));
+    CHECK(cap_revoke_begin(&cs, 0, &k) == CONT_PENDING);
+    cap_revoke_abandon(&cs, &k);
+    CHECK(cap_derive(&cs, 1600, 0, CAP_R_ALL, 0) == T_EBUSY);   /* slot 0 occupied */
+    CHECK(cap_delete(&cs, 1) == T_OK);                          /* a different record */
+    CHECK(cap_derive(&cs, 0, 1, CAP_R_ALL, 0) == T_OK);         /* same object, slot 1 */
+    struct thread_cont k1 = k;
+    k1.slot = 1;                                                /* aimed at it */
+    CHECK(cap_revoke_chunk(&cs, &k1) == T_EINTR);               /* no mark: never the root */
+    cspace_destroy(&cs);
+    CHECK(meta_audit());
+}
+
+/* F4, F5: an enclosing revocation, and the reaper, cancel an inner one
+ * without waiting for it; the inner one then ends with T_EINTR. */
+static void test_revoke_cancel(void)
+{
+    struct thread_cont in = { 0 }, out = { 0 };
+    struct cspace cn;
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 20, 1) == T_OK);   /* U1 */
+    CHECK(cap_retype(&uts, 20, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);   /* E under U1 */
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_ALL, 0) == T_OK && cap_derive(&uts, 2, 3, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_revoke_begin(&uts, 1, &in) == CONT_PENDING);              /* inner: E */
+    /* A revocation under the frozen object, and one of a descendant, are
+     * refused; the enclosing Untyped's is not (F4). */
+    CHECK(cap_revoke_begin(&uts, 2, &out) == T_EBUSY);
+    CHECK(cap_revoke_begin(&uts, 20, &out) == CONT_PENDING);            /* outer: U1 */
+    CHECK(obj_frozen(&uts.slots[1]));   /* both: E's own flag, and U1 on its chain */
+    int rc;
+    while ((rc = cap_revoke_chunk(&uts, &out)) == CONT_PENDING)
+        ;
+    CHECK(rc == T_OK && uts.slots[1].type == CAP_NULL && uts.slots[2].type == CAP_NULL);
+    CHECK(!(uts.slots[20].ut.flags & OBJ_FROZEN) && !(uts.slots[20].rights & CAP_R_REVOKING));
+    CHECK(cap_revoke_chunk(&uts, &in) == T_EINTR);                      /* cancelled */
+    reap_all();
+    CHECK(meta_audit());
+
+    /* The reaper meets a marked root in a dying CNode: it cancels it. */
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 2, &uts, 30, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 31, 1) == T_OK);
+    CHECK(cnode_view(&uts, 30, &cn) == T_OK);
+    CHECK(cap_derive_to(&uts, 31, &cn, 0, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive_to(&cn, 0, &uts, 32, CAP_R_ALL, 0) == T_OK);       /* a child elsewhere */
+    CHECK(cap_revoke_begin(&cn, 0, &in) == CONT_PENDING && obj_frozen(&uts.slots[31]));
+    CHECK(cap_delete(&uts, 30) == T_OK);                                /* the CNode dies */
+    reap_all();
+    CHECK(!obj_frozen(&uts.slots[31]) && uts.slots[32].type == CAP_ENDPOINT);  /* child kept */
+    CHECK(cap_revoke_chunk(&cn, &in) == T_EINTR);
+    CHECK(meta_audit());
+    ut_teardown();
+}
+
+/* A subtree for user-level revocation: the root is in runner b's cspace
+ * slot 2 (an endpoint, uts 1), its descendants in big_store. */
+static void revoke_subtree(cap_slot_t b, struct cspace *bs, int n)
+{
+    struct cspace c = task_cs(b);
+
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &c, 2, CAP_R_ALL, 0) == T_OK);
+    cspace_init(bs, big_store, BIG_N);
+    CHECK(cap_derive_to(&c, 2, bs, 0, CAP_R_ALL, 0) == T_OK);
+    for (int i = 1; i < n; i++)
+        CHECK(cap_derive(bs, (cap_slot_t)(i % 2 ? i - 1 : 0), (cap_slot_t)i, CAP_R_ALL, 0) == T_OK);
+}
+
+static unsigned live_in(const struct cspace *cs, int n)
+{
+    unsigned k = 0;
+    for (int i = 0; i < n; i++)
+        k += cs->slots[i].type != CAP_NULL;
+    return k;
+}
+
+/* SC22 through a user thread: the syscall runs to completion over many
+ * dispatches, while other threads keep trying to derive into the
+ * subtree; and every way of stopping the revoker mid-way releases the
+ * freeze (F6, E1), keeps what was deleted, and leaves T_EINTR. */
+static void test_revoke_syscall(void)
+{
+    struct cspace bs;
+    enum { N = 600 };
+
+    /* To completion, with derivers interleaved. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL) && spawn(20, P(runner), false, NULL));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK && thread_suspend(&uts, 20 + T_THR) == T_OK);
+    revoke_subtree(10, &bs, N);
+    struct cspace c20 = task_cs(20);
+    CHECK(cap_derive_to(&bs, N - 1, &c20, 2, CAP_R_ALL, 0) == T_OK);   /* a holder inside */
+    nreq = 0;
+    REQ(10, SYS_CAP_REVOKE, 2);
+    nreq = 0;
+    for (unsigned i = 0; i < 20; i++) {
+        REQ(20, SYS_YIELD);
+        REQ(20, SYS_CAP_DERIVE, 2, 3 + i % 8, CAP_R_ALL, 0);
+    }
+    uint64_t chunks = cont_chunks_run;
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK && thread_resume(&uts, 20 + T_THR) == T_OK);
+    run_user();
+    CHECK(res(10, 0) == T_OK && live_in(&bs, N) == 0);
+    CHECK(cont_chunks_run - chunks >= N / REVOKE_CHUNK);   /* many dispatches, not one */
+    struct cspace c10 = task_cs(10);
+    CHECK(c10.slots[2].rights == CAP_R_ALL && !obj_frozen(&c10.slots[2]));
+    bool refused = true;
+    for (unsigned i = 0; i < 20; i++)
+        refused &= res(20, 2 * i + 1) == T_EBUSY || res(20, 2 * i + 1) == T_EBADCAP;
+    for (cap_slot_t s = 3; s < 11; s++)
+        refused &= c20.slots[s].type == CAP_NULL;
+    CHECK(refused && tstate(10) == THREAD_INACTIVE && AUDIT());
+    ut_teardown();
+
+    /* Stopped mid-way, three ways: suspend, unbind the cspace, destroy. */
+    for (int how = 0; how < 3; how++) {
+        CHECK(ut_setup(20));
+        CHECK(spawn(10, P(runner), false, NULL) && spawn(30, P(runner), false, NULL));
+        CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK && thread_suspend(&uts, 30 + T_THR) == T_OK);
+        revoke_subtree(10, &bs, N);
+        struct cspace c30 = task_cs(30);
+        CHECK(cap_derive_to(&uts, 10 + T_THR, &c30, 2, CAP_R_ALL, 0) == T_OK);
+        if (how == 2)
+            CHECK(cap_delete(&uts, 10 + T_THR) == T_OK);   /* c30's copy is now the last */
+        nreq = 0;
+        REQ(10, SYS_CAP_REVOKE, 2);
+        nreq = 0;
+        REQ(30, SYS_YIELD);
+        REQ(30, SYS_YIELD);
+        if (how == 0)
+            REQ(30, SYS_TH_SUSPEND, 2);
+        else if (how == 1)
+            REQ(30, SYS_TH_UNBIND, 2, TS_CSPACE);
+        else
+            REQ(30, SYS_CAP_DELETE, 2);
+        CHECK(thread_resume(&uts, 10 + T_THR) == T_OK || how == 2);
+        if (how == 2)
+            CHECK(thread_resume(&c30, 2) == T_OK);
+        CHECK(thread_resume(&uts, 30 + T_THR) == T_OK);
+        run_user();
+        unsigned left = live_in(&bs, N);
+        /* Some deleted, some left: stopped mid-way, nothing rolled back. */
+        CHECK(left > 0 && left < N);
+        struct cspace r10 = task_cs(10);
+        CHECK(r10.slots[2].rights == CAP_R_ALL && !obj_frozen(&r10.slots[2]));  /* released */
+        CHECK(AUDIT());
+        if (how == 0) {
+            /* Resumed: the interrupted syscall returns T_EINTR, and a new
+             * revocation finishes the job. */
+            CHECK(tstate(10) == THREAD_INACTIVE && th(10)->cont.kind == CONT_NONE);
+            CHECK(th(10)->regs.rax == (uint64_t)(int64_t)T_EINTR);
+            CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+            run_user();
+            CHECK(res(10, 0) == T_EINTR);
+            CHECK(cap_revoke(&r10, 2, 0) == T_OK && live_in(&bs, N) == 0);
+        }
+        cspace_destroy(&bs);
+        ut_teardown();
+        CHECK(AUDIT());
+    }
+}
+
+/* SC28: the retype limit, at its exact boundary. Every request names few
+ * destination slots, so no other check can be what refuses it. */
+static void test_retype_limit(void)
+{
+    CHECK(ut_setup(22));
+    world_tables(NULL, 0);
+    world_take(&world_a);
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 11, &uts, 1, 3) == T_ERANGE);    /* 768 KiB */
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 12, &uts, 1, 2) == T_ERANGE);    /* 1 MiB */
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 11, &uts, 1, 2) == T_OK);        /* exactly 512 KiB */
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 12, &uts, 3, 1) == T_OK);        /* the largest object */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 20, &uts, 4, 1) == T_OK);      /* not zeroed: no limit */
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 5, 100) == T_OK);       /* 400 KiB */
+    ut_teardown();
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -5647,6 +5970,10 @@ static const struct {
     { "reaper_aba", test_reaper_aba },
     { "reaper_requeue", test_reaper_requeue },
     { "serial_exhaustion", test_serial_exhaustion },
+    { "revoke_chunks", test_revoke_chunks },
+    { "revoke_cancel", test_revoke_cancel },
+    { "revoke_syscall", test_revoke_syscall },
+    { "retype_limit", test_retype_limit },
     { "cpu_hardening", test_cpu_hardening },
 };
 

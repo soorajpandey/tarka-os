@@ -111,6 +111,33 @@ struct fault_record {
 };
 _Static_assert(sizeof(struct fault_record) == 32, "struct fault_record must have no padding");
 
+/* A thread continuation (ADR 0010 SC16, revision 3e E0, E5). It holds no
+ * pointer to any kernel object: only values. Every chunk resolves `slot`
+ * again in the thread's current cspace and compares the identity (type,
+ * object, serial) before touching anything. The slot is where to look;
+ * the identity is what to find. Captured inputs that do not fit here
+ * live in `msg` (a reply_recv's reply) and `offer` (a receive's slots). */
+enum cont_kind {
+    CONT_NONE = 0,
+    CONT_REVOKE,       /* cap_revoke (SC22, E6) */
+    CONT_RECV,         /* the receive drain (SC25, E7) */
+    CONT_REPLY_RECV,   /* the same, with a reply not yet committed (E2) */
+    CONT_KIND_COUNT,
+};
+struct thread_cont {
+    uint32_t kind;     /* enum cont_kind */
+    uint32_t slot;     /* the slot named: where to look */
+    uint32_t type;     /* the target's identity: type, object, serial */
+    uint32_t initial;  /* CONT_REPLY_RECV: remaining_initial_drain (E2) */
+    uint64_t object;
+    uint64_t serial;
+};
+_Static_assert(sizeof(struct thread_cont) == 32, "struct thread_cont must have no padding");
+
+/* A chunk's result when the operation is not finished (positive: never
+ * a T_E* code, never a syscall result). */
+#define CONT_PENDING 1
+
 /* How the thread's state must be restored on the way back (T18). */
 enum return_path {
     RETURN_IRET = 0,  /* default: full, validated IRETQ frame */
@@ -140,6 +167,7 @@ struct thread {
     struct thread      *reg_next;    /* test builds: registry of live threads */
     struct thread      *reg_prev;
     struct obj_meta     meta;        /* live count, carver (ADR 0010, SC19a) */
+    struct thread_cont  cont;        /* a long operation in progress, or kind NONE */
     struct cap          bind[TS_COUNT];  /* 128-byte aligned by type (SC20a) */
 };
 _Static_assert(sizeof(struct thread) <= 4096, "TCB must fit in page 0 of the thread object");

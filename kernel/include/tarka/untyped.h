@@ -10,6 +10,11 @@
 #define UNTYPED_MAX_BITS    47
 #define UNTYPED_BOOT_MAX_BITS 30   /* largest root Untyped handed out at boot */
 #define RETYPE_MAX_COUNT    256
+/* ADR 0010 SC28: the most one retype may zero. An architectural syscall
+ * limit chosen for the work bound W (SC26), at least the largest single
+ * object (a CNode of 2^12 128-byte slots). Raising it, or adding a
+ * larger object, means revisiting W in the same change. */
+#define RETYPE_ZERO_MAX     (512ull * 1024)
 #define CNODE_MAX_SLOT_BITS 12
 #define FRAME_BITS          12
 #define ENDPOINT_BITS       7      /* endpoints and notifications: 128 bytes, room

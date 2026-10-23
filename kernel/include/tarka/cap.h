@@ -40,6 +40,11 @@ typedef uint32_t cap_rights_t;
 #define CAP_R_GRANT  (1u << 3)  /* may be copied/derived to another slot */
 #define CAP_R_ALL    (CAP_R_READ | CAP_R_WRITE | CAP_R_EXEC | CAP_R_GRANT)
 
+/* Kernel-only (ADR 0010 revision 3e, E1): marks the root record of a
+ * revocation in progress. Never reported, never copied, never accepted
+ * from a user; outside CAP_R_ALL, so every user-facing mask drops it. */
+#define CAP_R_REVOKING (1u << 31)
+
 /*
  * A capability slot. It lives only in kernel memory and contains kernel
  * pointers, so it must never be copied to user space as-is: user space

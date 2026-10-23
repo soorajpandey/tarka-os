@@ -138,6 +138,9 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     uint64_t obj_size = 1ull << obj_bits;
     uint64_t start = ALIGN_UP(ut->ut_watermark, obj_size);
     uint64_t span, end;
+    if (!mul_overflow((uint64_t)count, obj_size, &span) && type != CAP_UNTYPED &&
+        span > RETYPE_ZERO_MAX)
+        return T_ERANGE;   /* SC28: split the request; nothing changed */
     if (mul_overflow((uint64_t)count, obj_size, &span) || add_overflow(start, span, &end) ||
         end > (1ull << ut_bits))
         /* A reset would make room once the reaper has finished: retry

@@ -6,6 +6,7 @@
 #include <tarka/kernel.h>
 #include <tarka/reaper.h>
 #include <tarka/string.h>
+#include <tarka/thread.h>
 
 static cap_finaliser_t finalisers[CAP_TYPE_COUNT];
 static cap_cleanup_t cleanups[CAP_TYPE_COUNT];
@@ -139,9 +140,39 @@ struct cap *cap_first_child(const struct cap *c)
     return cdt_elem_cap(c->open.next);
 }
 
+/* The word that holds the freeze flag of c's object (or of the Untyped
+ * itself), or NULL for a type with no metadata. */
+static uint32_t *freeze_word(struct cap *c)
+{
+    struct obj_meta *m;
+
+    if (c->type == CAP_UNTYPED)
+        return &c->ut.flags;
+    m = obj_meta(c);
+    return m ? &m->flags : NULL;
+}
+
+/* E1 property 7: clear a revocation's root mark and release its freeze,
+ * in one step. Its owner's next chunk then finds no marked root and ends
+ * with T_EINTR; nothing is written to the owner. */
+static void revoke_cancel(struct cap *c)
+{
+    uint32_t *f = freeze_word(c);
+
+    KASSERT((c->rights & CAP_R_REVOKING) && f && (*f & OBJ_FROZEN));
+    c->rights &= ~CAP_R_REVOKING;
+    *f &= ~OBJ_FROZEN;
+}
+
 static void destroy_slot(struct cap *c)
 {
     enum cap_type type = c->type;
+
+    /* F5, E1 property 3: a revocation's root goes only after that
+     * revocation is cancelled (an enclosing revocation, the reaper, or a
+     * finaliser deleting it). cap_delete refuses it outright. */
+    if (c->rights & CAP_R_REVOKING)
+        revoke_cancel(c);
 
     /* A thread is about to lose a binding: stop it first (ADR 0008, T2). */
     if ((c->slot_flags & SLOT_BINDING) && binding_hook)
@@ -222,8 +253,94 @@ static int revoke(struct cap *c, uint32_t budget)
     return T_OK;
 }
 
+/* ---- Revocation as a thread continuation (SC22, SC22a, F1-F7;
+ * revision 3e E0, E1, E3, E6) ---- */
+
+int cap_revoke_begin(struct cspace *cs, cap_slot_t slot, struct thread_cont *k)
+{
+    struct cap *c = cap_slot(cs, slot);
+    uint32_t *f;
+
+    if (!c)
+        return T_ERANGE;
+    if (c->type == CAP_NULL)
+        return T_EBADCAP;
+    /* F4: one revocation at a time per object, and none under a frozen
+     * Untyped (the chain check also covers this object's own flag). */
+    if ((c->rights & CAP_R_REVOKING) || obj_frozen(c))
+        return T_EBUSY;
+    if (!cap_has_children(c))
+        return T_OK;   /* nothing to revoke: no freeze, no continuation */
+    if (!(f = freeze_word(c)))
+        return T_EINVAL;   /* no metadata to freeze (the debug console) */
+
+    /* E1: the mark on the root, the freeze on the object, and the
+     * identity in the continuation, together, before the thread can be
+     * seen again. */
+    c->rights |= CAP_R_REVOKING;
+    *f |= OBJ_FROZEN;
+    *k = (struct thread_cont){
+        .kind = CONT_REVOKE, .slot = slot,
+        .type = c->type, .object = c->object, .serial = obj_serial(c),
+    };
+    return CONT_PENDING;
+}
+
+/* E0, E1 property 6: the root, found again by slot and identity, still
+ * marked; NULL if cancelled (or abandoned). */
+static struct cap *revoke_root(struct cspace *cs, const struct thread_cont *k)
+{
+    struct cap *c = cap_slot(cs, k->slot);
+
+    if (!c || !obj_identity_is(c, k->type, k->object, k->serial) || !(c->rights & CAP_R_REVOKING))
+        return NULL;
+    return c;
+}
+
+int cap_revoke_chunk(struct cspace *cs, const struct thread_cont *k)
+{
+    KASSERT(k->kind == CONT_REVOKE);
+    for (unsigned done = 0;; done++) {
+        /* Re-resolved before every deletion: a finaliser may delete
+         * anything (O11), the root included, which cancels it. */
+        struct cap *c = revoke_root(cs, k);
+        if (!c)
+            return T_EINTR;
+        if (!cap_has_children(c)) {
+            revoke_cancel(c);   /* done: the mark and the freeze go */
+            return T_OK;
+        }
+        if (done == REVOKE_CHUNK)
+            return CONT_PENDING;
+        struct cap *v = revoke_victim(c);
+        /* E3: blocked on an Untyped whose dying objects the reaper is
+         * still tearing down. Yield; a boundary (and reaper work) passes
+         * before the next chunk. */
+        if (v->type == CAP_UNTYPED && v->ut.dying)
+            return CONT_PENDING;
+#ifdef TARKA_SELFTEST
+        cdt_revoke_steps++;
+#endif
+        destroy_slot(v);
+    }
+}
+
+void cap_revoke_abandon(struct cspace *cs, const struct thread_cont *k)
+{
+    struct cap *c = revoke_root(cs, k);
+
+    /* F6: release the freeze if it is still this revocation's own (it is
+     * not if it was cancelled). Deleted records stay deleted. */
+    if (c)
+        revoke_cancel(c);
+}
+
 int cap_reap_slot(struct cap *c)
 {
+    /* F5: a revocation rooted here is cancelled before the reaper takes
+     * over (and, for an Untyped, before the reaper's own freeze, F7). */
+    if (c->rights & CAP_R_REVOKING)
+        revoke_cancel(c);
     if (c->type == CAP_UNTYPED) {
         if (cap_has_children(c)) {
             /* F7: the reaper owns a freeze on an Untyped it is emptying, so
@@ -329,7 +446,7 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
 
     memset(out, 0, sizeof(*out));
     out->type = c->type;
-    out->rights = c->rights;
+    out->rights = c->rights & CAP_R_ALL;   /* E1: the kernel's mark is never shown */
     out->badge = cap_badged_type(c->type) ? c->badge : 0;
     return T_OK;
 }
@@ -364,7 +481,8 @@ void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t
     cap_slot_clear(d);
     d->type = s->type;
     d->object = s->object;
-    d->rights = s->rights & mask; /* monotonic: rights only ever shrink */
+    d->rights = s->rights & mask & CAP_R_ALL; /* monotonic: rights only ever shrink;
+                                               * the kernel's mark is never copied (E1) */
     /* Badge rule (ADR 0009, P1): a copy of a badged capability carries
      * exactly that badge (re-badging was refused above); only an unbadged
      * capability can mint a badged copy. */
@@ -421,6 +539,9 @@ int cap_delete(struct cspace *cs, cap_slot_t slot)
      * dying. */
     if (c->type == CAP_UNTYPED && (cap_has_children(c) || c->ut.dying))
         return T_EBUSY;
+    /* F5, E1: the root of a running revocation stays put. */
+    if (c->rights & CAP_R_REVOKING)
+        return T_EBUSY;
 
     destroy_slot(c);
     return T_OK;
@@ -434,6 +555,8 @@ int cap_revoke(struct cspace *cs, cap_slot_t slot, uint32_t budget)
         return T_ERANGE;
     if (c->type == CAP_NULL)
         return T_EBADCAP;
+    if (c->rights & CAP_R_REVOKING)
+        return T_EBUSY;   /* a continuation owns this subtree (F4) */
 
     return revoke(c, budget);
 }

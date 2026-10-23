@@ -24,7 +24,9 @@ void thread_wake(struct thread *t, int64_t rax);
 
 /* Wake every thread in `q` with `rax` (object death or authority loss,
  * P26, P27). */
-void waitq_wake_all(struct waitq *q, int64_t rax);
+#ifdef TARKA_SELFTEST
+void waitq_wake_all(struct waitq *q, int64_t rax);   /* tests only: unbounded */
+#endif
 
 /* Link caller to server: the server gains reply authority, the caller is
  * BLOCKED_REPLY (P14, P16). The caller must not be on any queue. */
