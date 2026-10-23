@@ -1,16 +1,25 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3f; step 6), revision 3g proposed. Stages 1-5 implemented. Revision 3c was `2c517b1`.
+Status: accepted (revision 3g; step 6). Stages 1-5 implemented. Revision 3c was `2c517b1`.
 Revisions 3d, 3e and 3f (sections "Revision 3d", "Revision 3e" and
-"Revision 3f") amend it with the stage 3, 4 and 5 findings; revision 3g (proposed) with the stage 6 audit. Rule numbers SC1..SC32 are
+"Revision 3f") amend it with the stage 3, 4 and 5 findings; revision 3g with the stage 6 audit. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3g** (this one, proposed): the stage 6 audit of SC9-SC14
-  and T36 against the code and against themselves. Gaps H1-H7: timer
-  ownership, the arming point, quantum units, SC14's mixed units, T36's
-  unchecked conditions, the idle reaping window, and tests that assume
-  no preemption. The plan is H8-H12.
+- **Revision 3g** (this one): the stage 6 audit of SC9-SC14 and T36
+  against the code and against themselves. Gaps H1-H7: timer ownership,
+  the arming point, quantum units, SC14's mixed units, T36's unchecked
+  conditions, the idle reaping window, and tests that assume no
+  preemption. The plan is H8-H12. Proposed in `6a8027b`; accepted after
+  review, with these added from it (A1-A7):
+  - A1, what a dispatch is
+  - A2, timer state with a (thread, dispatch generation) owner
+  - A3, the ring-3 gate on every path into user mode
+  - A4, the expiry rule and stale interrupts (H13)
+  - A5, a quantum that runs out in kernel code
+  - A6, what W covers, with a loop-tag gate
+  - A7, EOI order, tested
+  - the stage 6 invariant set T36-1 to T36-12
 - **Revision 3f** (`5b8a70d`): the stage 5 audit of SC1-SC8 and SC29
   against the code: gaps G1-G5, the stage 5 plan (G6-G10), and the
   pairing rule G11. Proposed in `3b0c7fc`; accepted after review, with
@@ -1319,7 +1328,8 @@ everything it depends on exists.
 
 ## Revision 3g: stage 6 findings and plan
 
-*Status: proposed.* Stage 6 implements timer preemption, the quantum and
+*Status: accepted with conditions, written in as A1-A7 below.*
+Stage 6 implements timer preemption, the quantum and
 fairness (SC9-SC14), the work counter (SC27) and the T36 tests. An audit
 of the accepted text against the code, and of the text against itself,
 found seven gaps (H1-H7). H8-H12 are the plan.
@@ -1516,11 +1526,13 @@ interrupt exists yet, but the self-IPI does.
 1. **The arch timer interface and ownership:** `timer_arm`,
    `timer_disarm`, `timer_count` (current-count read). The gate is
    extended (H1), and the two tests are moved to the scheduler's API.
-2. **Quantum arming in dispatch,** `quantum_owner`, and the Q2
-   assertion at every return to ring 3. Disarming in the idle dispatch.
-3. **The expiry path:** EOI, then `sched_timer`, then the Q5 check, then
+2. **Quantum arming in dispatch** with the A2 timer state, and the A3
+   ring-3 assertion with its gate. Disarming in the idle dispatch.
+3. **The expiry path** in A7 order: EOI, then `sched_timer`, then the
+   A4 decision (with A5 for a quantum that ran out in kernel code), then
    `sched_yield`, then the boundary. The idle reaping window (H6).
-4. **The SC27 work counter:** every loop whose trip count is not a
+4. **The SC27 work counter and `scripts/check-work.sh`** (A6): every
+   loop whose trip count is not a
    compile-time constant cites its SC26 row and counts. It is asserted
    at every boundary, and the stage 1 pre-scan mutant (SC31.4) is
    finally run against it.
@@ -1575,6 +1587,209 @@ interrupt exists yet, but the self-IPI does.
 **H12. Non-goals for stage 6:** priorities, SMP, migration (G7 still
 holds), tickless accounting, and time-of-day. One level of FIFO round
 robin is the whole policy (SC13).
+
+### Amendments at acceptance (A1-A7)
+
+Revision 3g was accepted with six conditions and one new item, H13.
+They are written here and replace the H text they name. Where an H
+item and an amendment differ, the amendment holds.
+
+**A1. What a dispatch is** (replaces H2's Q1).
+- A **dispatch** is the one scheduler operation, `sched_dispatch()`,
+  that makes a non-idle thread RUNNING and `current` and starts its
+  quantum. It is a dispatch even if it picks the same thread that just
+  left RUNNING: a thread that yields with nobody else queued is
+  dispatched again and gets a fresh quantum.
+- Nothing else is a dispatch. A thread that is still RUNNING at the end
+  of a kernel entry, such as after a syscall that did not block or
+  yield, goes back to ring 3 without a dispatch and keeps its current
+  quantum.
+- Making the idle thread `current` is an idle dispatch: it starts no
+  quantum and disarms the timer.
+
+**A2. Quantum and timer state** (replaces Q1, Q2 and Q4).
+- **Per-CPU timer state, owned by `sched.c`:**
+  - `armed`
+  - `owner`, a thread
+  - `owner_gen`, the generation of the dispatch that armed it
+
+  Each CPU also has a dispatch generation counter, `dispatch_gen`. It
+  counts every non-idle dispatch, never repeats, and is never reset.
+- **A non-idle dispatch,** with interrupts disabled throughout:
+  1. stop the timer
+  2. increment `dispatch_gen`
+  3. arm a one-shot for the quantum
+  4. set `armed`, set `owner = t` and `owner_gen = dispatch_gen`
+- **An idle dispatch** stops the timer and clears `armed`.
+- **A stop, block or yield of the owner** ends its quantum: `armed` is
+  cleared. The hardware is reprogrammed only at the next dispatch.
+- **Identity.** The owner is (thread, `owner_gen`), never the thread
+  alone. A destroyed thread whose memory becomes a new thread can never
+  match an old generation. This is the identity model of D0 and E0
+  applied to the timer.
+
+**A3. The ring-3 gate** (replaces Q2's assertion, and H5 condition 2).
+- **The invariant:** every transition that makes a non-idle thread
+  executable in ring 3 has an active quantum owned by that thread and
+  that dispatch: `armed`, `owner == current`, and
+  `owner_gen == dispatch_gen`.
+- **One way into ring 3.** Today the only transitions into ring 3 are
+  `return_sysret` and `return_iret`, called only from
+  `try_exit_to_user`. That function asserts the invariant immediately
+  before them.
+- **A gate** (an extension of `check-sched.sh`) fails if `return_sysret`,
+  `return_iret`, or any new ring-3 entry is called from anywhere else.
+  A future entry path cannot skip the check without failing the build.
+
+**A4. Expiry, and stale interrupts** (replaces Q5; this is H13).
+- **The decision is about the quantum, not the interrupt.** The
+  hardware does not say which arming raised a latched interrupt, and
+  the scheduler does not need to know. The decision is based only on
+  scheduler state and the current count of the active arming.
+- **A timer interrupt preempts if and only if:**
+  - it was taken from ring 3
+  - `current` is not idle
+  - the A3 invariant holds: `armed`, `owner == current`,
+    `owner_gen == dispatch_gen`
+  - the hardware current count reads 0
+
+  Any other timer interrupt is stale: acknowledged and ignored, with
+  nothing changed.
+- **Why the count can be read this way.** A non-idle dispatch writes a
+  nonzero count with interrupts disabled, so a count of 0 while `armed`
+  means this arming has run out, whichever arming raised the interrupt.
+- **Why `armed` matters.** After a disarm the count also reads 0, so
+  without `armed` that 0 would wrongly read as expiry.
+- **The H13 case.** A owns the quantum, A blocks, B is dispatched and
+  armed, and A's latched interrupt arrives while B runs in ring 3. B's
+  count is nonzero, so nothing happens. If B's quantum has also run
+  out, B is preempted, which is correct.
+- **No other sender of the timer vector.** It is programmed only from
+  `sched.c`, so a self-IPI on that vector, which tests use to forge a
+  stale interrupt, is the only other source.
+
+**A5. A quantum that expires in kernel code** (new).
+- **The kernel runs with interrupts disabled (SC9),** so a quantum that
+  runs out during a syscall, fault, continuation chunk or reaper chunk
+  raises an interrupt that stays pending in the LAPIC. Nothing in the
+  kernel is interrupted, and no decision is recorded in software: the
+  pending interrupt is the record.
+- **The entry finishes its bounded work (W)** and reaches the
+  scheduling boundary.
+- **If the thread blocks, yields or stops,** the quantum ends (A2).
+  The pending interrupt is then delivered at the next ring-3 or idle
+  window, and is stale: it is ignored under A4.
+- **If the thread is still RUNNING,** it returns to ring 3 without a
+  dispatch. IRETQ and SYSRET set IF with no interrupt shadow, so the
+  pending interrupt is taken before any ring-3 instruction runs. The
+  thread is preempted by A4 having run no user instructions in the
+  expired quantum.
+- **A thread with a continuation** never reaches ring 3 while its
+  continuation is pending. Each chunk ends with `sched_yield` (G6), so
+  the case above applies only after its final chunk.
+- **The kernel never switches threads anywhere except a scheduling
+  boundary.** There is no software "preempt pending" flag, and no
+  context switch from inside kernel code.
+
+**A6. What W covers** (amends SC26, and H4's T(W)). W bounds everything
+a CPU does between two consecutive scheduling boundaries:
+1. **The entry:** state capture, the entry checks, FPU save.
+2. **For an interrupt:** EOI and the timer decision (A4).
+3. **The work the entry caused, at most one of:**
+   - one syscall
+   - one fault, including fault delivery (P67-P69)
+   - one continuation chunk
+4. **Every scheduler transition** that work makes, including IPC wakes.
+5. **One reaper chunk** at the boundary.
+6. **The dispatch,** including the timer stop and re-arm.
+7. **The return to ring 3:** address-space switch, FPU restore,
+   segment bases, SYSRET or IRETQ.
+
+The idle thread's passes are bounded the same way: one reaper chunk,
+the window (A7), then a dispatch or halt.
+
+No other interrupt is taken inside kernel code (SC9). NMI, #DF and #MC
+are handled on their own stacks with constant work. They are listed
+separately and are not part of W.
+
+**Mechanically identifiable:**
+- Every loop in `kernel/` whose trip count is not a compile-time
+  constant carries a `/* W: <SC26 row> */` tag. A gate script,
+  `scripts/check-work.sh`, fails on an untagged `for`, `while` or `do`
+  that is not marked `/* W: const */`.
+- **The SC27 counter** is accounting, independent of the tags. Each
+  tagged loop iteration adds its unit to a per-CPU work counter. The
+  counter is zeroed at each boundary and checked against W at the next.
+- **Mutants are caught by measurement, not by a tag.** A mutant that
+  makes a loop do more work, such as the SC31.4 pre-scan, is caught by
+  the counter exceeding W in that loop's worst-case test.
+- T(W) is the time those steps take on a given machine. SC14b uses it,
+  measured, not assumed.
+
+**A7. EOI order** (new). For every timer interrupt:
+1. the entry invariants (T32 state, registers captured)
+2. identify the vector
+3. one EOI
+4. `sched_timer()`, the A4 decision
+5. at most one transition (`sched_yield`)
+6. the scheduling boundary
+
+In addition:
+- **EOI ownership:**
+  - the arch entry path sends exactly one EOI per non-spurious
+    interrupt, before any scheduler call
+  - `sched.c` never sends EOI
+  - a spurious interrupt gets none
+- **Test builds record the order** in a per-CPU event sequence. The
+  tests check that every timer interrupt's EOI comes before its
+  decision, and that EOIs equal non-spurious interrupts exactly.
+- **Mutants:**
+  - EOI after the decision
+  - no EOI: the next quantum never interrupts, and the T36 test fails
+  - two EOIs
+  - an EOI for a spurious interrupt
+
+**H6 restated semantically** (replaces its fix):
+- **The property:** after each idle reaper chunk, the idle thread opens
+  a bounded interrupt-recognition window. Any maskable interrupt
+  pending at that point is delivered before the next chunk begins.
+- **The implementation:** `sti; nop; cli`. STI delays recognition by
+  one instruction, so delivery happens at the boundary after the `nop`.
+  The test checks the property: a recorded RIP inside the window, after
+  the first chunk and before the second.
+- **The mutants:** the window removed, or moved to after the whole
+  drain.
+
+### The stage 6 invariant set
+
+Stage 6 is implemented against these invariants. Each is proven by the
+test named and defended by the mutants of H11 and A7.
+
+| ID | Invariant | Where | Proof |
+|---|---|---|---|
+| T36-1 | Every dispatch starts exactly one fresh quantum | A1, A2 | dispatch count equals arm count; a yield to the same thread re-arms |
+| T36-2 | A quantum is owned by exactly one (thread, dispatch generation) | A2 | audit: `armed` implies the owner is `current` and RUNNING, with the current generation |
+| T36-3 | A syscall or other return to ring 3 does not reset the quantum | A1 | a thread looping on syscalls is preempted within SC14b |
+| T36-4 | Timer programming belongs to the scheduler | H1 | gate: timer programming only from `sched.c` |
+| T36-5 | Timer expiry cannot preempt kernel work | A5, SC9 | kernel-mode interrupts outside idle and the test window: zero; an expiry during a long syscall preempts with zero user instructions run |
+| T36-6 | A ring-3 expiry reaches `sched_yield` through exactly one legal transition | A4, A7 | event sequence: EOI, decision, one yield, boundary |
+| T36-7 | The timer never creates, changes or cancels a continuation | H8 | `t->cont` identical across every timer decision; the mutant that touches it is caught |
+| T36-8 | A stale timer interrupt never preempts the new owner | A4 (H13) | the H13 case, both forged (self-IPI on the timer vector) and real (A's quantum expired in kernel before it blocked) |
+| T36-9 | Kernel work between boundaries is at most W | A6 | SC27 counter at every boundary; `check-work.sh`; worst-case tests |
+| T36-10 | Fairness is measured apart from timer duration | H4 | SC14a exactly from the dispatch trace; SC14b separately, against measured T(W) |
+| T36-11 | The idle thread opens a bounded interrupt window between reaper chunks | H6 | an IPI delivered after the first chunk, not after the drain |
+| T36-12 | `current` is never NULL, through timer and preemption paths too | G3 | the boundary assertion; preemption tests check `current` at every event |
+
+**H11 additions** (A2-A4, A7, H13):
+- the owner check removed
+- the owner generation not compared
+- a thread compared without its generation
+- `armed` cleared too early (at EOI) or never
+- re-arming without updating the owner
+- a stale interrupt accepted after a dispatch
+- the A3 assertion removed (shown by the gate and by a ring-3 return
+  without a quantum)
+- the A7 set
 
 ## Revision 3f: stage 5 findings and plan
 
