@@ -104,6 +104,10 @@ invariants and tests here.
 | T-F | SYSRET never runs with a non-canonical return address | | planned (ADR 0008) |
 | T-G | The kernel touches user memory only through the copy routines, reading each value once | | planned (ADR 0008; completes K3) |
 | T-H | Syscalls are authorised only by capabilities; the syscall layer adds no permission logic | | planned (ADR 0008) |
+| T-J | Every kernel entry (syscall, interrupt, exception, NMI, #MC, #DF) establishes the same sanitised state before common code runs | | planned (ADR 0008, T32) |
+| T-K | Worst-case kernel stack use is within an 8 KiB budget, measured in CI; no unbounded kernel recursion | | planned (ADR 0008, T33) |
+| T-L | A fault during a user-memory copy always returns `T_EFAULT` through the landing pad with SMAP restored; no other kernel fault is recovered | | planned (ADR 0008, T35) |
+| T-M | Physical, user and kernel addresses cannot be confused without a compile error | | planned (ADR 0008, T34) |
 | O1 | Every physical frame has exactly one owner: the kernel allocator or one Untyped; total memory is conserved | self-test `untyped_ownership` | ✅ tested |
 | O2 | Memory authority is never duplicated: Untypeds cannot be copied | self-test `untyped_rules` | ✅ tested |
 | O3 | Retype never creates authority from nothing: it needs an Untyped with WRITE and free space in it | self-test `untyped_rules`, `untyped_exhaustion` | ✅ tested |

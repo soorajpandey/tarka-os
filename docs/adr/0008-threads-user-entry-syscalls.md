@@ -1,9 +1,9 @@
 # ADR 0008: Threads, user entry, the syscall boundary and user-memory access
 
-Status: proposed
+Status: accepted
 
 Refines ADR 0003, step 4. This is the specification; nothing in step 4 is
-implemented until it is agreed. Rule numbers (T1..T31) are referenced from
+implemented until it is agreed. Rule numbers (T1..T36) are referenced from
 `docs/SECURITY.md`.
 
 This step crosses from kernel infrastructure into running untrusted code.
@@ -27,8 +27,8 @@ Out of scope until later steps:
   suspended and its fault record is readable through its Thread
   capability.
 - Timer preemption and priorities (step 6). Until then threads run until
-  they yield, block, fault or exit. Acceptable only because no untrusted
-  code runs before step 6.
+  they yield, block, fault or exit. See T36: this is a hard gate, not a
+  convenience.
 - SMP (ADR 0005). Rules are written so that per-CPU state is already
   per-CPU.
 
@@ -161,6 +161,47 @@ The kernel never blocks on a stack.
 **T10. Interrupts:** user code always runs with IF=1. The kernel runs with
 interrupts disabled except at explicit preemption points.
 
+**T32. One sanitised kernel-entry state, whatever the entry mechanism.**
+Every transition into the kernel reaches common kernel C code only after
+establishing all of the following. Every entry path must satisfy it:
+SYSCALL, hardware interrupts, every exception vector, NMI, #MC, #DF, and
+any mechanism added later.
+
+| Property | How |
+|---|---|
+| RFLAGS.AC = 0 | `clac` in the stub (SFMASK as well for SYSCALL) |
+| RFLAGS.DF = 0 | `cld` in the stub |
+| Kernel stack valid | per-CPU kernel stack (T8), or for NMI, #MC and #DF a dedicated guarded IST stack; RSP is never taken from the interrupted context without switching |
+| GS base is the kernel's | `swapgs` only if the entry came from ring 3, or decided from the GS-base MSR on IST entries that can interrupt the kernel anywhere |
+| Kernel segments valid | CS and SS are set by hardware from the IDT/STAR; data segments are never used |
+| User state captured | every general register saved before any C code runs; for entries from ring 3, copied to the current TCB (T6) |
+| Address-space context known | the current thread and its bound AddressSpace are known from per-CPU data; CR3 is not trusted to identify the thread |
+| Recovery state clean | no copy-routine recovery is armed (T35); an entry that finds one armed outside the copy routine's own range panics |
+
+A single function, `entry_state_check()`, asserts these properties at the
+start of the common C handler in test builds. Adding an entry path means
+adding it to the test that drives every path through that assertion.
+
+Interrupted kernel code is restored exactly: returning from an entry that
+interrupted the kernel uses IRETQ with the saved RFLAGS. So an NMI that
+arrives inside a copy routine's open-SMAP window clears AC for its own
+execution, and AC is set again only for the interrupted copy.
+
+**T33. Kernel stack usage is bounded, measured and budgeted.**
+- Every per-CPU kernel stack and IST stack is 16 KiB with a guard page,
+  and every kernel path must fit within half of it: **8 KiB worst case**.
+- **No unbounded recursion in the kernel.** The only recursions allowed
+  are listed here with their bound:
+  - page-table subtree teardown: depth at most 4 (ADR 0007, V15)
+- The recursive CNode finaliser (ADR 0006, known limitation) must become
+  iterative before step 4 is complete: syscalls make CNode chains
+  user-constructible. Its deletion must use the zombie-capability
+  technique and preemptible, restartable progress, like revocation.
+- Measurement: kernel stacks are painted with a known pattern at boot, and
+  test builds report the high-water mark after the full suite. CI fails
+  if it exceeds the budget. The compiler's `-fstack-usage` output is kept
+  as a build artefact, so frame sizes can be reviewed per function.
+
 ## User entry state: validation
 
 Every value that will be loaded into a privileged position on return to
@@ -213,10 +254,25 @@ CVE-2012-0217 and CVE-2014-4699. It happens naturally when a 2-byte
 `syscall` instruction sits in the last two bytes of user space: the
 saved return address is `USER_TOP`, which is non-canonical.
 
-So the kernel returns with SYSRET only if:
-- the thread entered with SYSCALL
-- nothing has rewritten its RIP, RSP or RFLAGS since
-- RCX (the return RIP) is `< USER_TOP`, which is checked explicitly
+So the kernel never executes SYSRET unless **the complete return state is
+proven safe for SYSRET's specific semantics**. SYSRET loads RIP from RCX,
+RFLAGS from R11 and CS/SS from STAR, and does not switch stacks. All of
+these must hold:
+
+- The thread entered with SYSCALL, and nothing has rewritten its RIP,
+  RSP or RFLAGS since. Any external `thread_write_regs` forces IRETQ.
+- RCX is canonical and `< USER_TOP`, which is checked explicitly.
+- R11 is the sanitised user RFLAGS (T13): IF=1, IOPL=0, TF=0, NT=0, RF=0,
+  VM=0. It is recomputed from the TCB, never taken from the live
+  register.
+- STAR selects the fixed user CS and SS, which is checked once at boot.
+- In the window after the user RSP and user GS base are restored and
+  before SYSRET retires, only NMI and #MC can arrive (IF=0). Both use IST
+  stacks and decide GS from the MSR (T32), so neither runs on the user's
+  RSP or with the user's GS.
+
+If any condition is not met, the return uses IRETQ with a fully validated
+frame.
 
 Every other return goes through IRETQ with a full, validated frame. That
 includes returns from exceptions or interrupts, after `thread_write_regs`,
@@ -275,6 +331,20 @@ integer. It cannot be dereferenced, cast implicitly, or passed where a
 kernel pointer is expected. `kernel_struct = *(user_pointer)` does not
 compile. The only operations on a `uaddr_t` are the copy routines.
 
+**T34. Address kinds are distinct types throughout the kernel.**
+
+| Kind | Type | Converts by |
+|---|---|---|
+| Kernel virtual address | a C pointer | (dereferenceable) |
+| User virtual address | `uaddr_t` (struct) | copy routines only |
+| Physical address | `paddr_t` (struct) | `phys_to_virt()` / `virt_to_phys()`, explicit constructors |
+| Integer that is an address but not yet one of the above | `uint64_t` | must be wrapped at the boundary where it is validated |
+
+Converting the existing `paddr_t` (today an integer typedef) to a struct
+is the first step of the implementation. Mixing up physical, user and
+kernel addresses then becomes a compile error, not a code-review
+finding.
+
 **T26. `copy_from_user(kdst, usrc, len)` and `copy_to_user(udst, ksrc, len)`:**
 1. Compute `end = usrc + len` with overflow checking. Require
    `end <= USER_TOP` and `len <= COPY_MAX` (4 KiB in this step).
@@ -285,6 +355,37 @@ compile. The only operations on a `uaddr_t` are the copy routines.
 
 These are the only places in the kernel where `stac` appears; a CI check
 greps for it.
+
+**T35. Fault recovery in the copy routines is exact.**
+
+```text
+copy_from_user()
+   ├── range checked (T26 step 1)
+   ├── stac
+   ├── copy loop: the only instructions listed in the fixup table
+   ├── clac
+   └── return 0
+fault in the copy loop
+   └── #PF handler: faulting RIP in the fixup table AND fault address < USER_TOP
+          → resume at the routine's landing pad: clac, return T_EFAULT
+```
+
+- Recovery is armed by the faulting **instruction address** being in the
+  fixup table, not by a flag that could be left set. There is no state
+  to forget to clear.
+- The landing pad is the only place execution can go after a recovered
+  fault. It always executes `clac` before returning, so SMAP is restored
+  on success, on fault, and on every path in between.
+- A fault in the copy loop at a kernel address (which the range check
+  makes impossible) is not recovered: it panics. So a range-check bug
+  cannot be silently turned into "return an error".
+- Copy routines are leaf assembly: they call nothing, so copies cannot
+  nest, and nothing else ever runs with SMAP open. An interrupting NMI or
+  #MC clears AC on entry and IRETQ restores it (T32).
+- A partially accessible buffer copies up to the fault and then reports
+  `T_EFAULT`. The caller must treat the destination as unusable: callers
+  never use a buffer from a failed copy, and `copy_from_user` zeroes the
+  whole destination on failure, so no partial or stale bytes survive.
 
 **T27. Single fetch.** Every syscall that takes user memory copies it into
 a kernel buffer once, validates the copy, and then uses only the copy.
@@ -328,6 +429,14 @@ error to the caller and leave the thread running:
 - insufficient rights: `T_EPERM`
 - unmapped or kernel user pointer: `T_EFAULT`
 
+**T36. No untrusted program runs before timer preemption exists.**
+Until step 6, the only user programs are the kernel's own test programs.
+The first program not written as part of the kernel test suite runs only
+once:
+- timer interrupts preempt user threads
+- the scheduler guarantees that a thread which never yields cannot keep
+  the CPU from other runnable threads
+
 ## Invariants introduced
 
 | ID | Invariant | Rules |
@@ -341,6 +450,10 @@ error to the caller and leave the thread running:
 | T-G | The kernel touches user memory only through the copy routines, reading each value once | T25–T27 (completes K3) |
 | T-H | Syscalls are authorised only by capabilities | T23 |
 | T-I | A user fault never panics the kernel | T29 (completes U4) |
+| T-J | Every kernel entry establishes the same sanitised state (T32) before common code runs | T9, T32 |
+| T-K | Worst-case kernel stack use is within budget; no unbounded kernel recursion | T33 |
+| T-L | A fault during a user-memory copy always returns `T_EFAULT` through the landing pad with SMAP restored; no other kernel fault is recovered | T35 |
+| T-M | Physical, user and kernel addresses cannot be confused without a compile error | T25, T34 |
 
 ## Tests required before step 4 is done
 
@@ -399,6 +512,33 @@ kernel, copied into Frames mapped RX at user addresses.
 10. **Round trip:** user → syscall → kernel → user, in thousands of
     iterations with randomised argument registers. Preserved registers stay
     preserved, and RAX is always a valid result.
+11. **Every entry path through `entry_state_check()` (T32):** syscall,
+    every ring-3 exception vector, a timer or self-IPI interrupt from ring
+    3 and from ring 0, a self-NMI (through the local APIC) while in user
+    mode, while in ordinary kernel code, and inside a copy routine's open-
+    SMAP window. Each entry observes AC=0, DF=0, the correct GS base and a
+    valid stack.
+12. **Stacks (T33):**
+    - stack high-water mark within budget after the whole suite
+    - guard-page hit on the per-CPU kernel stack ends in a clean #DF panic
+      on the IST stack, never memory corruption
+    - exception during exception handling, and NMI during kernel execution,
+      both handled on their own stacks
+    - a user-built chain of 1000 nested CNodes is deleted without
+      exceeding the stack budget
+13. **Copy routines (T35):**
+    - fault on the first byte, on the last byte, and on a page-boundary
+      crossing
+    - a partially accessible buffer: destination fully zeroed, `T_EFAULT`
+    - length overflow and wraparound
+    - zero-length copy
+    - after every one of these, AC is clear and the next ordinary kernel
+      access to user memory faults (SMAP still active)
+
+    Mutation tests specifically for: SMAP not restored on the fault path,
+    recovery accepted for a non-table RIP, recovery accepted for a
+    kernel-half fault address, a missing range check, no zeroing on
+    failure, and an off-by-one at the end of the range.
 
 Then, as before:
 - mutation testing of the entry and exit stubs, the validators, the copy

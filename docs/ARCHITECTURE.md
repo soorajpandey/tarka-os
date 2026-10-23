@@ -51,7 +51,7 @@
 | Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
 | Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
 | Address spaces, page tables | `arch/x86_64/vspace.c` | done ([ADR 0007](adr/0007-address-spaces.md)): install/map/unmap/protect, W^X across aliases, teardown in any order |
-| Threads, scheduler, faults | | next ([ADR 0008](adr/0008-threads-user-entry-syscalls.md), proposed) |
+| Threads, scheduler, faults | | next ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)) |
 | Syscalls, IPC, notifications | | planned (ADR 0003) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
@@ -68,7 +68,7 @@
 | [0005](adr/0005-smp.md) | SMP: big kernel lock first, per-CPU state, TLB shootdown | accepted |
 | [0006](adr/0006-untyped-retype.md) | Untyped memory, retype, lifetime and reclamation (precise rules O1–O11) | accepted |
 | [0007](adr/0007-address-spaces.md) | Address spaces, page tables, mapping authority, W^X and aliasing, unmapping, TLB invalidation (rules V1–V15) | accepted |
-| [0008](adr/0008-threads-user-entry-syscalls.md) | Threads, context, user entry validation, syscall boundary, user-memory access, user faults (rules T1–T31) | proposed |
+| [0008](adr/0008-threads-user-entry-syscalls.md) | Threads, context, user entry validation, syscall boundary, user-memory access, user faults, unified kernel entry, stack budget (rules T1–T36) | accepted |
 
 Security invariants and the tests that prove them are listed in
 [SECURITY.md](SECURITY.md#security-invariants).
