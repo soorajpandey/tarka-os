@@ -57,7 +57,7 @@ modifies nothing until every check has passed:
    | Type | `size_bits` argument | Object size |
    |---|---|---|
    | `FRAME` | must be 0 | 4 KiB |
-   | `ENDPOINT`, `NOTIFICATION` | must be 0 | 64 B |
+   | `ENDPOINT`, `NOTIFICATION` | must be 0 | 128 B (64 B before ADR 0010 stage 2, which added their metadata) |
    | `CNODE` | number of slots is `2^size_bits`, with 1 ≤ `size_bits` ≤ 12 | 2^(`size_bits`+6) B |
    | `UNTYPED` | the child's size, with 12 ≤ `size_bits` < parent's bits | 2^`size_bits` B |
    | `ADDRESS_SPACE`, `PAGE_TABLE` | must be 0 | 8 KiB (ADR 0007) |

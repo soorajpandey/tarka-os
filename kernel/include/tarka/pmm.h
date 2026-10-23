@@ -10,6 +10,12 @@ struct limine_memmap_response;
 void pmm_init(struct limine_memmap_response *memmap);
 __must_check paddr_t pmm_alloc(void);          /* null (pa_is_null) on failure */
 __must_check int pmm_free(paddr_t frame);      /* T_EDOUBLEFREE, T_EINVAL */
+/* `n` physically contiguous, zeroed frames for the kernel's own use
+ * (counted as kernel frames); null on failure. */
+__must_check paddr_t pmm_alloc_contig(uint64_t n);
+/* Number of page frames the allocator's bitmaps cover: every managed
+ * frame's number is below this. */
+uint64_t pmm_frame_limit(void);
 uint64_t pmm_free_count(void);
 /* Frames the kernel itself holds (pmm_alloc without pmm_free). */
 uint64_t pmm_kernel_count(void);

@@ -216,7 +216,7 @@ int thread_bind(struct cspace *cs, cap_slot_t thr, unsigned which,
     if (which == TS_IPCBUF) {
         if ((s->rights & (CAP_R_READ | CAP_R_WRITE)) != (CAP_R_READ | CAP_R_WRITE))
             return T_EPERM;
-        if (vspace_frame_alias_conflict(cap_slot(src_cs, src), CAP_R_WRITE))
+        if (vspace_frame_alias_conflict(s, CAP_R_WRITE))
             return T_EPERM;
     }
     return cap_derive_into(cap_slot(src_cs, src), &t->bind[which], CAP_R_ALL);

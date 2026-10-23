@@ -52,6 +52,9 @@ void ipc_detach(struct thread *t, bool destroying);
 #ifdef TARKA_SELFTEST
 void thread_registry_add(struct thread *t);
 void thread_registry_remove(struct thread *t);
+/* Every live thread object, linked by reg_next (tests enumerate binding
+ * slots without following the CDT). */
+const struct thread *thread_registry_first(void);
 /* P9 over every live thread and every queue they reference, plus `extra`
  * queues (which may be empty or hold stale entries). */
 bool ipc_audit(struct waitq *const *extra, size_t nextra);

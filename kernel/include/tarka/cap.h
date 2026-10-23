@@ -57,6 +57,36 @@ struct cdt_elem {
     struct cdt_elem *prev, *next;
 };
 
+/*
+ * Per-object metadata (ADR 0010, SC17-SC19a, SC22a). Every object that
+ * can have capability records keeps one of these at a fixed location
+ * for its type (obj_meta(), in cap_internal.h). The live-record count is
+ * the only thing that decides whether a deletion is the last capability
+ * to its object (SC19a); nothing about the record's place in the CDT
+ * does.
+ */
+struct cap;
+struct obj_meta {
+    uint32_t live;   /* live capability records to the object, any rights */
+    uint32_t flags;  /* OBJ_FROZEN */
+    union {
+        struct {     /* CAP_ENDPOINT, CAP_NOTIFICATION (SC17) */
+            uint32_t n_read;   /* live records carrying READ */
+            uint32_t n_write;  /* live records carrying WRITE */
+        };
+        struct {     /* CAP_FRAME (SC18) */
+            uint32_t alias_w;  /* writable mappings + IPC-buffer bindings */
+            uint32_t alias_x;  /* executable mappings */
+        };
+    };
+    struct cap *carver; /* the Untyped record it was carved from; NULL for
+                         * a boot root Untyped (SC22a carving chain) */
+};
+
+#define OBJ_FROZEN 0x1u   /* a revocation is emptying a subtree under it */
+
+_Static_assert(sizeof(struct obj_meta) == 24, "struct obj_meta must have no padding");
+
 struct cap {
     uint32_t     type;     /* enum cap_type */
     cap_rights_t rights;
@@ -78,14 +108,18 @@ struct cap {
     uint64_t     pending_link; /* property of the slot: zero, except in slot 0 of
                                 * a CNode waiting to be drained (ADR 0008,
                                 * T33), see cnode_finalise() */
-    uint64_t     reserved[6]; /* zero; for ADR 0010 stages 2-4 (SC20a) */
+    struct obj_meta slot_meta; /* property of the slot: in slot 0 of a CNode
+                                * object, that CNode's metadata (SC19a);
+                                * zero everywhere else */
+    struct obj_meta ut_meta;   /* CAP_UNTYPED: the Untyped's own metadata
+                                * (unique record, O2); zero otherwise */
 } __aligned(128);
 
 /* ADR 0010 SC20a: the size and alignment are part of the architecture.
  * The alignment also lets a list element tell which bracket it is. */
 _Static_assert(sizeof(struct cap) == 128, "struct cap must be exactly 128 bytes");
 _Static_assert(_Alignof(struct cap) == 128, "struct cap must be 128-byte aligned");
-_Static_assert(offsetof(struct cap, reserved) + sizeof(((struct cap *)0)->reserved) == 128,
+_Static_assert(offsetof(struct cap, ut_meta) + sizeof(struct obj_meta) == 128,
                "struct cap must have no implicit padding");
 
 #define SLOT_BINDING     0x80000000u
@@ -130,15 +164,17 @@ struct cspace {
 
 typedef uint32_t cap_slot_t;
 
-/* Called when the last capability to an object is deleted, after the slot
- * has been cleared, so the owning subsystem can destroy the object. */
+/* Called when the last capability to an object is deleted (its live-record
+ * count reached 0, SC19a), after the slot has been cleared, so the owning
+ * subsystem can destroy the object. */
 typedef void (*cap_finaliser_t)(enum cap_type type, uint64_t object);
 
 void cap_set_finaliser(enum cap_type type, cap_finaliser_t fn);
 
 /* Called for every deleted capability of `type` (not only the last one),
- * while it is still intact and linked, so per-capability state such as a
- * frame mapping can be undone (ADR 0007, V12). */
+ * while it is still intact, linked and counted, so per-capability state
+ * such as a frame mapping can be undone (ADR 0007, V12). The object's
+ * counts still include `c`. */
 typedef void (*cap_cleanup_t)(struct cap *c);
 
 void cap_set_cleanup(enum cap_type type, cap_cleanup_t fn);
@@ -174,7 +210,10 @@ __must_check int cap_identify(const struct cspace *cs, cap_slot_t slot, struct c
  * set on an unbadged source, and only on endpoints. The copy becomes a CDT
  * child of the source and never inherits per-capability state (a copy of a
  * mapped frame starts unmapped). Untyped and PageTable capabilities cannot
- * be copied (ADR 0006 O2, ADR 0007 V10): T_EINVAL. */
+ * be copied (ADR 0006 O2, ADR 0007 V10): T_EINVAL. While a revocation is
+ * emptying a subtree the source lies in (its object, or an Untyped it was
+ * carved from, is frozen): T_EBUSY (ADR 0010, SC22a). If the object's
+ * live-record count has no room: T_ERANGE (SC18). */
 __must_check int cap_derive_to(struct cspace *src_cs, cap_slot_t src,
                                struct cspace *dst_cs, cap_slot_t dst,
                                cap_rights_t mask, uint64_t badge);
@@ -186,7 +225,8 @@ static inline __must_check int cap_derive(struct cspace *cs, cap_slot_t src, cap
 }
 
 /* Delete one capability. Its CDT children move up to its parent. If it was
- * the last capability to its object, the type's finaliser runs. An Untyped
+ * the last capability to its object (by the live-record count, ADR 0010
+ * SC19a), the type's finaliser runs. An Untyped
  * that still has children cannot be deleted (ADR 0006, O8): T_EBUSY. */
 __must_check int cap_delete(struct cspace *cs, cap_slot_t slot);
 

@@ -81,9 +81,12 @@ writable mappings always carry NX.
 **V6. No physical frame is ever writable through one mapping and
 executable through another, in any address space.** Before mapping
 writable, the kernel checks that no other capability to the same frame is
-mapped executable, and vice versa (`T_EPERM`). All capabilities to one
-frame are contiguous in the capability derivation tree, so the check
-walks only that frame's own capabilities. When DMA domains arrive (ADR
+mapped executable, and vice versa (`T_EPERM`). *Amended by ADR 0010
+(SC18, stage 2):* the check reads the frame's writable and executable
+alias counts in the frame metadata table, which are updated in the same
+step as every mapping, protection change, unmapping and IPC-buffer
+binding; it no longer walks the frame's capabilities, and no longer
+relies on them being contiguous in the CDT. When DMA domains arrive (ADR
 0001), a device mapping counts as writable.
 
 **V7. In-place permission changes can only remove rights.**

@@ -7,7 +7,8 @@
 #include <tarka/cap.h>
 
 /* Zero a slot's capability, keeping the slot's own properties
- * (slot_flags, pending_link). Every writer of a slot uses this. */
+ * (slot_flags, pending_link, slot_meta). Every writer of a slot uses
+ * this. */
 void cap_slot_clear(struct cap *c);
 
 /* Called for a capability in a binding slot (slot_flags & SLOT_BINDING)
@@ -42,14 +43,47 @@ static inline bool cap_badged_type(uint32_t type)
     return type == CAP_ENDPOINT || type == CAP_NOTIFICATION;
 }
 
-/* True if both capabilities refer to the same object. */
-bool cap_same_object(const struct cap *a, const struct cap *b);
+/* ---- Per-object metadata (ADR 0010, SC17-SC19a, SC22a; objmeta.c) ---- */
 
-/* TRANSITIONAL (ADR 0010 stage 1; replaced by live-record counts in
- * stage 2): iterate over every record of c's object,
- *   for (x = cap_object_first(c); x; x = cap_object_next(x)) */
-struct cap *cap_object_first(struct cap *c);
-struct cap *cap_object_next(const struct cap *x);
+/* Headroom kept below the counter's limit: one operation can create up to
+ * three records of one object (a message's capabilities), and every
+ * check runs before any of them is committed. */
+#define OBJ_LIVE_MAX (UINT32_MAX - 3)
+
+/* Allocate the frame metadata table (SC18). Runs before any Untyped
+ * exists; boot fails if the table does not fit. */
+void objmeta_boot(void);
+
+/* The metadata of c's object, at its type's fixed location; NULL for a
+ * type without one (debug console). */
+struct obj_meta *obj_meta(const struct cap *c);
+
+/* SC22a F2: c's object, or an Untyped on its carving chain, is frozen. */
+bool obj_frozen(const struct cap *c);
+
+/* Every refusal a new record of s's object can meet: T_EBUSY if frozen,
+ * T_ERANGE if the live count has no room. Called by cap_derive_check. */
+__must_check int meta_check_new(const struct cap *s);
+
+/* A freshly retyped (or boot) object: record its carving Untyped. */
+void meta_new_object(struct cap *c, struct cap *carver);
+
+/* Commit steps (C4): c has just been linked in / is about to be unlinked.
+ * meta_del() returns true when c was the object's last record. */
+void meta_add(struct cap *c);
+bool meta_del(struct cap *c);
+
+/* Frame alias counts (SC18): a mapping with `rights` appears (+1) or goes
+ * (-1); and the V6/P5 test for a new alias that wants `want`. */
+void meta_alias(struct cap *frame, cap_rights_t rights, int delta);
+bool meta_alias_conflict(const struct cap *frame, cap_rights_t want);
+bool cap_is_ipcbuf_binding(const struct cap *c);
+
+#ifdef TARKA_SELFTEST
+void objmeta_test_freeze(const struct cap *c, bool frozen);
+bool objmeta_token_entry(unsigned i, uint64_t *object, const struct obj_meta **m);
+bool objmeta_frame_entry(uint64_t i, const struct obj_meta **m);
+#endif
 
 /* The CDT as a balanced-bracket list (ADR 0010, SC20). */
 struct cap *cdt_elem_cap(const struct cdt_elem *e);

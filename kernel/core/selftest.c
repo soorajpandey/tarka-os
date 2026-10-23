@@ -35,6 +35,10 @@
 
 static unsigned checks, failures;
 
+/* ADR 0010 gate SC31.3: the independent counter oracle (defined near the
+ * end of this file, after every record store). */
+static bool meta_audit(void);
+
 void selftest_check(bool ok, const char *expr, const char *file, int line)
 {
     checks++;
@@ -238,11 +242,14 @@ static bool cdt_list_ok(const struct cdt_elem *head)
     return depth == 0;
 }
 
-/* Every record in a cspace: empty slots fully zeroed (no stale links or
- * data), reserved fields zero, and its list well-nested. */
+/* Every record in a cspace that is not a CNode object: empty slots fully
+ * zeroed (no stale links, data or metadata), reserved fields zero, the
+ * Untyped-only metadata zero in every other record, and its list
+ * well-nested. */
 static bool cdt_consistent(const struct cspace *cs)
 {
     static const struct cap zero;
+    static const struct obj_meta zero_meta;
 
     for (uint32_t i = 0; i < cs->nslots; i++) {
         const struct cap *c = &cs->slots[i];
@@ -253,9 +260,10 @@ static bool cdt_consistent(const struct cspace *cs)
         }
         if (c->slot_flags != 0 || c->pending_link != 0 || c->reserved0)
             return false;
-        for (size_t k = 0; k < ARRAY_SIZE(c->reserved); k++)
-            if (c->reserved[k])
-                return false;
+        if (memcmp(&c->slot_meta, &zero_meta, sizeof(zero_meta)) != 0)
+            return false;
+        if (c->type != CAP_UNTYPED && memcmp(&c->ut_meta, &zero_meta, sizeof(zero_meta)) != 0)
+            return false;
         if (!cdt_list_ok(cdt_list_head(c)))
             return false;
     }
@@ -726,6 +734,10 @@ static int m_index(const struct cap *c)
 
 static void m_reset(void)
 {
+    /* Delete what the previous round left: re-zeroing live records would
+     * leave their objects' counts (and CDT links) stale. */
+    cspace_destroy(&cdtm_cs[0]);
+    cspace_destroy(&cdtm_cs[1]);
     cspace_init(&cdtm_cs[0], cdtm_a, CDT_N);
     cspace_init(&cdtm_cs[1], cdtm_b, CDT_N);
     for (int g = 0; g < 2 * CDT_N; g++)
@@ -1179,12 +1191,14 @@ static void test_vspace_alias(void)
     CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RW) == T_EPERM); /* same AS */
     CHECK(vspace_map(&uts, 5, 11, ua(VA0), RO) == T_OK);             /* RO alias ok */
     CHECK(vspace_map(&uts, 5, 12, ua(VA0 + 0x1000), RX) == T_OK);    /* RX alias ok */
+    CHECK(meta_audit());
 
     /* Remove every executable mapping; now RW is allowed... */
     CHECK(vspace_unmap(&uts, 10) == T_OK);
     CHECK(vspace_map(&uts, 1, 13, ua(VA0 + 0x2000), RW) == T_EPERM); /* 12 still RX */
     CHECK(vspace_unmap(&uts, 12) == T_OK);
     CHECK(vspace_map(&uts, 1, 13, ua(VA0 + 0x2000), RW) == T_OK);
+    CHECK(meta_audit());
 
     /* ...and RW first blocks RX, in the other order too. */
     CHECK(vspace_map(&uts, 1, 10, ua(VA0), RX) == T_EPERM);
@@ -1193,6 +1207,7 @@ static void test_vspace_alias(void)
 
     /* Deleting a writable alias's capability lifts the block. */
     CHECK(cap_delete(&uts, 13) == T_OK);
+    CHECK(meta_audit());
     CHECK(vspace_map(&uts, 1, 10, ua(VA0), RX) == T_OK);
 
     /* A copy never inherits a mapping (V10), and frames take no badge. */
@@ -2145,7 +2160,7 @@ static void test_entry_paths(void)
 /* ---- IPC state machinery (docs/adr/0009-ipc.md, step 5.1) ---- */
 
 static struct waitq *const tq_all[] = { &test_waitqs[0], &test_waitqs[1] };
-#define AUDIT() ipc_audit(tq_all, ARRAY_SIZE(tq_all))
+#define AUDIT() (ipc_audit(tq_all, ARRAY_SIZE(tq_all)) && meta_audit())
 
 /* Exact snapshot of all IPC-relevant state: every live thread's state,
  * links and saved registers, the run queue order, the test queues and the
@@ -2418,7 +2433,7 @@ static unsigned scan_write_caps(const struct cap *obj, struct cspace *const *css
 static bool notif_ok(const struct notification *n)
 {
     struct waitq *q[] = { (struct waitq *)&n->waiters };
-    return !(n->waiters.head && n->pending) && ipc_audit(q, 1);
+    return !(n->waiters.head && n->pending) && ipc_audit(q, 1) && meta_audit();
 }
 
 /* Master notification in uts slot 1 (unbadged, all rights): minting
@@ -2656,7 +2671,7 @@ static void test_notif_destroy(void)
 static bool ep_ok(const struct endpoint *e)
 {
     struct waitq *q[] = { (struct waitq *)&e->senders, (struct waitq *)&e->receivers };
-    return !(e->senders.head && e->receivers.head) && ipc_audit(q, 2);
+    return !(e->senders.head && e->receivers.head) && ipc_audit(q, 2) && meta_audit();
 }
 
 static struct ipc_buffer *tbuf(cap_slot_t b)
@@ -3015,11 +3030,15 @@ static void test_ep_ipcbuf_wx(void)
     CHECK(cap_derive(&uts, 71, 74, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);
     CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 74) == T_EPERM);  /* no WRITE */
     CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 71) == T_OK);
+    CHECK(meta_audit());
     CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RX) == T_EPERM);   /* now an alias */
     CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RW) == T_OK);
     CHECK(vspace_map(&uts, 10 + T_AS, 73, ua(0x405000), RO) == T_OK);
+    CHECK(meta_audit());
     CHECK(thread_unbind(&uts, 10 + T_THR, TS_IPCBUF) == T_OK);
+    CHECK(meta_audit());
     CHECK(vspace_unmap(&uts, 72) == T_OK);
+    CHECK(meta_audit());
     CHECK(vspace_map(&uts, 10 + T_AS, 72, ua(0x404000), RX) == T_OK);      /* alias gone */
     ut_teardown();
 }
@@ -4522,6 +4541,553 @@ static void test_cpu_hardening(void)
     CHECK((__stack_chk_guard & 0xFF) == 0);
 }
 
+/* ---- The independent counter oracle (ADR 0010, SC17-SC19a, gate SC31.3) ----
+ *
+ * Recount every object's live records, rights and frame aliases from
+ * scratch and compare with what the kernel stores. Independence is the
+ * point: the oracle finds records by scanning their storage (the root
+ * cspace, every static test store, every live thread's binding slots, and
+ * every CNode reachable from those), never by following a CDT link; it
+ * reads a frame's mapping from the hardware entry, not from map_state;
+ * and it locates each object's stored metadata itself, without calling
+ * obj_meta() or any counting code. So a bug shared by the CDT and the
+ * counters cannot make the two agree. */
+
+#define ORACLE_MAX  16384
+#define ORACLE_CN   256
+static const struct cap *or_rec[ORACLE_MAX];
+static unsigned or_n;
+static uint64_t or_cnode[ORACLE_CN];
+static unsigned or_ncn;
+static bool or_overflow;
+
+static void or_scan(const struct cap *slots, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        const struct cap *c = &slots[i];
+        if (c->type == CAP_NULL)
+            continue;
+        if (or_n == ORACLE_MAX) {
+            or_overflow = true;
+            return;
+        }
+        or_rec[or_n++] = c;
+    }
+}
+
+/* Records come from storage; a CNode record adds its object's slots once. */
+static void or_collect(void)
+{
+    static struct cap *const stores[] = {
+        caps_store, cdt_store_a, cdt_store_b, ut_store, cdtm_a, cdtm_b, big_store, b_store,
+    };
+    static const uint32_t sizes[] = {
+        ARRAY_SIZE(caps_store), ARRAY_SIZE(cdt_store_a), ARRAY_SIZE(cdt_store_b),
+        ARRAY_SIZE(ut_store), CDT_N, CDT_N, BIG_N, ARRAY_SIZE(b_store),
+    };
+    const struct cspace *root = untyped_root_cspace();
+
+    or_n = or_ncn = 0;
+    or_overflow = false;
+    or_scan(root->slots, root->nslots);
+    for (size_t i = 0; i < ARRAY_SIZE(stores); i++)
+        or_scan(stores[i], sizes[i]);
+    for (const struct thread *t = thread_registry_first(); t; t = t->reg_next)
+        or_scan(t->bind, TS_COUNT);
+    for (unsigned k = 0; k < or_n; k++) {
+        const struct cap *c = or_rec[k];
+        bool seen = false;
+        if (c->type != CAP_CNODE)
+            continue;
+        for (unsigned j = 0; j < or_ncn && !seen; j++)
+            seen = or_cnode[j] == c->object;
+        if (seen)
+            continue;
+        if (or_ncn == ORACLE_CN) {
+            or_overflow = true;
+            return;
+        }
+        or_cnode[or_ncn++] = c->object;
+        or_scan(phys_to_virt(cap_obj_paddr(c)), 1u << (cap_obj_bits(c) - CAP_SLOT_BITS));
+    }
+}
+
+static int or_by_ptr(const struct cap *a, const struct cap *b)
+{
+    return a < b ? -1 : a > b;
+}
+
+static int or_by_object(const struct cap *a, const struct cap *b)
+{
+    if (a->type != b->type)
+        return a->type < b->type ? -1 : 1;
+    if (a->object != b->object)
+        return a->object < b->object ? -1 : 1;
+    return or_by_ptr(a, b);
+}
+
+/* Heapsort: no recursion, no extra memory. */
+static void or_sift(unsigned i, unsigned n, int (*cmp)(const struct cap *, const struct cap *))
+{
+    for (;;) {
+        unsigned big = i, l = 2 * i + 1, r = l + 1;
+        if (l < n && cmp(or_rec[l], or_rec[big]) > 0)
+            big = l;
+        if (r < n && cmp(or_rec[r], or_rec[big]) > 0)
+            big = r;
+        if (big == i)
+            return;
+        const struct cap *t = or_rec[i];
+        or_rec[i] = or_rec[big];
+        or_rec[big] = t;
+        i = big;
+    }
+}
+
+static void or_sort(int (*cmp)(const struct cap *, const struct cap *))
+{
+    for (unsigned i = or_n / 2; i-- > 0;)
+        or_sift(i, or_n, cmp);
+    for (unsigned n = or_n; n > 1; n--) {
+        const struct cap *t = or_rec[0];
+        or_rec[0] = or_rec[n - 1];
+        or_rec[n - 1] = t;
+        or_sift(0, n - 1, cmp);
+    }
+}
+
+static bool or_has(const struct cap *c)
+{
+    unsigned lo = 0, hi = or_n;
+
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        if (or_rec[mid] == c)
+            return true;
+        if (or_rec[mid] < c)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
+}
+
+/* Where the kernel should have stored c's metadata, worked out here from
+ * ADR 0010 SC19a's table rather than by asking the kernel. */
+static const struct obj_meta *or_stored(const struct cap *c)
+{
+    const struct obj_meta *m;
+    uint64_t obj;
+
+    switch (c->type) {
+    case CAP_UNTYPED:
+        return &c->ut_meta;
+    case CAP_FRAME:
+    case CAP_ADDRESS_SPACE:
+    case CAP_PAGE_TABLE:
+        return objmeta_frame_entry(pa_raw(cap_obj_paddr(c)) / PAGE_SIZE, &m) ? m : NULL;
+    case CAP_ENDPOINT:
+        return &endpoint_of(c)->meta;
+    case CAP_NOTIFICATION:
+        return &notification_of(c)->meta;
+    case CAP_THREAD:
+        return &thread_of(c)->meta;
+    case CAP_CNODE:
+        return &((const struct cap *)phys_to_virt(cap_obj_paddr(c)))[0].slot_meta;
+    case CAP_TEST_TOKEN:
+        for (unsigned i = 0; objmeta_token_entry(i, &obj, &m); i++)
+            if (m->live && obj == c->object)
+                return m;
+        return NULL;
+    default:
+        return NULL;
+    }
+}
+
+static bool or_contains(const struct cap *ut, const struct cap *c)
+{
+    uint64_t ub = pa_raw(cap_obj_paddr(ut)), cb = pa_raw(cap_obj_paddr(c));
+    return cb >= ub && cb + (1ull << cap_obj_bits(c)) <= ub + (1ull << cap_obj_bits(ut));
+}
+
+static bool meta_mismatch(const char *what, const struct cap *c)
+{
+    kprintf("    meta_audit: %s (type %u object %lx)\n", what, c->type, c->object);
+    return false;
+}
+
+/* One object's records are or_rec[lo, hi). */
+static bool or_group(unsigned lo, unsigned hi, unsigned *frame_objs, unsigned *token_objs)
+{
+    const struct cap *c = or_rec[lo];
+    uint32_t live = hi - lo, nr = 0, nw = 0, aw = 0, ax = 0;
+
+    for (unsigned k = lo; k < hi; k++) {
+        const struct cap *x = or_rec[k];
+        nr += (x->rights & CAP_R_READ) != 0;
+        nw += (x->rights & CAP_R_WRITE) != 0;
+        if (x->type == CAP_FRAME) {
+            /* The hardware entry, not the record's own bookkeeping. */
+            uint64_t e = x->map_entry ? *x->map_entry : 0;
+            if (e & PTE_P) {
+                aw += (e & PTE_W) != 0;
+                ax += (e & PTE_NX) == 0;
+            }
+            aw += x->slot_flags == (SLOT_BINDING | TS_IPCBUF);
+        }
+    }
+    if (c->type == CAP_DEBUG_CONSOLE)
+        return true;   /* no object, no metadata (SC19a) */
+    const struct obj_meta *m = or_stored(c);
+    if (!m)
+        return meta_mismatch("no metadata", c);
+    if (m->live != live)
+        return meta_mismatch("live count", c);
+    if (m->flags & ~OBJ_FROZEN)
+        return meta_mismatch("flags", c);
+    if (c->type == CAP_ENDPOINT || c->type == CAP_NOTIFICATION) {
+        if (m->n_read != nr || m->n_write != nw)
+            return meta_mismatch("rights counts", c);
+    } else if (c->type == CAP_FRAME) {
+        if (m->alias_w != aw || m->alias_x != ax)
+            return meta_mismatch("alias counts", c);
+    } else if (m->n_read || m->n_write) {
+        return meta_mismatch("stray counts", c);
+    }
+    if (c->type == CAP_UNTYPED && live != 1)
+        return meta_mismatch("Untyped with several records", c);
+    if (c->type == CAP_TEST_TOKEN) {
+        ++*token_objs;
+        return m->carver == NULL || meta_mismatch("token carver", c);
+    }
+    if (c->type == CAP_FRAME || c->type == CAP_ADDRESS_SPACE || c->type == CAP_PAGE_TABLE)
+        ++*frame_objs;
+    /* The carving back-pointer: a live Untyped record whose range holds
+     * the object. Only an Untyped may have none (a boot or test root). */
+    if (!m->carver)
+        return c->type == CAP_UNTYPED || meta_mismatch("no carver", c);
+    return true;
+}
+
+static bool meta_audit(void)
+{
+    static const struct obj_meta zero;
+    const struct obj_meta *m;
+    uint64_t obj;
+    unsigned frame_objs = 0, token_objs = 0, threads = 0, thread_objs = 0;
+    bool ok = true;
+
+    or_collect();
+    if (or_overflow) {
+        kprintf("    meta_audit: too many records\n");
+        return false;
+    }
+
+    /* By address: every record is counted once, and carvers are found. */
+    or_sort(or_by_ptr);
+    for (unsigned k = 1; k < or_n; k++)
+        if (or_rec[k] == or_rec[k - 1])
+            return meta_mismatch("record found twice", or_rec[k]);
+    for (unsigned k = 0; k < or_n && ok; k++) {
+        const struct cap *c = or_rec[k];
+        const struct obj_meta *cm = c->type == CAP_DEBUG_CONSOLE ? NULL : or_stored(c);
+        if (cm && cm->carver &&
+            !(or_has(cm->carver) && cm->carver->type == CAP_UNTYPED && or_contains(cm->carver, c)))
+            ok = meta_mismatch("carver is not a live Untyped holding the object", c);
+    }
+
+    /* By object: each group is one object's records. */
+    or_sort(or_by_object);
+    for (unsigned lo = 0, hi; ok && lo < or_n; lo = hi) {
+        for (hi = lo + 1; hi < or_n && or_rec[hi]->type == or_rec[lo]->type &&
+                          or_rec[hi]->object == or_rec[lo]->object; hi++)
+            ;
+        ok = or_group(lo, hi, &frame_objs, &token_objs);
+        thread_objs += or_rec[lo]->type == CAP_THREAD;
+    }
+    if (!ok)
+        return false;
+
+    /* Nothing is stored for an object with no records: every non-zero
+     * frame table entry and token entry belongs to an object found above,
+     * and a thread object is registered exactly while it has records. */
+    unsigned nonzero = 0, tokens = 0;
+    for (uint64_t i = 0; objmeta_frame_entry(i, &m); i++)
+        nonzero += memcmp(m, &zero, sizeof(zero)) != 0;
+    for (unsigned i = 0; objmeta_token_entry(i, &obj, &m); i++)
+        tokens += m->live != 0;
+    for (const struct thread *t = thread_registry_first(); t; t = t->reg_next)
+        threads++;
+    if (nonzero != frame_objs) {
+        kprintf("    meta_audit: %u frame table entries in use, %u objects\n", nonzero, frame_objs);
+        return false;
+    }
+    if (tokens != token_objs || threads != thread_objs) {
+        kprintf("    meta_audit: tokens %u/%u threads %u/%u\n", tokens, token_objs, threads,
+                thread_objs);
+        return false;
+    }
+    return true;
+}
+
+/* ---- Stage 2: counters, metadata and the freeze (ADR 0010, SC17-SC22a) ---- */
+
+static const struct obj_meta meta_zero;
+
+static bool meta_is(const struct cap *c, uint32_t live, uint32_t a, uint32_t b)
+{
+    const struct obj_meta *m = or_stored(c);
+    return m && m->live == live && m->n_read == a && m->n_write == b;
+}
+
+/* SC17, SC19a, C4-C6: counts move with records, only in commit steps;
+ * finality is the count reaching 0, whichever record goes last. */
+static void test_meta_counts(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    const struct obj_meta *m = or_stored(&ut_store[1]);
+    CHECK(meta_is(&ut_store[1], 1, 1, 1) && m->carver == &ut_store[0] && m->flags == 0);
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_READ | G_, 0) == T_OK);
+    CHECK(cap_derive(&uts, 2, 3, CAP_R_READ, 0) == T_OK);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_WRITE, 0x9) == T_OK);
+    CHECK(cap_derive(&uts, 1, 5, 0, 0) == T_OK);           /* no rights: live only */
+    CHECK(meta_is(&ut_store[1], 5, 3, 2) && meta_audit());
+
+    /* C5: every refusal leaves every count as it was. */
+    struct obj_meta before = *m;
+    CHECK(cap_derive(&uts, 3, 6, CAP_R_ALL, 0) == T_EPERM);   /* no GRANT */
+    CHECK(cap_derive(&uts, 1, 2, CAP_R_ALL, 0) == T_EBUSY);   /* occupied */
+    CHECK(cap_derive(&uts, 1, 999, CAP_R_ALL, 0) == T_ERANGE);
+    CHECK(cap_derive(&uts, 1, 6, CAP_R_ALL, 0) == T_OK && cap_delete(&uts, 6) == T_OK);
+    CHECK(memcmp(&before, m, sizeof(before)) == 0 && meta_audit());
+
+    /* C6: deleting the first record re-parents its children and changes
+     * no other count; it is not final, whatever its position. */
+    CHECK(cap_delete(&uts, 1) == T_OK);
+    CHECK(meta_is(&ut_store[2], 4, 2, 1) && ut_store[2].type == CAP_ENDPOINT && meta_audit());
+    CHECK(cap_delete(&uts, 3) == T_OK && cap_delete(&uts, 2) == T_OK);
+    CHECK(meta_is(&ut_store[4], 2, 0, 1) && meta_audit());
+    CHECK(cap_delete(&uts, 4) == T_OK && meta_is(&ut_store[5], 1, 0, 0));
+    /* The last record: the count reaches 0 and the metadata is cleared,
+     * carver included, so nothing stale survives into the memory's next
+     * object. */
+    CHECK(cap_delete(&uts, 5) == T_OK && memcmp(m, &meta_zero, sizeof(meta_zero)) == 0);
+    CHECK(meta_audit());
+
+    /* Every kind of location: retype gives each new object a count of 1
+     * and its carver. */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 14, &uts, 10, 1) == T_OK);
+    CHECK(cap_retype(&uts, 10, CAP_NOTIFICATION, 0, &uts, 11, 2) == T_OK);
+    CHECK(cap_retype(&uts, 10, CAP_CNODE, 2, &uts, 13, 1) == T_OK);
+    CHECK(cap_retype(&uts, 10, CAP_FRAME, 0, &uts, 14, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_THREAD, 0, &uts, 15, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, 16, 1) == T_OK);
+    CHECK(or_stored(&ut_store[10])->carver == &ut_store[0]);
+    for (cap_slot_t k = 11; k <= 14; k++)
+        CHECK(or_stored(&ut_store[k])->live == 1 && or_stored(&ut_store[k])->carver == &ut_store[10]);
+    CHECK(or_stored(&ut_store[11]) != or_stored(&ut_store[12]));   /* per object */
+    CHECK(or_stored(&ut_store[15])->carver == &ut_store[0] &&
+          or_stored(&ut_store[16])->carver == &ut_store[0]);
+    /* A CNode's metadata is a property of its slot 0: a capability stored
+     * there and deleted leaves it alone. */
+    struct cspace cn;
+    CHECK(cnode_view(&uts, 13, &cn) == T_OK);
+    CHECK(cap_derive_to(&uts, 11, &cn, 0, CAP_R_ALL, 0) == T_OK && meta_audit());
+    CHECK(cnode_view(&uts, 13, &cn) == T_OK && cap_delete(&cn, 0) == T_OK);
+    CHECK(or_stored(&ut_store[13])->live == 1 && or_stored(&ut_store[13])->carver == &ut_store[10]);
+    CHECK(cap_derive(&uts, 13, 17, CAP_R_ALL, 0) == T_OK && or_stored(&ut_store[13])->live == 2);
+    CHECK(meta_audit());
+    ut_teardown();
+    CHECK(meta_audit());
+}
+
+/* SC18: frame alias counts across map, protect, unmap, binding and
+ * deletion, checked against the hardware entries by the oracle. */
+static void test_meta_frames(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(build_as(1, 2));
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 10, 1) == T_OK);
+    CHECK(cap_derive(&uts, 10, 11, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive(&uts, 10, 12, CAP_R_ALL, 0) == T_OK);
+    const struct obj_meta *m = or_stored(&ut_store[10]);
+    CHECK(m->live == 3 && m->alias_w == 0 && m->alias_x == 0);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RW) == T_OK && m->alias_w == 1 && meta_audit());
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RW) == T_OK && m->alias_w == 2);
+    /* Protecting to the same rights keeps the alias: still writable. */
+    CHECK(vspace_protect(&uts, 11, RW) == T_OK && m->alias_w == 2 && meta_audit());
+    CHECK(vspace_protect(&uts, 10, RO) == T_OK && m->alias_w == 1 && meta_audit());
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x2000), RX) == T_EPERM);   /* 11 is RW */
+    CHECK(vspace_protect(&uts, 11, RO) == T_OK && m->alias_w == 0);
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x2000), RX) == T_OK && m->alias_x == 1);
+    CHECK(vspace_protect(&uts, 12, RX) == T_OK && m->alias_x == 1 && meta_audit());
+    CHECK(vspace_protect(&uts, 12, RO) == T_OK && m->alias_x == 0 && meta_audit());
+    CHECK(vspace_protect(&uts, 12, RX) == T_EPERM && m->alias_x == 0);  /* V7 */
+    /* Failed maps change nothing. */
+    struct obj_meta before = *m;
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x3000), RW) == T_EBUSY);   /* already mapped */
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0 + 0x3000), RO) == T_EBUSY);
+    CHECK(vspace_unmap(&uts, 12) == T_OK);
+    before = *m;
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0), RX) == T_EBUSY);              /* VA taken */
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + (1ull << 30)), RX) == T_ENOENT); /* no table */
+    CHECK(memcmp(&before, m, sizeof(before)) == 0 && meta_audit());
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x2000), RW) == T_OK);
+    CHECK(m->alias_w == 1 && meta_audit());
+    /* Deleting a mapped record removes its alias in the same deletion. */
+    CHECK(cap_delete(&uts, 12) == T_OK && m->alias_w == 0 && m->live == 2 && meta_audit());
+    /* Tearing down the page tables detaches the mappings under them. */
+    CHECK(cap_delete(&uts, 4) == T_OK && m->alias_w == 0 && m->alias_x == 0 && meta_audit());
+    CHECK(ut_store[10].map_entry == NULL && ut_store[11].map_entry == NULL);
+    /* The last record clears the frame table entry. */
+    CHECK(cap_delete(&uts, 11) == T_OK && cap_delete(&uts, 10) == T_OK);
+    CHECK(memcmp(m, &meta_zero, sizeof(meta_zero)) == 0 && meta_audit());
+    ut_teardown();
+}
+
+/* SC18: a count with no room refuses a new record with T_ERANGE and
+ * changes nothing; derivation, binding and transfer all meet it. The
+ * count is raised by hand (2^32 records would need 512 GiB) and restored
+ * before the oracle looks. */
+static void test_meta_overflow(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &uts, 2, 1) == T_OK);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7 }, 1));
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV);
+    CHECK(xfer_sender(10, 6, 0xCD, (const uint32_t[]){ 5 }, 1));
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_derive_to(&uts, 2, &c10, 5, CAP_R_ALL, 0) == T_OK);
+    CHECK(meta_audit());
+
+    struct obj_meta *m = (struct obj_meta *)or_stored(&ut_store[2]);
+    struct obj_meta *me = (struct obj_meta *)or_stored(&ut_store[1]);
+    struct obj_meta real = *m, real_e = *me;
+    m->live = OBJ_LIVE_MAX + 1;   /* as if 2^32 - 3 records existed */
+    me->live = OBJ_LIVE_MAX + 1;
+    struct obj_meta before = *m;
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    CHECK(cap_derive(&uts, 2, 3, CAP_R_ALL, 0) == T_ERANGE);
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_FAULT, &uts, 1) == T_ERANGE);
+    run_user();   /* the transfer: refused at capture, receiver untouched */
+    CHECK(test_report_count == 1 && test_reports[0].a == (uint64_t)T_ERANGE);
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b) && memcmp(&before, m, sizeof(before)) == 0);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV);
+
+    m->live = OBJ_LIVE_MAX;       /* exactly at the limit: still allowed */
+    CHECK(cap_derive(&uts, 2, 3, CAP_R_ALL, 0) == T_OK && m->live == OBJ_LIVE_MAX + 1);
+    CHECK(cap_delete(&uts, 3) == T_OK && m->live == OBJ_LIVE_MAX);
+    *m = real;
+    *me = real_e;
+    CHECK(meta_audit());
+    ut_teardown();
+}
+
+/* SC22a: a frozen object, or an object under a frozen Untyped, gets no
+ * new record by derive, binding, transfer or retype; T_EBUSY, nothing
+ * changed; other objects unaffected. */
+static void test_meta_freeze(void)
+{
+    CHECK(ut_setup(20));
+    /* U0 (slot 0) > U1 (20) > U2 (21); objects under each. */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 16, &uts, 20, 1) == T_OK);
+    CHECK(cap_retype(&uts, 20, CAP_UNTYPED, 14, &uts, 21, 1) == T_OK);
+    CHECK(cap_retype(&uts, 21, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);   /* under U2 */
+    CHECK(cap_retype(&uts, 21, CAP_FRAME, 0, &uts, 2, 1) == T_OK);      /* under U2 */
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 3, 1) == T_OK);    /* under U0 only */
+    /* An unrelated Untyped straight from a root: never affected. */
+    struct cspace *root = untyped_root_cspace();
+    cap_slot_t r = 0;
+    while (r < root->nslots && !(root->slots[r].type == CAP_UNTYPED && cap_obj_bits(&root->slots[r]) > 16))
+        r++;
+    CHECK(r < root->nslots && cap_retype(root, r, CAP_UNTYPED, 16, &uts, 30, 1) == T_OK);
+    CHECK(cap_retype(&uts, 30, CAP_ENDPOINT, 0, &uts, 31, 1) == T_OK);
+    CHECK(spawn(40, P(hello), false, NULL));
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+    CHECK(meta_audit());
+
+    world_tables((const cap_slot_t[]){ 40 }, 1);
+    /* Freezing the object itself. */
+    objmeta_test_freeze(&ut_store[1], true);
+    world_take(&world_a);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_ALL, 0) == T_EBUSY);
+    CHECK(thread_bind(&uts, 40 + T_THR, TS_FAULT, &uts, 1) == T_EBUSY);
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    /* Only that object: a sibling under the same Untyped, and the
+     * Untyped itself, are unaffected. */
+    CHECK(cap_derive(&uts, 2, 4, CAP_R_ALL, 0) == T_OK && cap_delete(&uts, 4) == T_OK);
+    CHECK(cap_retype(&uts, 21, CAP_ENDPOINT, 0, &uts, 4, 1) == T_OK && cap_delete(&uts, 4) == T_OK);
+    objmeta_test_freeze(&ut_store[1], false);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_ALL, 0) == T_OK && cap_delete(&uts, 4) == T_OK);
+
+    /* Freezing U0: everything carved under it, at any depth, is blocked;
+     * the chain is followed U2 -> U1 -> U0. */
+    objmeta_test_freeze(&ut_store[0], true);
+    world_take(&world_a);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_ALL, 0) == T_EBUSY);   /* two links up */
+    CHECK(cap_derive(&uts, 2, 4, CAP_R_ALL, 0) == T_EBUSY);
+    CHECK(cap_derive(&uts, 3, 4, CAP_R_ALL, 0) == T_EBUSY);   /* one link */
+    CHECK(thread_bind(&uts, 40 + T_THR, TS_FAULT, &uts, 3) == T_EBUSY);
+    CHECK(thread_bind(&uts, 40 + T_THR, TS_IPCBUF, &uts, 2) == T_EBUSY);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 4, 1) == T_EBUSY);
+    CHECK(cap_retype(&uts, 20, CAP_FRAME, 0, &uts, 4, 1) == T_EBUSY);
+    CHECK(cap_retype(&uts, 21, CAP_FRAME, 0, &uts, 4, 1) == T_EBUSY);
+    /* The task's own objects are under U0 too. */
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 40 + T_THR, &c40, 2, CAP_R_ALL, 0) == T_EBUSY);
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    /* Unrelated objects are untouched by the freeze. */
+    CHECK(cap_derive(&uts, 31, 4, CAP_R_ALL, 0) == T_OK && cap_delete(&uts, 4) == T_OK);
+    CHECK(cap_retype(&uts, 30, CAP_FRAME, 0, &uts, 4, 1) == T_OK && cap_delete(&uts, 4) == T_OK);
+    /* Deletion is not creation: still allowed under a freeze (F1). */
+    CHECK(cap_delete(&uts, 3) == T_OK);
+    objmeta_test_freeze(&ut_store[0], false);
+
+    /* Freezing the middle of the chain: only what lies under U1. */
+    objmeta_test_freeze(&ut_store[20], true);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_ALL, 0) == T_EBUSY);
+    CHECK(cap_retype(&uts, 21, CAP_FRAME, 0, &uts, 4, 1) == T_EBUSY);
+    CHECK(cap_retype(&uts, 20, CAP_FRAME, 0, &uts, 4, 1) == T_EBUSY);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 4, 1) == T_OK && cap_delete(&uts, 4) == T_OK);
+    objmeta_test_freeze(&ut_store[20], false);
+    CHECK(cap_derive(&uts, 1, 4, CAP_R_ALL, 0) == T_OK);
+    CHECK(meta_audit());
+
+    /* Transfer: a sender offering a capability under a frozen Untyped is
+     * refused before anything moves; the receiver stays as it was. */
+    ut_teardown();
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 14, &uts, 20, 1) == T_OK);
+    CHECK(cap_retype(&uts, 20, CAP_NOTIFICATION, 0, &uts, 21, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7 }, 1));
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV);
+    CHECK(xfer_sender(10, 6, 0xCD, (const uint32_t[]){ 5 }, 1));
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_derive_to(&uts, 21, &c10, 5, CAP_R_ALL, 0) == T_OK);
+    objmeta_test_freeze(&ut_store[20], true);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(test_report_count == 1 && test_reports[0].a == (uint64_t)T_EBUSY);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && ep_ok(e));
+    objmeta_test_freeze(&ut_store[20], false);
+    ut_teardown();
+    CHECK(meta_audit());
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -4593,6 +5159,10 @@ static const struct {
     { "fault_nested", test_fault_nested },
     { "fault_kernel_paths", test_fault_kernel_paths },
     { "fault_contract", test_fault_contract },
+    { "meta_counts", test_meta_counts },
+    { "meta_frames", test_meta_frames },
+    { "meta_overflow", test_meta_overflow },
+    { "meta_freeze", test_meta_freeze },
     { "cpu_hardening", test_cpu_hardening },
 };
 
@@ -4603,6 +5173,7 @@ __noreturn void selftest_run(void)
     for (size_t i = 0; i < ARRAY_SIZE(tests); i++) {
         unsigned before = failures;
         tests[i].fn();
+        CHECK(meta_audit());   /* SC31.3: counters exact after every test */
         kprintf("  [%s] %s\n", failures == before ? "PASS" : "FAIL", tests[i].name);
     }
 

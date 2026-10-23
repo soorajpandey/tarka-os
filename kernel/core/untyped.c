@@ -85,6 +85,8 @@ void untyped_boot(void)
 
     cspace_init(&root_cs, root_slots, ROOT_CSPACE_SLOTS);
     cap_set_finaliser(CAP_CNODE, cnode_finalise);
+    /* SC18: the frame table exists before any memory can become a Frame. */
+    objmeta_boot();
 
     while (n < ROOT_CSPACE_SLOTS &&
            pmm_take_block(UNTYPED_BOOT_MAX_BITS, KERNEL_RESERVE_FRAMES, &base, &bits)) {
@@ -158,6 +160,11 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
             return T_EBUSY;
     }
 
+    /* 5a. the derivation freeze (ADR 0010 SC22a): nothing is carved from
+     * an Untyped that is frozen or lies under a frozen one */
+    if (obj_frozen(ut))
+        return T_EBUSY;
+
     /* 6. reset rule (O7) */
     if (!cap_has_children(ut))
         ut->ut_watermark = 0;
@@ -201,7 +208,9 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
         c->type = type;
         c->rights = rights;
         c->object = cap_obj_encode(pa_add(base, i * obj_size), obj_bits);
+        meta_new_object(c, ut);   /* the carving back-pointer (SC22a) */
         cap_insert_child(ut, c);
+        meta_add(c);              /* C4 */
     }
     ut->ut_watermark = end;
     return T_OK;

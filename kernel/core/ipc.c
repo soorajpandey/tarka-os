@@ -225,6 +225,11 @@ void thread_registry_remove(struct thread *t)
     t->reg_next = t->reg_prev = NULL;
 }
 
+const struct thread *thread_registry_first(void)
+{
+    return registry;
+}
+
 static bool live(const struct thread *t)
 {
     for (const struct thread *x = registry; x; x = x->reg_next)

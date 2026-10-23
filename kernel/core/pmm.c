@@ -118,6 +118,25 @@ paddr_t pmm_alloc(void)
     return pa(0);
 }
 
+static bool range_free(uint64_t f, uint64_t n);
+
+paddr_t pmm_alloc_contig(uint64_t n)
+{
+    if (n == 0 || n > free_frames)
+        return pa(0);
+    for (uint64_t f = 1; f + n <= nframes; f++) {
+        if (!range_free(f, n))
+            continue;
+        for (uint64_t i = f; i < f + n; i++)
+            set_bit(used, i);
+        free_frames -= n;
+        kernel_frames += n;
+        memset(phys_to_virt(pa(f * PAGE_SIZE)), 0, n * PAGE_SIZE);
+        return pa(f * PAGE_SIZE);
+    }
+    return pa(0);
+}
+
 int pmm_free(paddr_t frame)
 {
     uint64_t p = pa_raw(frame);
@@ -189,3 +208,4 @@ bool pmm_frame_is_free(paddr_t frame)
 uint64_t pmm_free_count(void) { return free_frames; }
 uint64_t pmm_kernel_count(void) { return kernel_frames; }
 uint64_t pmm_total_count(void) { return total_frames; }
+uint64_t pmm_frame_limit(void) { return nframes; }

@@ -44,33 +44,35 @@ void endpoint_obj_init(paddr_t obj)
     e->receivers.kind = THREAD_BLOCKED_RECV;
 }
 
-/* P27a: computed, not cached; walks only this object's capabilities. */
-static unsigned count_with(const struct cap *c, cap_rights_t right, const struct cap *except)
-{
-    unsigned n = 0;
+_Static_assert(sizeof(struct endpoint) <= (1u << ENDPOINT_BITS), "endpoint must fit its object");
 
-    for (struct cap *x = cap_object_first((struct cap *)c); x; x = cap_object_next(x))
-        if (x != except && (x->rights & right))
-            n++;
-    return n;
+/* P27a as amended by ADR 0010 SC17: maintained, not computed. */
+static unsigned count_with(const struct cap *c, cap_rights_t right)
+{
+    const struct endpoint *e = endpoint_of(c);
+
+    KASSERT(right == CAP_R_READ || right == CAP_R_WRITE);
+    return right == CAP_R_READ ? e->meta.n_read : e->meta.n_write;
 }
 
 unsigned endpoint_caps_with(const struct cap *c, cap_rights_t right)
 {
-    return count_with(c, right, NULL);
+    return count_with(c, right);
 }
 
 /* Per-capability cleanup (P27, P43, P44). A blocked sender waits for a
  * receiver, so it is woken when the last receive authority goes; a
  * blocked receiver waits for a sender, so it is woken when the last send
- * authority goes. */
+ * authority goes. The counts still include `c` (it is uncounted in the
+ * step that unlinks it), so `c` is the last with a right when the count
+ * is 1. */
 static void endpoint_cleanup(struct cap *c)
 {
     struct endpoint *e = endpoint_of(c);
 
-    if ((c->rights & CAP_R_READ) && count_with(c, CAP_R_READ, c) == 0)
+    if ((c->rights & CAP_R_READ) && count_with(c, CAP_R_READ) == 1)
         waitq_wake_all(&e->senders, T_EDEAD);
-    if ((c->rights & CAP_R_WRITE) && count_with(c, CAP_R_WRITE, c) == 0)
+    if ((c->rights & CAP_R_WRITE) && count_with(c, CAP_R_WRITE) == 1)
         waitq_wake_all(&e->receivers, T_EDEAD);
 }
 
@@ -244,7 +246,7 @@ static int64_t send_common(struct thread *t, struct cspace *cs, cap_slot_t slot,
         return rc;         /* P58: the caller's offer for the reply */
     struct endpoint *e = endpoint_of(c);
     struct thread *r = waitq_first(&e->receivers);
-    if (!r && count_with(c, CAP_R_READ, NULL) == 0)
+    if (!r && count_with(c, CAP_R_READ) == 0)
         return T_EDEAD;    /* nobody can ever receive (P27) */
 
     capture(b, info, c->badge, &m);
@@ -362,7 +364,7 @@ int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot)
         return rc;
     struct endpoint *e = endpoint_of(c);
     struct thread *s = drain(e, cs, &o, &p);
-    if (!s && count_with(c, CAP_R_WRITE, NULL) == 0)
+    if (!s && count_with(c, CAP_R_WRITE) == 0)
         return T_EDEAD;    /* nobody can ever send (P27) */
     return recv_commit(t, e, s, &p, &o, false);
 }
@@ -459,7 +461,7 @@ int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot
     /* Phases 3 and 4: drain, then liveness, before anything of ours. */
     struct endpoint *e = endpoint_of(c);
     struct thread *s = drain(e, cs, &o, &p);
-    if (!s && count_with(c, CAP_R_WRITE, NULL) == 0)
+    if (!s && count_with(c, CAP_R_WRITE) == 0)
         return T_EDEAD;
     /* Phase 5: commit the reply, then receive. */
     bool skipped = false;
@@ -494,7 +496,7 @@ int endpoint_fault(struct thread *t)
         return T_EBADCAP;  /* no handler */
     struct endpoint *e = endpoint_of(c);
     struct thread *r = waitq_first(&e->receivers);
-    if (!r && count_with(c, CAP_R_READ, NULL) == 0)
+    if (!r && count_with(c, CAP_R_READ) == 0)
         return T_EDEAD;    /* nobody can ever handle it */
 
     /* P68: only the thread's own state; no offer, no call_grant. */

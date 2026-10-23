@@ -368,9 +368,13 @@ in every cspace, CNode and binding slot.
   Frames never overlap (O5), so one entry per base page cannot conflict.
   A future large Frame would use the entry at its base page; that
   belongs to the large-pages design.
-- **Capacity.** The table is sized at boot to cover exactly the physical
-  ranges handed out as Untyped: 8 bytes per page, about 0.2% of that
-  memory. It is reserved before any Untyped exists. **It cannot fill at
+- **Capacity.** The table is sized at boot to cover every page the
+  physical allocator manages, which includes every range handed out as
+  Untyped. *Corrected at stage 2:* an entry is 24 bytes, not 8, because
+  it also holds the live-record count (SC19a), the freeze flag and the
+  carving back-pointer (SC22a) of the Frame, AddressSpace or PageTable
+  based there: about 0.6% of memory. It is reserved before any Untyped
+  exists. **It cannot fill at
   run time**, because every page that can ever back a Frame has its
   entry from boot. There is no allocation, no lookup structure and no
   blocking. If the reserve cannot hold the table, boot fails, which is
@@ -392,9 +396,9 @@ the count lives:
 | Endpoint, Notification | in the object (SC23) |
 | CNode | the slot-property area of its slot 0 (SC20a) |
 | Thread | in the TCB |
-| AddressSpace, PageTable | in the shadow page (ADR 0007) |
+| AddressSpace, PageTable | the frame metadata table entry of its base page (SC18). *Corrected at stage 2:* this said "in the shadow page", which has no free space (all 512 slots are back-pointers) |
 | Frame | the frame metadata table entry of its base page (SC18), alongside the alias counters |
-| Untyped | not needed: an Untyped has exactly one record (O2) |
+| Untyped | its own record, which is unique (O2). The count is always 1; keeping it makes finality one rule for every type |
 | Debug console, test token | no object, no finaliser; not counted |
 
 C1-C6 apply to it as to the rights counters.
@@ -1234,27 +1238,30 @@ limit:
 
 ## Implementation order
 
-Each stage keeps every existing test passing before the next begins.
+Each stage keeps every existing test passing before the next begins,
+and each ends with its own gates, mutation testing, review and
+documentation. *Revised at stage 2* to the agreed order: dying objects
+come before continuations, and the scheduler plumbing waits until
+everything it depends on exists.
 1. **`struct cap` to 128 bytes and the bracket-list CDT** (SC20, SC20a),
    with the proof's tests (test 7) and gates SC31.1 and SC31.4.
    Revocation switches to first-child deletion, still one-pass in this
-   stage: the existing API keeps working until stage 5 replaces it. This
+   stage: the existing API keeps working until stage 4 replaces it. This
    is the riskiest change, so it goes first, with the scheduler
    untouched.
-2. **Counters, the frame metadata table and the carving back-pointers**
-   (SC17-SC19a), checked against the rescan (gates SC31.2, SC31.3).
-   Remove every O(copies) walk. Add the derivation freeze check
-   (SC22a).
-3. **Ownership, transitions and the idle thread** (SC1-SC8, SC29), with
-   no timer yet.
-4. **Object serials** (SC21), **dying objects and the reaper** (SC23,
+2. **Accounting: counters, the frame metadata table, the carving
+   back-pointers and the creation gates** (SC17-SC19a), checked against
+   an independent rescan (gates SC31.2, SC31.3, SC31.5). Remove every
+   O(copies) walk. Add the derivation freeze check (SC22a).
+3. **Object serials** (SC21), **dying objects and the reaper** (SC23,
    SC24), and the amended O7/O8.
-5. **Thread continuations,** then the receive drain (SC25) and revocation
+4. **Thread continuations,** then the receive drain (SC25) and revocation
    as a continuation with the freeze (SC22); the retype limit (SC28).
-6. **Timer preemption and the quantum** (SC9-SC14), with the T36 tests.
-   Then the work counter (SC27) across the whole suite.
-7. **Mutation testing, review, documentation,** and the amendments
-   above. T36 is then satisfied.
+5. **Scheduler plumbing: ownership, transitions and the idle thread**
+   (SC1-SC8, SC29), with no timer yet.
+6. **Timer preemption, the quantum and fairness** (SC9-SC14), with the
+   T36 tests. Then the work counter (SC27) across the whole suite, and
+   the amendments above. T36 is then satisfied.
 
 ## Implementation notes
 
@@ -1266,7 +1273,7 @@ Each stage keeps every existing test passing before the next begins.
   (gate SC31.4). It never deletes an Untyped that still has descendants:
   the victim search descends through such Untypeds (at most `CHAIN_MAX`
   of them), so O8 holds at every step and the carving back-pointers of
-  stage 2 stay valid. The revoke API is unchanged until stage 5.
+  stage 2 stay valid. The revoke API is unchanged until stage 4 (stage 5 in the original numbering).
 - **Transitional:** `is_final()`, `cap_object_first()` and
   `cap_object_next()` still decide finality and iterate an object's
   records by list position, adapted to brackets. That is correct under
@@ -1294,3 +1301,93 @@ Each stage keeps every existing test passing before the next begins.
   frame holding eight records over the 1 KiB frame limit (T33); test
   storage for records is now static. No kernel function keeps a record
   on its stack.
+
+**Stage 2 (done).**
+- **Where the metadata lives** (`kernel/core/objmeta.c`): a 24-byte
+  `struct obj_meta` (live count; READ and WRITE counts, or for a Frame
+  the writable and executable alias counts; freeze flag; carving
+  back-pointer) at the SC19a location for each type. Endpoints and
+  notifications grew from 64 to 128 bytes (`ENDPOINT_BITS` 7) to hold it.
+  A CNode's is the slot property `slot_meta` of its slot 0, which
+  `cap_slot_clear()` preserves; an Untyped's is `ut_meta` in its own
+  record. `struct cap` stays 128 bytes: the six reserved words became
+  these two fields.
+- **The frame table** is allocated by `pmm_alloc_contig()` in
+  `untyped_boot()` before the first Untyped, counted as kernel frames,
+  and never freed (256 MiB of RAM: 1.5 MiB of table). Boot panics if it
+  does not fit.
+- **Finality** is `meta_del()` taking the count from 1 to 0, in
+  `destroy_slot()` between the cleanup hook and the unlinking. Cleanup
+  hooks therefore see counts that still include the record being
+  deleted (an endpoint's last READ record is the one with READ when the
+  count is 1). `is_final()`, `cap_object_first()`, `cap_object_next()`,
+  `cap_same_object()`, the endpoint `count_with()` walk and the
+  notification `count_write()` walk are gone, and V6's alias check is
+  O(1) from the alias counts.
+- **Count 0 is not reuse.** Reaching 0 clears the metadata (nothing stale
+  survives into the memory's next object, and retype asserts it finds
+  zero) and runs the finaliser synchronously, as before. Whether memory
+  can be reused is still decided only by O7 (the Untyped has no
+  children); stage 3 inserts the dying transaction between the count
+  reaching 0 and that point, and will read the carving back-pointer at
+  the dying transition rather than after it.
+- **Counts change only in commit steps:** `cap_derive_commit()` (derive,
+  transfer, binding), retype step 9, `cap_install()` (boot roots),
+  `destroy_slot()`, and for aliases `vspace_map()`, `cap_detach()` (unmap,
+  deletion, page-table teardown), `vspace_protect()` and the IPC-buffer
+  binding. A failing operation returns before any of them (C5).
+- **Creation gates.** `cap_install()` now accepts only the types no retype
+  can make (boot Untypeds, the debug console, test tokens), so every
+  other object has a carver. `cap_derive_check()` ends with
+  `meta_check_new()`: `T_EBUSY` if the source's object or any Untyped on
+  its carving chain is frozen, `T_ERANGE` if the count has no room
+  (`OBJ_LIVE_MAX` leaves room for the three records one message can
+  create). Retype refuses a frozen chain with `T_EBUSY` at its step 5a.
+  Until stage 4 nothing in the kernel sets the freeze flag; tests set it
+  through a test-only hook.
+- **Gate scripts** (`scripts/check-cdt.sh`, run by `make test`): SC31.2
+  forbids the positional helpers, any object comparison involving a CDT
+  neighbour, and any object comparison in `cap.c`; SC31.5 requires
+  `cap_insert_child()` to be called from exactly `cap_derive_commit()`
+  and `cap_retype()`. Each check was shown to fail on an injected
+  violation.
+- **The independent oracle** (`meta_audit()` in the self-tests) finds
+  records by scanning storage (the root cspace, every test store, every
+  live thread's binding slots, every CNode reachable from those), never
+  through a CDT link. It reads frame mappings from the hardware entries,
+  not from `map_state`, and locates stored metadata itself rather than
+  through `obj_meta()`. It compares, for every object: the live count,
+  the rights or alias counts, that an Untyped has one record, and that
+  the carver is a live Untyped containing the object. It also checks
+  that no metadata exists for an object without records: frame table
+  entries, test-token entries and registered threads. It runs after
+  every test, inside every IPC audit (`AUDIT()`, `ep_ok()`, `notif_ok()`)
+  and at each step of the new tests.
+- **A test bug it found:** the random CDT test re-initialised its two
+  cspaces between rounds without deleting their live records. That left
+  the previous round's objects counted (and their CDT links dangling
+  into zeroed memory). Positional finality could not see it; the
+  counter did.
+- **Tests:** `meta_counts` (every location, failure atomicity, finality
+  regardless of which record goes last, re-parenting changes no count),
+  `meta_frames` (map, same-rights and narrowing protect, unmap,
+  deletion, page-table teardown, failed maps), `meta_overflow` (derive,
+  binding and transfer refused with `T_ERANGE`, nothing changed, the
+  limit itself allowed), `meta_freeze` (the object, one and two carving
+  links, the middle of a chain, unrelated objects unaffected, deletion
+  still allowed, a refused transfer leaves sender and receiver
+  byte-identical).
+- **Mutation testing:** 26 mutants, all caught. There is one per counter
+  site (derive, install, retype, delete, binding add and remove, map,
+  unmap, both halves of protect, READ increment, WRITE decrement), four
+  wrong-object updates (the first object of a retype, the next frame
+  table entry, slot 1 of a CNode, the source instead of the copy), the
+  four freeze bypasses (derive, retype, chain not walked, one link
+  only), overflow not refused, positional finality, an alias counted
+  before a failing map, the final metadata not cleared, and both
+  liveness thresholds. The one survivor of the first run (protect's
+  increment, a no-op unless a mapping is re-protected to the same
+  rights) got a test. All 18 counter mutants were then re-run with every
+  assertion in the metadata code compiled out, so that only the tests
+  could catch them: all 18 were caught, most by the oracle.
+

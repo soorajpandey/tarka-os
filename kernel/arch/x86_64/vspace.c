@@ -50,9 +50,12 @@ static void tlb_flush_user(void)
 }
 
 /* Forget that `c` fills a hardware entry (the entry itself is cleared by
- * the caller). */
+ * the caller). A frame's mapping stops being an alias in the same step
+ * (ADR 0010 SC18, C4). */
 static void cap_detach(struct cap *c)
 {
+    if (c->type == CAP_FRAME && (c->map_state & MS_MAPPED))
+        meta_alias(c, c->map_state & MS_RIGHTS, -1);
     c->map_state = 0;
     c->map_entry = NULL;
 }
@@ -217,37 +220,13 @@ static uint64_t pte_flags(cap_rights_t r)
     return f;
 }
 
-/* A capability bound as a thread's IPC buffer is a writable alias: the
- * kernel writes into its frame (ADR 0009, P5). */
-static bool ipcbuf_binding(const struct cap *c)
+/* V6: a new alias that wants `want` must not make one physical frame
+ * writable through one capability and executable through another. The
+ * frame's alias counts (ADR 0010, SC18) say what exists now: writable
+ * mappings and IPC-buffer bindings, and executable mappings. */
+bool vspace_frame_alias_conflict(const struct cap *frame, cap_rights_t want)
 {
-    return c->slot_flags == (SLOT_BINDING | TS_IPCBUF);
-}
-
-/* V6: refuse a new alias that would make one physical frame writable
- * through one capability and executable through another. `skip` is the
- * capability that will hold the new alias, if it is one of the frame's
- * existing records (a mapping); NULL when the alias is a new record (a
- * binding), so that every existing record is checked, the source's own
- * mapping included. */
-static bool alias_conflict(struct cap *frame, const struct cap *skip, cap_rights_t want)
-{
-    for (struct cap *c = cap_object_first(frame); c; c = cap_object_next(c)) {
-        if (c == skip)
-            continue;
-        bool w = ((c->map_state & MS_MAPPED) && (c->map_state & CAP_R_WRITE)) || ipcbuf_binding(c);
-        bool x = (c->map_state & MS_MAPPED) && (c->map_state & CAP_R_EXEC);
-        if ((want & CAP_R_WRITE) && x)
-            return true;
-        if ((want & CAP_R_EXEC) && w)
-            return true;
-    }
-    return false;
-}
-
-bool vspace_frame_alias_conflict(struct cap *frame, cap_rights_t want)
-{
-    return alias_conflict(frame, NULL, want);
+    return meta_alias_conflict(frame, want);
 }
 
 int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, uaddr_t va, unsigned depth)
@@ -319,8 +298,8 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, uaddr_t va,
     struct cap *fc = cap_slot(cs, frame);
     if (fc->map_state & MS_MAPPED)
         return T_EBUSY;  /* V10: one mapping per capability */
-    if (alias_conflict(fc, fc, rights))
-        return T_EPERM;  /* V6 */
+    if (meta_alias_conflict(fc, rights))
+        return T_EPERM;  /* V6; fc itself is unmapped, so not counted */
 
     uint64_t *entry = entry_at(cap_obj_paddr(a), va, 3);
     if (!entry)
@@ -332,6 +311,7 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, uaddr_t va,
     *shadow_of(entry) = fc;
     fc->map_state = ua_raw(va) | rights | MS_MAPPED;
     fc->map_entry = entry;
+    meta_alias(fc, rights, 1);   /* SC18, C4 */
     return T_OK;
 }
 
@@ -366,6 +346,8 @@ int vspace_protect(struct cspace *cs, cap_slot_t frame, cap_rights_t rights)
         return T_EPERM;
 
     *fc->map_entry = pte_make(cap_obj_paddr(fc), pte_flags(rights));
+    meta_alias(fc, cur, -1);     /* SC18: the alias changes kind in this step */
+    meta_alias(fc, rights, 1);
     fc->map_state = (fc->map_state & ~(uint64_t)MS_RIGHTS) | rights;
     tlb_flush_user();
     return T_OK;

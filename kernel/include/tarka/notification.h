@@ -11,10 +11,11 @@
  */
 
 struct notification {
-    uint64_t     pending;
-    struct waitq waiters;      /* kind = THREAD_BLOCKED_NOTIF */
+    uint64_t        pending;
+    struct waitq    waiters;    /* kind = THREAD_BLOCKED_NOTIF */
+    struct obj_meta meta;       /* live and rights counts (ADR 0010, SC17, SC19a) */
 };
-_Static_assert(sizeof(struct notification) <= 64, "notification must fit its 64-byte object");
+_Static_assert(sizeof(struct notification) <= 128, "notification must fit its 128-byte object");
 
 void notification_boot(void);
 void notification_obj_init(paddr_t obj);
@@ -22,7 +23,8 @@ void notification_obj_init(paddr_t obj);
 struct notification *notification_of(const struct cap *c);
 
 /* Number of live capability records conferring signal authority (WRITE)
- * on the notification `c` refers to (P27a). */
+ * on the notification `c` refers to (P27a): the maintained count (ADR
+ * 0010, SC17). */
 unsigned notification_signal_caps(const struct cap *c);
 
 /* Syscall bodies. `t` is the calling thread; results that are not the

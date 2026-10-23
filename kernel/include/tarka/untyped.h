@@ -12,8 +12,13 @@
 #define RETYPE_MAX_COUNT    256
 #define CNODE_MAX_SLOT_BITS 12
 #define FRAME_BITS          12
-#define ENDPOINT_BITS       6
+#define ENDPOINT_BITS       7      /* endpoints and notifications: 128 bytes, room
+                                    * for their metadata (ADR 0010, SC19a) */
 #define CAP_SLOT_BITS       7      /* a CNode slot occupies 128 bytes (ADR 0010, SC20a) */
+
+/* SC22a F2: the longest carving chain. Each nested Untyped is strictly
+ * smaller than its parent and no smaller than UNTYPED_MIN_BITS. */
+#define CHAIN_MAX (UNTYPED_BOOT_MAX_BITS - UNTYPED_MIN_BITS + 1)
 
 /* Frames kept in the kernel's own allocator; everything else becomes
  * Untyped. */

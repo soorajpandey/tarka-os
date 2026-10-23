@@ -19,10 +19,12 @@ void cap_slot_clear(struct cap *c)
 {
     uint32_t flags = c->slot_flags;
     uint64_t link = c->pending_link;
+    struct obj_meta meta = c->slot_meta;
 
     memset(c, 0, sizeof(*c));
     c->slot_flags = flags;
     c->pending_link = link;
+    c->slot_meta = meta;
 }
 
 #ifdef TARKA_SELFTEST
@@ -58,11 +60,6 @@ struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot)
     if (slot >= cs->nslots)
         return NULL;
     return &cs->slots[slot];
-}
-
-bool cap_same_object(const struct cap *a, const struct cap *b)
-{
-    return a && b && a->type == b->type && a->object == b->object;
 }
 
 /* ---- The CDT: a balanced-bracket list (ADR 0010, SC20) ----
@@ -142,42 +139,6 @@ struct cap *cap_first_child(const struct cap *c)
     return cdt_elem_cap(c->open.next);
 }
 
-/*
- * TRANSITIONAL (ADR 0010 stage 1 only). The records of one object happen
- * to form one contiguous run of the list under today's rules: derivation
- * copies the source's object, and the only records whose children are
- * other objects are Untypeds, which cannot be copied (O2). ADR 0010 does
- * not allow the kernel to rely on that; stage 2 replaces these three
- * functions with the live-record count (SC19a), and gate SC31.2 then
- * forbids them.
- */
-static bool is_final(const struct cap *c)
-{
-    if (c->open.prev && cap_same_object(cdt_elem_cap(c->open.prev), c))
-        return false;
-    if (c->close.next && cap_same_object(cdt_elem_cap(c->close.next), c))
-        return false;
-    return !cap_has_children(c) || !cap_same_object(cap_first_child(c), c);
-}
-
-struct cap *cap_object_first(struct cap *c)
-{
-    struct cdt_elem *e = &c->open;
-
-    while (e->prev && cap_same_object(cdt_elem_cap(e->prev), c))
-        e = e->prev;
-    KASSERT(cdt_elem_is_open(e));
-    return cdt_elem_cap(e);
-}
-
-struct cap *cap_object_next(const struct cap *x)
-{
-    for (struct cdt_elem *e = x->open.next; e && cap_same_object(cdt_elem_cap(e), x); e = e->next)
-        if (cdt_elem_is_open(e))
-            return cdt_elem_cap(e);
-    return NULL;
-}
-
 static void destroy_slot(struct cap *c)
 {
     enum cap_type type = c->type;
@@ -187,11 +148,16 @@ static void destroy_slot(struct cap *c)
         binding_hook(c);
 
     /* Undo per-capability state (e.g. a mapping) while the capability is
-     * still intact. */
+     * still intact and counted. */
     if (cleanups[type])
         cleanups[type](c);
 
-    bool final = is_final(c);
+    /* SC19a: this is the last capability to the object exactly when its
+     * live-record count goes from 1 to 0. Nothing about c's place in the
+     * CDT enters into it (gate SC31.2). The count changes in the same
+     * step as the unlinking (C4). */
+    KASSERT(obj_meta(c) != NULL || !finalisers[type]);
+    bool final = meta_del(c);
     uint64_t object = c->object;
 
     cdt_remove(c);
@@ -224,7 +190,7 @@ static struct cap *revoke_victim(struct cap *c)
  * the end of the subtree (ADR 0010 SC22): each step is O(1) apart from
  * the bounded Untyped descent. Every intermediate state is a valid tree.
  * A finaliser may delete further records, even c itself (O11); the loop
- * re-reads c every step. Until stage 5, `budget` 0 still means "until
+ * re-reads c every step. Until stage 4, `budget` 0 still means "until
  * done". */
 static int revoke(struct cap *c, uint32_t budget)
 {
@@ -253,6 +219,19 @@ void cspace_destroy(struct cspace *cs)
     cs->nslots = 0;
 }
 
+/* Only roots that no retype could make: boot Untypeds, the debug console
+ * (no object), and in test builds test tokens (no object; their roots may
+ * share an object value). Every other object comes from retype, which
+ * records its carver (F1, gate SC31.5). */
+static bool installable(enum cap_type type)
+{
+#ifdef TARKA_SELFTEST
+    if (type == CAP_TEST_TOKEN)
+        return true;
+#endif
+    return type == CAP_UNTYPED || type == CAP_DEBUG_CONSOLE;
+}
+
 int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
                 cap_rights_t rights, uint64_t object)
 {
@@ -260,7 +239,7 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
 
     if (!c)
         return T_ERANGE;
-    if (type == CAP_NULL || type >= CAP_TYPE_COUNT || (rights & ~CAP_R_ALL))
+    if (!installable(type) || (rights & ~CAP_R_ALL))
         return T_EINVAL;
     if (c->type != CAP_NULL)
         return T_EBUSY;
@@ -271,6 +250,11 @@ int cap_install(struct cspace *cs, cap_slot_t slot, enum cap_type type,
     c->rights = rights;
     c->object = object;
     cdt_make_root(c);
+    /* A root Untyped is a new object with no carver: the top of every
+     * carving chain (SC22a). */
+    if (type == CAP_UNTYPED)
+        meta_new_object(c, NULL);
+    meta_add(c);
     return T_OK;
 }
 
@@ -325,7 +309,9 @@ int cap_derive_check(const struct cap *s, const struct cap *d, uint64_t badge)
      * rewritten, or a client could impersonate another. */
     if (badge && s->badge)
         return T_EPERM;
-    return T_OK;
+    /* SC22a (frozen: T_EBUSY) and SC18 (no room in the count: T_ERANGE).
+     * Every derivation passes here: derive, transfer and binding. */
+    return meta_check_new(s);
 }
 
 void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
@@ -344,6 +330,7 @@ void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t
     /* Everything else (mapping state, map_entry) stays zero: a copy holds
      * authority, not the source's mappings. */
     cap_insert_child(s, d);
+    meta_add(d);   /* C4: counted in the step that links it in */
 }
 
 static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)

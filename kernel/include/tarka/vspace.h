@@ -34,9 +34,9 @@ void vspace_activate_cap(const struct cap *as);
 
 /* V6 / ADR 0009 P5: would a new capability record to `frame` (a binding)
  * with rights `want` make the frame both writable (by a mapping or as an
- * IPC buffer) and executable? Every existing record is checked, `frame`'s
- * own mapping included. */
-bool vspace_frame_alias_conflict(struct cap *frame, cap_rights_t want);
+ * IPC buffer) and executable? Answered from the frame's alias counts (ADR
+ * 0010, SC18), which include `frame`'s own mapping. */
+bool vspace_frame_alias_conflict(const struct cap *frame, cap_rights_t want);
 
 /* Structural audit of one AddressSpace (ADR 0007 tests): kernel half equal
  * to the master and supervisor-only; every user entry backed by a shadow

@@ -19,6 +19,7 @@
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
 #include <tarka/syscall.h>
+#include <tarka/untyped.h>
 
 struct notification *notification_of(const struct cap *c)
 {
@@ -33,30 +34,26 @@ void notification_obj_init(paddr_t obj)
     n->waiters.kind = THREAD_BLOCKED_NOTIF;
 }
 
-/* P27a: a semantic count, computed rather than cached. All capabilities to
- * one object are adjacent in the CDT (one root per object, every copy a
- * descendant), so this walks only this object's capabilities. */
-static unsigned count_write(const struct cap *c, const struct cap *except)
-{
-    unsigned n = 0;
+_Static_assert(sizeof(struct notification) <= (1u << ENDPOINT_BITS), "notification must fit its object");
 
-    for (struct cap *x = cap_object_first((struct cap *)c); x; x = cap_object_next(x))
-        if (x != except && (x->rights & CAP_R_WRITE))
-            n++;
-    return n;
+/* P27a as amended by ADR 0010 SC17: a semantic count, maintained in the
+ * commit steps that create and delete records, never computed. */
+static unsigned count_write(const struct cap *c)
+{
+    return notification_of(c)->meta.n_write;
 }
 
 unsigned notification_signal_caps(const struct cap *c)
 {
-    return count_write(c, NULL);
+    return count_write(c);
 }
 
 /* Per-capability cleanup: if this is the last capability that confers
  * signal authority, every waiter is woken with T_EDEAD before the
- * deletion completes (P27, I-L1). */
+ * deletion completes (P27, I-L1). The count still includes `c`. */
 static void notification_cleanup(struct cap *c)
 {
-    if ((c->rights & CAP_R_WRITE) && count_write(c, c) == 0)
+    if ((c->rights & CAP_R_WRITE) && count_write(c) == 1)
         waitq_wake_all(&notification_of(c)->waiters, T_EDEAD);
 }
 
@@ -112,7 +109,7 @@ int64_t notification_wait(struct thread *t, struct cspace *cs, cap_slot_t slot, 
         n->pending = 0;
         return T_OK;
     }
-    if (count_write(c, NULL) == 0)
+    if (count_write(c) == 0)
         return T_EDEAD;             /* nobody can ever signal (P27) */
     waitq_block(t, &n->waiters);
     return SYS_NORESULT;

@@ -11,10 +11,11 @@
  */
 
 struct endpoint {
-    struct waitq senders;      /* kind = THREAD_BLOCKED_SEND */
-    struct waitq receivers;    /* kind = THREAD_BLOCKED_RECV */
+    struct waitq    senders;    /* kind = THREAD_BLOCKED_SEND */
+    struct waitq    receivers;  /* kind = THREAD_BLOCKED_RECV */
+    struct obj_meta meta;       /* live and rights counts (ADR 0010, SC17, SC19a) */
 };
-_Static_assert(sizeof(struct endpoint) <= 64, "endpoint must fit its 64-byte object");
+_Static_assert(sizeof(struct endpoint) <= 128, "endpoint must fit its 128-byte object");
 
 /* Info word (P3). */
 #define MSG_LEN(info)     ((unsigned)((info) & 0x3F))
@@ -34,7 +35,8 @@ void endpoint_boot(void);
 void endpoint_obj_init(paddr_t obj);
 struct endpoint *endpoint_of(const struct cap *c);
 
-/* Live capability records conferring `right` on the endpoint (P27a). */
+/* Live capability records conferring `right` on the endpoint (P27a): the
+ * maintained count (ADR 0010, SC17). */
 unsigned endpoint_caps_with(const struct cap *c, cap_rights_t right);
 
 int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
