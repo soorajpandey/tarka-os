@@ -1,6 +1,6 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: proposed, revision 3c (step 6). Rule numbers SC1..SC32 are
+Status: accepted (revision 3c, `2c517b1`; step 6). Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
@@ -1068,7 +1068,7 @@ limit:
 | I-SC8 | "Last capability to an object" is decided by the live-record count, never by CDT position | SC19a, SC20 |
 | I-B1 (closed) | IPC work, message size and queue depth are bounded | P37, SC26, SC29 |
 
-## Amendments to earlier ADRs (on acceptance)
+## Amendments to earlier ADRs (applied on acceptance)
 
 - **ADR 0009:**
   - P27a: counts are maintained and checked against the rescan

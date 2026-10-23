@@ -74,15 +74,23 @@ forge or alter a capability.
 - The copy is recorded as a child of the source in the **capability
   derivation tree (CDT)**. The tree is stored as a doubly linked pre-order
   list with depths, as in seL4, so revocation needs no extra allocation.
+  *Amended by ADR 0010 (SC20, SC20a):* the list is a balanced-bracket
+  list (an open and a close element per record, no depths), so deleting
+  a record and each revocation step are O(1). `struct cap` is 128 bytes.
 
 ### Revocation and destruction
 
 - `revoke(cap)` deletes every descendant of `cap` in the CDT and keeps
   `cap` itself. This is how a supervisor takes back everything it
-  delegated.
+  delegated. *Amended by ADR 0010 (SC22-SC22b):* it runs to completion as
+  a thread continuation, in bounded chunks, with derivation into the
+  subtree frozen until it finishes.
 - `delete(cap)` removes one capability. When it was the last capability to
   its object (no CDT siblings or ancestors referring to the same object),
-  the object is destroyed:
+  the object is destroyed. *Amended by ADR 0010 (SC19a, SC23):* "last"
+  is decided by the object's live-record count, never by CDT position,
+  and objects whose teardown is not constant-time are handed to the
+  reaper:
   - **Thread:** stopped and removed from every queue.
   - **Endpoint:** blocked senders and receivers are woken with `T_EDEAD`.
   - **Frame:** unmapped from every address space (with TLB shootdown,

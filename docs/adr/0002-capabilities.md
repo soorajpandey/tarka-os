@@ -1,6 +1,9 @@
 # ADR 0002: Capability-based access control
 
-Status: accepted
+Status: accepted. *Amended by ADR 0010:* the representation of the
+derivation tree and of capability records (SC20, SC20a), and revocation
+as a frozen, kernel-owned operation (SC22-SC22b); the derivation relation
+itself is unchanged.
 
 ## Context
 

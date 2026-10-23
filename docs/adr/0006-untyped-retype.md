@@ -86,13 +86,17 @@ a previous owner's data, whatever happened to the memory before.
 ### Lifetime and reclamation
 
 **O7. Memory becomes reusable exactly when its Untyped has no children.**
+*Amended by ADR 0010 (SC23):* and its dying count is 0, so memory of an
+object still being torn down by the reaper is never reused; a retype
+that would reset the watermark meanwhile returns `T_EAGAIN`.
 Deleting one object out of many does *not* make its bytes reusable; the
 watermark only resets once the last child is gone. This is the seL4
 model: O(1), with no per-object free lists hidden in the kernel. For
 fine-grained reuse, split an Untyped into small child Untypeds and retype
 one object from each. Deleting that object frees that child.
 
-**O8. An Untyped with children cannot be deleted.** `cap_delete` on it
+**O8. An Untyped with children cannot be deleted.** *Amended by ADR 0010
+(SC23):* nor while its dying count is nonzero. `cap_delete` on it
 fails with `T_EBUSY`; revoke it first. Otherwise its children would be
 re-parented above it and the memory it covered would lose its owner.
 `cspace_destroy` revokes Untypeds before deleting them.
@@ -145,6 +149,9 @@ The root cspace is handed to the first user task once threads exist
 
 ## Known limitations
 
+- *Retired by ADR 0010 (SC23, SC24):* dying CNodes are drained by the
+  per-CPU reaper in bounded chunks, and the "zombie capabilities"
+  anticipated below are replaced by dying objects, which need no slot.
 - ~~CNode finalisers recurse.~~ Fixed (ADR 0008, T33): final CNodes go
   onto an intrusive pending list drained by a single loop, so deleting a
   chain of any depth uses constant kernel stack. Draining a huge tree

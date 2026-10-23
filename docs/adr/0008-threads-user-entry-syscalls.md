@@ -317,7 +317,7 @@ return `T_EINVAL`; they do not fault the thread.
 
 | Syscall | Authority |
 |---|---|
-| `cap_identify`, `cap_derive`, `cap_delete`, `cap_revoke` | the capabilities named |
+| `cap_identify`, `cap_derive`, `cap_delete`, `cap_revoke` | the capabilities named (*ADR 0010 SC22:* `cap_revoke` takes no budget and returns when complete) |
 | `retype` | Untyped with WRITE (O3) |
 | `vspace_install`, `vspace_map`, `vspace_unmap`, `vspace_protect` | per ADR 0007 |
 | `thread_bind`, `thread_unbind`, `thread_read_regs`, `thread_write_regs`, `thread_resume`, `thread_suspend`, `thread_read_fault` | Thread capability rights (T3) |
@@ -430,6 +430,8 @@ error to the caller and leave the thread running:
 - unmapped or kernel user pointer: `T_EFAULT`
 
 **T36. No untrusted program runs before timer preemption exists.**
+*ADR 0010 (SC9-SC14) specifies how T36 is met: it is satisfied once
+ADR 0010's T36 tests pass.*
 Until step 6, the only user programs are the kernel's own test programs.
 The first program not written as part of the kernel test suite runs only
 once:

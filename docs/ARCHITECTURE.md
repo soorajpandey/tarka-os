@@ -56,10 +56,10 @@
 | Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
 | Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
 | Address spaces, page tables | `arch/x86_64/vspace.c` | done ([ADR 0007](adr/0007-address-spaces.md)): install/map/unmap/protect, W^X across aliases, teardown in any order |
-| Threads, user entry, syscalls, faults | `arch/x86_64/thread.c`, `user.c`, `isr.S`, `user_entry.S`, `core/syscall.c`, `core/uaccess.c` | done ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)): ring 3 runs; 19 syscalls; FIFO run queue without preemption |
+| Threads, user entry, syscalls, faults | `arch/x86_64/thread.c`, `user.c`, `isr.S`, `user_entry.S`, `core/syscall.c`, `core/uaccess.c` | done ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)): ring 3 runs; 28 syscalls; FIFO run queue without preemption |
 | Local APIC | `arch/x86_64/lapic.c` | x2APIC or xAPIC (MMIO); self-IPI, self-NMI, one-shot timer |
-| IPC, notifications | | next ([ADR 0009](adr/0009-ipc.md)) |
-| Scheduler with timer preemption | | planned (step 6; gate for untrusted code, ADR 0008 T36) |
+| IPC, notifications, fault IPC | `core/ipc.c`, `endpoint.c`, `notification.c` | done ([ADR 0009](adr/0009-ipc.md)): send/recv/call/reply/reply_recv, capability transfer, badges, notifications, fault delivery |
+| Scheduler with timer preemption, bounded kernel work | | specified ([ADR 0010](adr/0010-scheduler.md)), implementation stage 1 next (gate for untrusted code, ADR 0008 T36) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
 | IOMMU, DMA domains | | planned ([ADR 0001](adr/0001-microkernel.md)) |
@@ -76,7 +76,8 @@
 | [0006](adr/0006-untyped-retype.md) | Untyped memory, retype, lifetime and reclamation (precise rules O1–O11) | accepted |
 | [0007](adr/0007-address-spaces.md) | Address spaces, page tables, mapping authority, W^X and aliasing, unmapping, TLB invalidation (rules V1–V15) | accepted |
 | [0008](adr/0008-threads-user-entry-syscalls.md) | Threads, context, user entry validation, syscall boundary, user-memory access, user faults, unified kernel entry, stack budget (rules T1–T36) | accepted |
-| [0009](adr/0009-ipc.md) | IPC: endpoints, call/reply, notifications, capability transfer, fault IPC, liveness and atomicity (rules P1–P37, P6a, P23a, P27a) | accepted |
+| [0009](adr/0009-ipc.md) | IPC: endpoints, call/reply, notifications, capability transfer, fault IPC, liveness and atomicity (rules P1–P76, P6a, P23a, P27a) | accepted |
+| [0010](adr/0010-scheduler.md) | Scheduler, timer preemption, bounded kernel work: idle threads, continuations, reaper, bracket-list CDT, maintained counters, frozen revocation (rules SC1–SC31, F1–F7, R0–R9) | accepted |
 
 Security invariants and the tests that prove them are listed in
 [SECURITY.md](SECURITY.md#security-invariants).
