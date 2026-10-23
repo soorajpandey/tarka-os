@@ -270,7 +270,10 @@ int thread_resume(struct cspace *cs, cap_slot_t thr)
 
     if ((rc = lookup(cs, thr, CAP_R_WRITE, &t)))
         return rc;
-    if (t->state == THREAD_RUNNABLE || t->state == THREAD_RUNNING)
+    /* Only a stopped thread can be started. A running, runnable or
+     * blocked one is already started; making a blocked one runnable would
+     * leave it in its queue or reply link (ADR 0009, P9). */
+    if (t->state != THREAD_INACTIVE && t->state != THREAD_FAULTED)
         return T_EBUSY;
     if (!thread_runnable_safe(t))
         return T_EPERM;             /* T4 */

@@ -2466,6 +2466,10 @@ static void test_ep_capture(void)
     run_user();
     CHECK(tstate(10) == THREAD_BLOCKED_SEND && tstate(20) == THREAD_BLOCKED_SEND && ep_ok(e));
     CHECK(th(10)->msg.info == MSG_INFO(1, 1) && th(10)->msg.words[0] == 0x1111);
+    /* P9: resuming a blocked thread is refused: it is already started,
+     * and making it runnable would leave it in its queue. */
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_EBUSY);
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && !runq_contains(th(10)) && ep_ok(e));
 
     /* P47: refused receives, with senders queued, change nothing: no READ
      * (only WRITE); holding reply authority, pending or caller-gone. */
