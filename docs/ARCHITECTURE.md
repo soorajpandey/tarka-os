@@ -104,3 +104,8 @@ Security invariants and the tests that prove them are listed in
 - Kernel code never trusts sizes or indices from user space or the
   bootloader without checking them; size arithmetic is overflow-checked.
 - Every new security property comes with a self-test.
+- A test is accepted only once it is shown to tell the property apart
+  from plausible broken implementations (mutation testing). A mutant
+  counts as killed only by a behavioural failure of the suite as it runs.
+  A build failure, a harness failure, or an assertion inside the mutated
+  code alone does not count (ADR 0010 SC31.6).

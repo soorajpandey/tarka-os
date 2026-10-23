@@ -1,12 +1,17 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3f; step 6). Stages 1-5 implemented. Revision 3c was `2c517b1`.
+Status: accepted (revision 3f; step 6), revision 3g proposed. Stages 1-5 implemented. Revision 3c was `2c517b1`.
 Revisions 3d, 3e and 3f (sections "Revision 3d", "Revision 3e" and
-"Revision 3f") amend it with the stage 3, 4 and 5 findings. Rule numbers SC1..SC32 are
+"Revision 3f") amend it with the stage 3, 4 and 5 findings; revision 3g (proposed) with the stage 6 audit. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
 History:
-- **Revision 3f** (this one): the stage 5 audit of SC1-SC8 and SC29
+- **Revision 3g** (this one, proposed): the stage 6 audit of SC9-SC14
+  and T36 against the code and against themselves. Gaps H1-H7: timer
+  ownership, the arming point, quantum units, SC14's mixed units, T36's
+  unchecked conditions, the idle reaping window, and tests that assume
+  no preemption. The plan is H8-H12.
+- **Revision 3f** (`5b8a70d`): the stage 5 audit of SC1-SC8 and SC29
   against the code: gaps G1-G5, the stage 5 plan (G6-G10), and the
   pairing rule G11. Proposed in `3b0c7fc`; accepted after review, with
   these added from it:
@@ -1066,6 +1071,19 @@ implementation order is complete only when its gate passes:
 5. **One insertion path (stage 2).** A build check fails if
    `cap_insert_child()` is called from anywhere except the derivation
    commit and the retype commit, the two places F1 is enforced (SC22b).
+6. **What counts as a kill (every stage; adopted at stage 5
+   acceptance).** A mutant is killed only by a behavioural failure of the
+   test suite as it runs: a failed check, an audit that rejects, or a
+   panic reached by running the tests.
+   - These do not count: a mutant that fails to build or link, a harness
+     error or timeout before the suite starts, or a failure only of an
+     assertion inside the mutated code.
+   - Each mutant is run twice, once as built and once with the mutated
+     subsystem's own assertions disabled. It is caught only if it is
+     caught in both runs.
+   - The harness records why each mutant was killed, and treats a run
+     that never printed `selftest: running` as not run.
+   - An unexplained kill is investigated like a survivor.
 
 ## Pre-acceptance audit (revision 3b)
 
@@ -1298,6 +1316,265 @@ everything it depends on exists.
 6. **Timer preemption, the quantum and fairness** (SC9-SC14), with the
    T36 tests. Then the work counter (SC27) across the whole suite, and
    the amendments above. T36 is then satisfied.
+
+## Revision 3g: stage 6 findings and plan
+
+*Status: proposed.* Stage 6 implements timer preemption, the quantum and
+fairness (SC9-SC14), the work counter (SC27) and the T36 tests. An audit
+of the accepted text against the code, and of the text against itself,
+found seven gaps (H1-H7). H8-H12 are the plan.
+
+**H1. Nobody owns the timer.** SC11 says "nothing else arms it", but no
+owner is named, and three places program the LAPIC timer today, all
+test code:
+- `entry_paths` arms a one-shot to interrupt a spinning user thread
+- `sched_halt_wake` arms one as a wake source for the idle thread
+- `lapic_timer_stop()` is called by the tests to clean up
+
+The kernel itself never arms it. Once the scheduler arms it at every
+dispatch and the idle thread disarms it, both tests break:
+- `sched_halt_wake`'s LAPIC case arms the timer before `run_user()`,
+  and the idle dispatch then disarms it before the HLT, so nothing
+  wakes the CPU and the test hangs
+- `entry_paths`'s arming is overwritten at dispatch
+
+*Proposed fix,* one owner per action:
+
+| Action | Owner | Where |
+|---|---|---|
+| program (arm, re-arm, disarm, set the divider) | `core/sched.c` only, through an arch interface `timer_arm(count)`, `timer_disarm()`, `timer_count()` | arm in `sched_dispatch` of a non-idle thread; disarm in `sched_dispatch` of the idle thread; nowhere else |
+| acknowledge (EOI) | the arch interrupt entry, for every vector, exactly once, before any decision | `entry_from_user`, `isr_dispatch` (as today) |
+| decide (expiry or stale) | `sched_timer(t)` in `sched.c` | called by the entry path for the timer vector only |
+
+- The SC31-style gate (`scripts/check-sched.sh`) is extended: the timer
+  programming functions may be called only from `sched.c`. Tests are
+  not exempt here; they go through the scheduler.
+- **Test wake sources go through the owner.** The halt/wake test asks
+  the scheduler for a wake (`sched_test_wake(ticks)`, test builds only).
+  The idle thread arms that one-shot itself in `idle_wait`, right
+  before `sti; hlt`, and only when a wake was requested. The self-IPI
+  case is unchanged. G4's rule that the escape never stands in for an
+  armed halt is unchanged.
+- `entry_paths`'s user-mode timer interrupt becomes an ordinary
+  quantum expiry, which the T36 tests cover.
+
+**H2. SC11 and SC12 disagree about when the timer is armed, and one
+reading breaks T36.**
+- SC11 says "every **dispatch** of a user thread ... arms it".
+- SC12 says "every dispatch writes a nonzero initial count ...
+  immediately before **returning to user mode**".
+
+These are different places. A thread that makes a syscall and stays
+RUNNING returns to user mode without a new dispatch.
+
+If arming were placed at the return to user mode (`try_exit_to_user`),
+a thread that makes syscalls in a tight loop would get a fresh quantum
+on every return and never expire: T36 broken.
+
+*Proposed fix:*
+- **Q1, the arming point.** The quantum is armed in `sched_dispatch()`
+  when it makes a non-idle thread RUNNING, and only there. A return to
+  user mode without a dispatch never touches the timer.
+- **Q2, the quantum owner.** In each dispatch, with interrupts disabled
+  from `sched_dispatch()` to the return to user mode, `sched_dispatch()`
+  arms the timer and records `quantum_owner = t`, per CPU.
+  - Every return to user mode asserts `quantum_owner == current`.
+  - Every stop, block or yield of the owner clears it.
+  - So no path can reach ring 3 without a quantum armed by that
+    thread's own dispatch. This is the code-level form of T36's hard
+    gate.
+- SC12's correctness argument holds unchanged. It needs only that the
+  count is written nonzero with interrupts disabled before the thread
+  can next take an interrupt, and Q1 satisfies that.
+
+**H3. Quantum accounting has no stated unit or invariant.** SC11 says
+"`QUANTUM` ticks" but not what a tick measures, nor whether the quantum
+is time, dispatches or work. *Proposed:*
+- **Q3, the unit.** A quantum is `QUANTUM` LAPIC timer ticks (at the
+  divider `sched.c` sets at boot) of elapsed time from the dispatch. It
+  includes kernel time on the thread's behalf: continuation chunks run
+  after that dispatch, syscalls, faults and interrupt entries. It does
+  not count dispatches, instructions or work units.
+- **Q4, the generation.** A quantum belongs to exactly one dispatch.
+  Blocking, yielding, stopping or being preempted ends it, and the
+  remainder is never carried over. A thread's next dispatch gets a
+  fresh full quantum.
+- **Q5, expiry.** A timer interrupt preempts if and only if:
+  - it was taken from user mode
+  - `current` is not the idle thread
+  - `current == quantum_owner`
+  - the hardware current count reads 0
+
+  Anything else is stale: acknowledged and ignored. An interrupt taken
+  in the idle thread never preempts. The count is read through a new
+  `timer_count()` (the LAPIC current-count register, x2APIC and xAPIC).
+  Nothing reads it today.
+- **Preemption uses `sched_yield`.** SC10's `sched_preempt` is not a
+  separate primitive. G1's table has one primitive per edge, and
+  preemption is the RUNNING → RUNNABLE edge, so the cause is recorded
+  only in test counters.
+
+**H4. SC14 mixes units, so it is not provable as written.** The bound
+t0 + k·(QUANTUM + W) + W adds QUANTUM, which is in timer ticks, to W,
+which is in work units (SC26). A work unit has no fixed duration in
+ticks: cache misses, SMIs and emulation make that unknowable. Bounded
+kernel work and fairness are different properties, and the text merges
+them. *Proposed:* split SC14 into two theorems.
+- **SC14a, fairness (by order).** Let X enter the tail of CPU c's run
+  queue at t0, with k non-idle threads ahead of it, as SC14 defines k.
+  Then at most k dispatches of other threads happen on c before X is
+  dispatched.
+  - This is purely structural. Every way to become RUNNABLE appends at
+    the tail (G1, SC13), dispatch takes only the head, and nothing else
+    reorders the queue.
+  - It holds whatever the timer does. It is the property that rules out
+    starvation by ordering.
+- **SC14b, bounded tenure (time).** Each dispatch of a non-idle thread
+  holds the CPU for at most QUANTUM ticks plus T(W) ticks: the time
+  taken by at most one kernel entry of at most W units in progress when
+  the quantum ends (SC9), plus one boundary.
+  - QUANTUM is enforced by the hardware timer (Q1-Q5).
+  - W is enforced by SC26/SC27.
+  - T(W) is a property of the machine, not a constant of the design.
+- **Together:** X is dispatched within k·(QUANTUM + T(W)) + T(W) ticks
+  of t0. The bound is now explicit about which part comes from the
+  scheduler and which from the hardware.
+- O(1) primitives (G5) say nothing about starvation. SC14a does, and
+  it holds for an O(1) scheduler only because of the FIFO tail rule.
+- **Tests:** SC14a is tested exactly, from the dispatch trace, with no
+  timing tolerance. SC14b is tested against a measured T(W), with a
+  stated margin.
+
+**H5. T36 is a hard gate only if four conditions hold, and two have no
+check today.** "No untrusted program runs before timer preemption
+exists" needs:
+1. **User code always runs with interrupts on.** T13 forces IF on every
+   return, user code cannot clear it (IOPL 0), and the LAPIC is not
+   reachable from ring 3 (supervisor-only MMIO, MSRs). Holds.
+2. **Every return to ring 3 carries a quantum armed by that thread's
+   dispatch.** Not checked today; Q2 adds the assertion.
+3. **Kernel entries are bounded (W).** Specified (SC26), not checked:
+   the SC27 work counter does not exist yet. Stage 6 adds it, as the
+   implementation order says.
+4. **Only the timer interrupt can end a user thread's tenure
+   involuntarily.** The NMI, #DF and #MC take the paranoid path and
+   return to the interrupted context; any other vector is acknowledged
+   and ignored. Holds.
+
+*Proposed:* T36 is met when the stage 6 tests pass (as ADR 0008 says)
+**and** conditions 2 and 3 are assertions in every test build, exercised
+across the whole suite: Q2 at every return to ring 3, and SC27 at every
+boundary.
+
+**H6. Gap: no interrupt window while the idle thread reaps.** SC9 and SC5
+give the idle thread a one-instruction interrupt window between reaper
+chunks. The stage 5 code opens interrupts only across the HLT: while the
+reaper has work, the idle thread runs chunk after chunk with interrupts
+off. The reaper's backlog grows with user activity and has no bound, so
+neither does the interrupt latency of an idle-but-reaping CPU. No device
+interrupt exists yet, but the self-IPI does.
+- *Fix:* the window, `sti; nop; cli`, after each idle reaper chunk, as
+  SC5 already says.
+- *Test:* a self-IPI pending while the idle thread reaps a 32-slot CNode
+  is taken in the window after the first chunk, at a recorded RIP, not
+  after the whole drain.
+
+**H7. Gap: today's tests assume no preemption.**
+- `run_in_order` and the FIFO and rendezvous suites expect each thread
+  to block before the next one starts.
+- With a quantum, a thread can be preempted first, and on an emulator
+  whether it is depends on host timing.
+
+*Proposed:*
+- `QUANTUM` is a constant, and test builds may override it through
+  `sched_test_quantum`, which `sched.c` reads at each dispatch.
+- The existing suites keep a quantum long enough that their short
+  programs never expire. This is checked, not assumed: they assert that
+  no preemption happened (a counter), and a suite that did get
+  preempted fails rather than passing for an untested reason.
+- Test 6 reruns the ADR 0009 suites with a short quantum. It asserts
+  only order-independent properties: the audit after every step,
+  conservation, and every thread finishing. It never asserts an
+  interleaving.
+
+**H8. The timer and continuations stay separate** (E4, G6):
+- **The timer only causes a scheduling decision.** It is taken only
+  from user mode or the idle thread (SC9). It never interrupts a
+  continuation chunk, never creates a continuation boundary, and never
+  changes `t->cont`.
+- **A thread with a continuation is never preempted by the timer.** It
+  does not run user code while its continuation is pending, and each
+  chunk already ends at a boundary through `sched_yield` (G6).
+- **Each continuation dispatch gets a fresh quantum** (Q1, Q4). If it
+  runs out during the final chunk, the pending interrupt is taken at the
+  first user instruction after the return, and the thread is preempted
+  then. Q3 says that kernel time counts, so this is correct.
+- **A mutant** that lets the timer path touch `t->cont`, or skip
+  `cont_run`, must be caught.
+
+**H9. Stage 6 plan, in layers, each passing `make test`:**
+1. **The arch timer interface and ownership:** `timer_arm`,
+   `timer_disarm`, `timer_count` (current-count read). The gate is
+   extended (H1), and the two tests are moved to the scheduler's API.
+2. **Quantum arming in dispatch,** `quantum_owner`, and the Q2
+   assertion at every return to ring 3. Disarming in the idle dispatch.
+3. **The expiry path:** EOI, then `sched_timer`, then the Q5 check, then
+   `sched_yield`, then the boundary. The idle reaping window (H6).
+4. **The SC27 work counter:** every loop whose trip count is not a
+   compile-time constant cites its SC26 row and counts. It is asserted
+   at every boundary, and the stage 1 pre-scan mutant (SC31.4) is
+   finally run against it.
+5. **The T36 tests and the H7 reruns.**
+
+**H10. Tests,** the ADR's T36 list (tests 1-6) made exact:
+- **SC14a:** two and five threads spinning without syscalls, plus a
+  thread looping on syscalls (the H2 case). From the dispatch trace,
+  every enqueue-to-dispatch interval has at most k other dispatches,
+  and every thread makes progress.
+- **SC14b:** T(W) is measured on the TSC during the run, and each tenure
+  is at most QUANTUM + T(W) ticks plus a stated margin. The TSC-to-LAPIC
+  ratio is calibrated by the test itself, independently of the
+  scheduler's bookkeeping.
+- **Preemption state:** the preserve-style register and FPU/vector
+  checker running under preemption. The thread is at the tail, and it
+  returns through IRETQ.
+- **Stale interrupts:**
+  - an interrupt pending before a dispatch does not preempt the new
+    thread
+  - one after the quantum ends does
+  - one taken in the idle thread does nothing
+- **Kernel-mode interrupts outside the idle thread:** zero, apart from
+  the test's own window, which is counted separately.
+- **The idle reaping window (H6),** and halt and wake through the owner
+  (H1).
+- **Short-quantum reruns (H7).**
+
+**H11. Mutants** (killed under SC31.6, both as built and with
+`sched.c`'s assertions disabled):
+- **Timer:**
+  - arming at every return to user mode instead of at dispatch (the H2
+    mutant)
+  - no arming
+  - QUANTUM ignored
+  - arming left to the idle thread
+  - a timer write outside `sched.c` (the gate)
+- **Expiry:**
+  - preempting on any timer interrupt (no count check)
+  - never preempting
+  - preempting the idle thread
+  - ignoring `quantum_owner`
+- **Order:**
+  - a preempted thread to the head
+  - a woken thread ahead of X
+  - the quantum remainder carried over
+- **Continuations:** the timer path touching `t->cont`.
+- **Work:** an uninstrumented loop (the counter misses it: caught by its
+  worst-case test exceeding W), and the SC31.4 pre-scan.
+- **Idle:** no window while reaping.
+
+**H12. Non-goals for stage 6:** priorities, SMP, migration (G7 still
+holds), tickless accounting, and time-of-day. One level of FIFO round
+robin is the whole policy (SC13).
 
 ## Revision 3f: stage 5 findings and plan
 
