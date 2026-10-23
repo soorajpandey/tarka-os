@@ -64,6 +64,21 @@
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
 | IOMMU, DMA domains | | planned ([ADR 0001](adr/0001-microkernel.md)) |
 
+## Fixed kernel memory
+
+Memory the kernel takes for itself at boot, before handing the rest to
+user space as Untyped:
+
+| What | Size | Notes |
+|---|---|---|
+| Frame bitmaps (`core/pmm.c`) | 2 bits per page | `used` and `managed` |
+| Frame metadata table (`core/objmeta.c`) | 24 bytes per page: 1.5 MiB at 256 MiB of RAM (0.6%) | ADR 0010 SC18; 32 bytes per page (2.0 MiB) if revision 3d's D3 is accepted |
+| Kernel reserve | 8 MiB (`KERNEL_RESERVE_FRAMES`) | kernel page tables, stacks and other `pmm_alloc()` use |
+
+Per-object kernel state lives in memory the object's creator supplied
+from an Untyped, such as a 128-byte capability record or a 128-byte
+endpoint. It is not part of this fixed cost.
+
 ## Design records
 
 | ADR | Decision | Status |
