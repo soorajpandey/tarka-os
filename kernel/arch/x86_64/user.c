@@ -11,6 +11,7 @@
 #include "lapic.h"
 #include "percpu.h"
 
+#include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
 #include <tarka/selftest.h>
@@ -168,10 +169,15 @@ static void user_fault(struct thread *t, const struct trap_frame *tf)
 
     if (tf->vector == 14)
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    /* P67: NMI, #DF and #MC take the paranoid path and never get here. */
+    KASSERT(tf->vector != 2 && tf->vector != 8 && tf->vector != 18);
     t->fault = (struct fault_record){
         .vector = tf->vector, .error = tf->error, .addr = cr2, .rip = tf->rip,
     };
-    t->state = THREAD_FAULTED;   /* T29: the thread, never the kernel */
+    /* ADR 0009 P69: a call to its handler, or FAULTED if it has none.
+     * T29: the thread, never the kernel. */
+    if (endpoint_fault(t) != T_OK)
+        t->state = THREAD_FAULTED;
 }
 
 void entry_from_user(struct trap_frame *tf);

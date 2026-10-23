@@ -17,7 +17,9 @@ struct thread *waitq_first(const struct waitq *q);
 
 /* Wake a thread blocked in a queue or waiting for a reply: it leaves the
  * queue or reply link, gets `rax` as its syscall result, and becomes
- * RUNNABLE at the tail of the run queue (P10). */
+ * RUNNABLE at the tail of the run queue (P10). A thread delivering a
+ * fault is not in a syscall: it gets no result; T_OK resumes it and
+ * anything else leaves it FAULTED (P70-P72). */
 void thread_wake(struct thread *t, int64_t rax);
 
 /* Wake every thread in `q` with `rax` (object death or authority loss,
@@ -32,11 +34,13 @@ void reply_link(struct thread *server, struct thread *caller, uint32_t flags);
  * whose message has just been delivered) leaves its queue and its staged
  * message and flags, keeps its offer, and becomes BLOCKED_REPLY on
  * `server`, which gains reply authority. */
-void ipc_call_link(struct thread *server, struct thread *caller, bool grant);
+void ipc_call_link(struct thread *server, struct thread *caller, uint32_t reply_flags);
 
 /* Commit a reply (P61): consume `server`'s PENDING authority and wake
- * its caller with T_OK. The reply must already be delivered. */
-void reply_complete(struct thread *server);
+ * its caller with `rax` (T_OK after a delivered reply). The reply must
+ * already be delivered. For a fault caller, T_OK resumes it and anything
+ * else leaves it FAULTED (P71). */
+void reply_complete(struct thread *server, int64_t rax);
 
 /* Consume an authority whose caller is gone (P29, P61). */
 void reply_consume_gone(struct thread *server);

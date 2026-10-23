@@ -88,13 +88,35 @@ static void reply_unlink_caller(struct thread *caller)
     caller->reply_from = NULL;
 }
 
+/* Is `t` blocked delivering a fault (P69, P76)? */
+static bool fault_caller(const struct thread *t)
+{
+    if (t->state == THREAD_BLOCKED_SEND)
+        return (t->ipc_flags & IPC_FAULT) != 0;
+    if (t->state == THREAD_BLOCKED_REPLY)
+        return t->reply_from && (t->reply_from->reply_flags & REPLY_FAULT);
+    return false;
+}
+
 void thread_wake(struct thread *t, int64_t rax)
 {
     KASSERT(blocked(t->state));
+    bool fault = fault_caller(t);
+
     waitq_remove(t);
     reply_unlink_caller(t);
     ipc_clear_staged(t);
-    t->regs.rax = (uint64_t)rax;   /* P10: result, state and queue together */
+    if (fault) {
+        /* P70-P72: no register is written. */
+        if (rax != T_OK) {
+            t->state = THREAD_FAULTED;   /* the record stays (P73) */
+            return;
+        }
+        memset(&t->fault, 0, sizeof(t->fault));
+        t->ret_path = RETURN_IRET;
+    } else {
+        t->regs.rax = (uint64_t)rax;   /* P10: result, state and queue together */
+    }
     t->state = THREAD_RUNNABLE;
     thread_enqueue(t);
 }
@@ -118,27 +140,27 @@ void reply_link(struct thread *server, struct thread *caller, uint32_t flags)
     caller->state = THREAD_BLOCKED_REPLY;
 }
 
-void ipc_call_link(struct thread *server, struct thread *caller, bool grant)
+void ipc_call_link(struct thread *server, struct thread *caller, uint32_t reply_flags)
 {
     KASSERT((caller->state == THREAD_RUNNING && this_cpu()->current == caller) ||
             (caller->state == THREAD_BLOCKED_SEND && (caller->ipc_flags & IPC_CALL)));
     waitq_remove(caller);
     memset(&caller->msg, 0, sizeof(caller->msg));   /* delivered: P42 */
     caller->ipc_flags = 0;                           /* the offer stays (P59) */
-    reply_link(server, caller, grant ? REPLY_CALL_GRANT : 0);
+    reply_link(server, caller, reply_flags);
 }
 
-void reply_complete(struct thread *server)
+void reply_complete(struct thread *server, int64_t rax)
 {
     struct thread *caller = server->reply_to;
 
     KASSERT(server->reply_state == REPLY_PENDING && caller &&
             caller->reply_from == server && caller->state == THREAD_BLOCKED_REPLY);
-    caller->reply_from = NULL;
-    server->reply_to = NULL;
+    /* The wake unlinks both sides (it must still see REPLY_FAULT, P71),
+     * leaving the authority marked gone; then it is consumed (P17). */
+    thread_wake(caller, rax);
+    KASSERT(server->reply_state == REPLY_CALLER_GONE && !server->reply_to);
     server->reply_state = REPLY_NONE;
-    server->reply_flags = 0;
-    thread_wake(caller, T_OK);   /* single use: consumed with the wake (P17) */
 }
 
 void reply_consume_gone(struct thread *server)
@@ -151,6 +173,7 @@ void reply_consume_gone(struct thread *server)
 void ipc_detach(struct thread *t, bool destroying)
 {
     bool was_blocked = blocked(t->state);
+    bool fault = fault_caller(t);
 
     /* Its own wait: a queue, or a reply it is waiting for. */
     waitq_remove(t);
@@ -168,8 +191,11 @@ void ipc_detach(struct thread *t, bool destroying)
     t->reply_flags = 0;
     ipc_clear_staged(t);
 
-    /* P30: an interrupted blocking syscall returns T_EINTR on resume. */
-    if (was_blocked && !destroying)
+    /* P30: an interrupted blocking syscall returns T_EINTR on resume. A
+     * thread delivering a fault is not in a syscall: no register is
+     * written, and on resume it re-executes the faulting instruction
+     * (P72). */
+    if (was_blocked && !destroying && !fault)
         t->regs.rax = (uint64_t)(int64_t)T_EINTR;
 }
 
@@ -294,9 +320,19 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
             if (t->offer.slots[i])
                 return false;
         /* 9 (P59): flags only in the state they belong to. */
-        uint32_t allowed = t->state == THREAD_BLOCKED_SEND ? (IPC_CALL | IPC_CALL_GRANT)
+        uint32_t allowed = t->state == THREAD_BLOCKED_SEND ? (IPC_CALL | IPC_CALL_GRANT | IPC_FAULT)
                          : t->state == THREAD_BLOCKED_RECV ? IPC_REPLY_SKIPPED : 0;
-        if ((t->ipc_flags & ~allowed) || ((t->ipc_flags & IPC_CALL_GRANT) && !calling))
+        if ((t->ipc_flags & ~allowed) || ((t->ipc_flags & (IPC_CALL_GRANT | IPC_FAULT)) && !calling))
+            return false;
+        /* P76: a fault call never has an offer or call_grant, on either
+         * side of the rendezvous. */
+        if ((t->ipc_flags & IPC_FAULT) && ((t->ipc_flags & IPC_CALL_GRANT) || t->offer.count))
+            return false;
+        if ((t->reply_flags & REPLY_FAULT) &&
+            ((t->reply_flags & REPLY_CALL_GRANT) || !t->reply_to || t->reply_to->offer.count))
+            return false;
+        /* 11 (P64): stopping is terminal for reply authority. */
+        if (t->state == THREAD_INACTIVE && (t->reply_state != REPLY_NONE || t->reply_to))
             return false;
         /* 10 (P60): a receiver holds no reply authority; reply flags only
          * with a pending authority. */

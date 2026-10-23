@@ -1240,7 +1240,8 @@ static void test_thread_lifecycle(void)
 
 #define PROGS(X) X(sys1) X(block) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
-    X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
+    X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge) \
+    X(f_ud_go) X(f_pf_retry) X(f_pf_kernel)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
 PROGS(DECL)
 #define P(n) prog_##n##_start, prog_##n##_end
@@ -1975,10 +1976,19 @@ static void test_ipc_states(void)
 static void test_ipc_reply_links(void)
 {
     CHECK(ut_setup(20));
-    for (cap_slot_t b = 10; b <= 60; b += 10) {
-        CHECK(spawn(b, P(hello), false, NULL));
-        CHECK(thread_suspend(&uts, b + T_THR) == T_OK);
+    /* Servers 10, 40 and 70 are parked (blocked), never stopped: a stopped
+     * thread holds no reply authority (P64, audit rule 11). Callers start
+     * stopped; reply_link() makes them BLOCKED_REPLY. */
+    for (cap_slot_t b = 10; b <= 70; b += 10) {
+        if (b == 10 || b == 40 || b == 70) {
+            CHECK(spawn(b, P(block), false, &(struct user_regs){ .rdi = 1 }));
+        } else {
+            CHECK(spawn(b, P(hello), false, NULL));
+            CHECK(thread_suspend(&uts, b + T_THR) == T_OK);
+        }
     }
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_NOTIF && tstate(70) == THREAD_BLOCKED_NOTIF);
 
     /* Caller destroyed: the server keeps its authority, marked gone. */
     reply_link(th(10), th(20), REPLY_CALL_GRANT);
@@ -2006,11 +2016,14 @@ static void test_ipc_reply_links(void)
     CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);
 
     /* Caller suspended: T_EINTR for it, "caller gone" for the server. */
-    reply_link(th(10), th(60), 0);
+    reply_link(th(70), th(60), 0);
     CHECK(thread_suspend(&uts, 60 + T_THR) == T_OK);
     CHECK(tstate(60) == THREAD_INACTIVE && th(60)->regs.rax == (uint64_t)(int64_t)T_EINTR);
-    CHECK(th(10)->reply_state == REPLY_CALLER_GONE && th(60)->reply_from == NULL);
+    CHECK(th(70)->reply_state == REPLY_CALLER_GONE && th(60)->reply_from == NULL);
     CHECK(AUDIT());
+    /* P64: stopping the server is terminal for the gone authority too. */
+    CHECK(thread_suspend(&uts, 70 + T_THR) == T_OK);
+    CHECK(th(70)->reply_state == REPLY_NONE && AUDIT());
 
     ut_teardown();
     CHECK(AUDIT() && runq_empty());
@@ -2485,8 +2498,11 @@ static void test_ep_capture(void)
     CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
     CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);             /* caller gone */
     CHECK(th(40)->reply_state == REPLY_CALLER_GONE);
-    CHECK(endpoint_recv(th(40), &c40, 1) == T_EBUSY && e->senders.head == th(10) && ep_ok(e));
-    th(40)->reply_state = REPLY_NONE;    /* (a reply would consume it, step 5.5) */
+    CHECK(endpoint_recv(th(40), &c40, 1) == T_EBUSY && e->senders.head == th(10));
+    /* (Built by hand on a stopped thread, a state P64 rules out: undo it
+     * before the audit. reply_gone tests this with a real server.) */
+    th(40)->reply_state = REPLY_NONE;
+    CHECK(ep_ok(e));
 
     tbuf(10)->words[0] = 0xBADBAD;                               /* rewritten while blocked */
     CHECK(thread_unbind(&uts, 20 + T_THR, TS_IPCBUF) == T_OK);   /* unbound while blocked */
@@ -3724,6 +3740,418 @@ static void test_ep_badge(void)
     ut_teardown();
 }
 
+/* ---- Fault IPC (ADR 0009, step 5.6) ---- */
+
+#define FAULT_INFO (((uint64_t)FAULT_LABEL << 32) | FAULT_WORDS | INFO_FAULT)
+
+/* Bind thread b's TS_FAULT to a copy of the endpoint at uts `ep` with
+ * `rights` (+GRANT, which binding needs) and `badge`. The copy at uts slot
+ * b + 9 is the binding's parent. */
+static bool fault_bind(cap_slot_t b, cap_slot_t ep, cap_rights_t rights, uint64_t badge)
+{
+    return cap_derive(&uts, ep, b + 9, rights | G_, badge) == T_OK &&
+           thread_bind(&uts, b + T_THR, TS_FAULT, &uts, b + 9) == T_OK;
+}
+
+/* A server parked holding a fault: ep_server at b, receiving on its slot
+ * 1, then parked. */
+static struct ipc_buffer *fault_handler(cap_slot_t b, cap_slot_t f)
+{
+    struct ipc_buffer *hb = ep_server(b, f, CAP_R_READ);
+    nreq = 0;
+    REQ(b, SYS_RECV, 1);
+    REQ(b, SYS_TEST_BLOCK, TB_PARK);
+    return hb;
+}
+
+/* P68-P71, P73: the frozen message, then a label-0 reply that resumes the
+ * thread at the faulting instruction with no register written. */
+static void test_fault_deliver(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    struct ipc_buffer *hb = fault_handler(40, 110);
+    go(40);                                           /* the handler waits */
+    /* Distinctive registers: an RSP no other thread has, and an RAX the
+     * fault path must leave alone (P70). */
+    struct user_regs ir = { .rax = 0x5EED, .rsp = USTACK_TOP - 0x48 };
+    CHECK(spawn(10, P(f_pf_retry), false, &ir));
+    CHECK(th(10)->regs.rsp == USTACK_TOP);   /* spawn sets the stack top... */
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    ir = th(10)->regs;
+    ir.rsp = USTACK_TOP - 0x48;              /* ...so move it */
+    CHECK(thread_write_regs(&uts, 10 + T_THR, &ir) == T_OK);
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0xF1));
+    go(10);
+    CHECK(res(40, 0) == T_OK && rsi_out(40, 0) == FAULT_INFO && rdi_out(40, 0) == 0xF1);
+    CHECK(hb->words[0] == 14 && hb->words[1] == 4 && hb->words[2] == 0x500A08);
+    CHECK(hb->words[3] == UCODE_VA && hb->words[4] == USTACK_TOP - 0x48);
+    CHECK(th(10)->regs.rax == 0x5EED);
+    CHECK(hb->words[5] == (th(10)->regs.rflags & RFLAGS_USER_MASK) && hb->words[6] == 0);
+    CHECK(tstate(10) == THREAD_BLOCKED_REPLY && th(40)->reply_flags == REPLY_FAULT);
+    struct fault_record f = tfault(10);
+    CHECK(f.vector == 14 && f.error == 4 && f.addr == 0x500A08 && f.rip == UCODE_VA);
+    CHECK(th(10)->offer.count == 0 && ep_ok(e));
+
+    /* The handler's side: map the page, then reply label 0. */
+    struct user_regs before = th(10)->regs;
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 111, 1) == T_OK);
+    *(uint64_t *)((uint8_t *)phys_to_virt(cap_obj_paddr(&ut_store[111])) + 0xA08) = 0x7777;
+    CHECK(vspace_map(&uts, 10 + T_AS, 111, ua(0x500000), RO) == T_OK);
+    struct cspace c40 = task_cs(40);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(0, 0)) == T_OK);
+    CHECK(tstate(10) == THREAD_RUNNABLE && th(40)->reply_state == REPLY_NONE);
+    CHECK(memcmp(&before, &th(10)->regs, sizeof(before)) == 0);        /* P70 */
+    CHECK(th(10)->ret_path == RETURN_IRET);
+    f = tfault(10);
+    CHECK(f.vector == 0 && f.error == 0 && f.addr == 0 && f.rip == 0); /* P73 */
+    run_user();
+    CHECK(test_report_count == 1 && test_reports[0].a == 0x7777);      /* retried */
+    unpark(40);
+    CHECK(ep_ok(e));
+    ut_teardown();
+}
+
+/* P33, P75: a ring-3 handler changes the thread only through its Thread
+ * capability; without it, it can only resume or leave it faulted. */
+static void test_fault_authority(void)
+{
+    /* With the Thread capability: skip the ud2. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(spawn(10, P(f_ud_go), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0x10));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 10 + T_THR, &c40, 2, CAP_R_ALL, 0) == T_OK);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TH_READ_REGS, 2, UBUF);
+    REQ(40, SYS_TEST_BLOCK, TB_PARK);
+    REQ(40, SYS_TH_WRITE_REGS, 2, UBUF);
+    REQ(40, SYS_REPLY, MSG_INFO(0, 0));
+    go(40);
+    go(10);
+    CHECK(res(40, 1) == T_OK && tstate(10) == THREAD_BLOCKED_REPLY);
+    struct user_regs *ur = ubuf(40, UBUF);
+    CHECK(ur->rip == UCODE_VA);
+    ur->rip += 2;                                     /* the handler's decision */
+    unpark(40);
+    CHECK(res(40, 3) == T_OK && res(40, 4) == T_OK);
+    CHECK(test_report_count == 1 && test_reports[0].a == 0x600D && ep_ok(e));
+    ut_teardown();
+
+    /* Without it: no register change, no suspension; label 0 retries the
+     * same instruction (a second, identical fault); label 1 leaves it
+     * FAULTED with its record. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(spawn(10, P(f_ud_go), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0x10));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    struct ipc_buffer *hb = ep_server(40, 110, CAP_R_READ);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_TH_WRITE_REGS, 2, UBUF);
+    REQ(40, SYS_TH_SUSPEND, 2);
+    REQ(40, SYS_TH_READ_REGS, 1, UBUF);              /* the endpoint is no Thread cap */
+    REQ(40, SYS_REPLY, MSG_INFO(0, 0));
+    REQ(40, SYS_RECV, 1);
+    REQ(40, SYS_REPLY, MSG_INFO(1, 0));
+    go(40);
+    go(10);
+    CHECK(res(40, 1) == T_EBADCAP && res(40, 2) == T_EBADCAP && res(40, 3) == T_EBADCAP);
+    CHECK(res(40, 4) == T_OK && res(40, 5) == T_OK && res(40, 6) == T_OK);
+    CHECK(rsi_out(40, 5) == FAULT_INFO && hb->words[0] == 6 && hb->words[3] == UCODE_VA);
+    CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6 && tfault(10).rip == UCODE_VA);
+    CHECK(test_report_count == 0 && ep_ok(e));
+    ut_teardown();
+}
+
+/* P34, P69, P73: no usable handler. */
+static void test_fault_nohandler(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    /* A binding without WRITE is no handler. */
+    CHECK(spawn(10, P(f_ud), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_READ, 0));
+    run_user();
+    CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6 && !e->senders.head);
+    /* Resuming clears the record; the thread faults again and gets a new
+     * one (P73). */
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    CHECK(tfault(10).vector == 0 && tfault(10).rip == 0);
+    run_user();
+    CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6 && tfault(10).rip == UCODE_VA);
+    /* Nobody can ever receive: FAULTED at once, never queued. */
+    CHECK(spawn(20, P(f_ud), false, NULL));
+    CHECK(fault_bind(20, 1, CAP_R_WRITE, 0));
+    CHECK(cap_delete(&uts, 1) == T_OK && cap_delete(&uts, 10 + 9) == T_OK);
+    CHECK(thread_unbind(&uts, 10 + T_THR, TS_FAULT) == T_OK);   /* a binding counts too */
+    CHECK(endpoint_caps_with(&ut_store[29], CAP_R_READ) == 0);
+    run_user();
+    CHECK(tstate(20) == THREAD_FAULTED && !e->senders.head && ep_ok(e));
+    ut_teardown();
+}
+
+/* P72: the handler or the endpoint goes away; the faulting thread goes
+ * FAULTED with no register written. Suspension of the faulting thread
+ * itself makes it re-execute the fault later. */
+static void test_fault_handler_gone(void)
+{
+    for (unsigned how = 0; how < 5; how++) {
+        CHECK(ut_setup(20));
+        CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+        struct endpoint *e = endpoint_of(&ut_store[1]);
+        CHECK(ep_server(40, 110, CAP_R_READ) != NULL);   /* holds READ; idle */
+        nreq = 0;
+        REQ(40, SYS_RECV, 1);
+        if (how < 2)
+            REQ(40, SYS_TEST_BLOCK, TB_PARK);         /* how 2: exits instead */
+        if (how < 3)
+            go(40);                                 /* how 2: receives, then exits */
+        CHECK(spawn(10, P(f_ud), false, NULL));
+        CHECK(fault_bind(10, 1, CAP_R_WRITE, 0));
+        run_user();
+        struct user_regs before = th(10)->regs;
+        switch (how) {
+        case 0:                                     /* handler suspended */
+            CHECK(tstate(10) == THREAD_BLOCKED_REPLY);
+            CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+            break;
+        case 1:                                     /* handler destroyed */
+            CHECK(tstate(10) == THREAD_BLOCKED_REPLY);
+            CHECK(cap_delete(&uts, 40 + T_THR) == T_OK);
+            break;
+        case 2:                                     /* handler exited */
+            break;
+        case 3: {                                   /* queued; last READ gone */
+            CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->ipc_flags == (IPC_CALL | IPC_FAULT));
+            struct cspace c40 = task_cs(40);
+            CHECK(cap_delete(&c40, 1) == T_OK && cap_delete(&uts, 1) == T_OK);
+            break;
+        }
+        case 4:                                     /* queued; endpoint destroyed */
+            CHECK(tstate(10) == THREAD_BLOCKED_SEND);
+            CHECK(cap_revoke(&uts, 1, 1000) == T_OK && cap_delete(&uts, 1) == T_OK);
+            break;
+        }
+        CHECK(tstate(10) == THREAD_FAULTED && tfault(10).vector == 6);
+        CHECK(memcmp(&before, &th(10)->regs, sizeof(before)) == 0);
+        CHECK(th(10)->regs.rax == 0 && th(10)->regs.rip == UCODE_VA);   /* no T_EDEAD */
+        CHECK(!runq_contains(th(10)) && th(10)->reply_from == NULL && AUDIT());
+        if (how != 4)
+            CHECK(ep_ok(e));
+        ut_teardown();
+    }
+
+    /* The faulting thread suspended while queued: INACTIVE, registers
+     * untouched (no T_EINTR); resumed, it faults again and re-queues. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(spawn(10, P(f_ud), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0));
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND);
+    struct user_regs before = th(10)->regs;
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(tstate(10) == THREAD_INACTIVE && th(10)->ipc_flags == 0 && th(10)->msg.info == 0);
+    CHECK(memcmp(&before, &th(10)->regs, sizeof(before)) == 0 && !e->senders.head);
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->msg.words[3] == UCODE_VA && ep_ok(e));
+    ut_teardown();
+}
+
+/* P74: a handler whose fault endpoint is the one it serves. Its fault
+ * queues there; it is never its own receiver; nothing recurses; its reply
+ * authority is kept until a supervisor stops it. */
+static void test_fault_self(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(fault_handler(40, 110) != NULL);
+    CHECK(fault_bind(40, 1, CAP_R_WRITE, 0xEE));      /* its own endpoint */
+    go(40);
+    CHECK(spawn(10, P(f_ud), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0x07));
+    run_user();
+    CHECK(th(40)->reply_to == th(10) && tstate(10) == THREAD_BLOCKED_REPLY);
+    /* The handler faults (a jump to an unmapped address). */
+    struct user_regs r = th(40)->regs;
+    r.rip = 0x10;
+    CHECK(thread_write_regs(&uts, 40 + T_THR, &r) == T_OK);
+    unpark(40);
+    CHECK(tstate(40) == THREAD_BLOCKED_SEND && th(40)->ipc_flags == (IPC_CALL | IPC_FAULT));
+    CHECK(e->senders.head == th(40) && !e->receivers.head);
+    CHECK(th(40)->msg.badge == 0xEE && th(40)->msg.words[3] == 0x10);
+    CHECK(th(40)->reply_state == REPLY_PENDING && th(40)->reply_to == th(10));   /* kept */
+    CHECK(tstate(10) == THREAD_BLOCKED_REPLY && ep_ok(e));
+    /* A supervisor stops it: terminal, so its authority dies; the thread
+     * it was handling was delivering a fault, so it becomes FAULTED. */
+    struct user_regs before = th(10)->regs;
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+    CHECK(tstate(40) == THREAD_INACTIVE && th(40)->regs.rip == 0x10);
+    CHECK(tstate(10) == THREAD_FAULTED && memcmp(&before, &th(10)->regs, sizeof(before)) == 0);
+    CHECK(ep_ok(e) && !e->senders.head);
+    ut_teardown();
+}
+
+/* P64, P74: a handler that faults while holding a fault reply, handled by
+ * a supervisor; leaving it FAULTED does not cascade. */
+static void test_fault_nested(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 2, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]), *e2 = endpoint_of(&ut_store[2]);
+    CHECK(fault_handler(40, 110) != NULL);            /* H serves E */
+    CHECK(fault_bind(40, 2, CAP_R_WRITE, 0x44));      /* H's faults go to E2 */
+    struct ipc_buffer *sb = ep_server(50, 111, CAP_R_READ);   /* S serves E2 */
+    struct cspace c50 = task_cs(50);
+    CHECK(cap_derive_to(&uts, 2, &c50, 3, CAP_R_READ, 0) == T_OK);
+    nreq = 0;
+    REQ(50, SYS_RECV, 3);
+    REQ(50, SYS_TEST_BLOCK, TB_PARK);
+    go(40);
+    go(50);
+    CHECK(spawn(10, P(f_ud), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0x07));
+    run_user();
+    CHECK(th(40)->reply_to == th(10));
+    struct user_regs r = th(40)->regs;
+    r.rip = 0x10;
+    CHECK(thread_write_regs(&uts, 40 + T_THR, &r) == T_OK);
+    unpark(40);
+    CHECK(rsi_out(50, 0) == FAULT_INFO && rdi_out(50, 0) == 0x44 && sb->words[3] == 0x10);
+    CHECK(tstate(40) == THREAD_BLOCKED_REPLY && th(50)->reply_to == th(40));
+    CHECK(th(40)->reply_to == th(10) && tstate(10) == THREAD_BLOCKED_REPLY);
+    /* S leaves H faulted: H keeps the authority for T (FAULTED is not
+     * terminal); T keeps waiting. No cascade. */
+    CHECK(endpoint_reply(th(50), &c50, MSG_INFO(1, 0)) == T_OK);
+    CHECK(tstate(40) == THREAD_FAULTED && tfault(40).rip == 0x10);
+    CHECK(th(40)->reply_state == REPLY_PENDING && tstate(10) == THREAD_BLOCKED_REPLY);
+    CHECK(ep_ok(e) && AUDIT());
+    (void)e2;
+    /* Stopping H is terminal: T becomes FAULTED. */
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+    CHECK(tstate(10) == THREAD_FAULTED && th(40)->reply_state == REPLY_NONE && AUDIT());
+    unpark(50);
+    ut_teardown();
+}
+
+/* P67: faults in kernel mode on a thread's behalf never become fault
+ * messages; IPC never touches user virtual addresses. */
+static void test_fault_kernel_paths(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(ep_server(40, 110, CAP_R_READ) != NULL);
+    nreq = 0;
+    REQ(40, SYS_RECV, 1);
+    go(40);                                           /* a handler waits */
+    CHECK(spawn(10, P(runner), false, NULL));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0));
+    struct cspace c10 = task_cs(10);
+    CHECK(cap_install(&c10, 3, CAP_DEBUG_CONSOLE, CAP_R_WRITE, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 10 + T_THR, &c10, 4, CAP_R_ALL, 0) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_DEBUG_WRITE, 3, 0x10, 8);                     /* copy_from_user */
+    REQ(10, SYS_DEBUG_WRITE, 3, 0xFFFF800000000000ull, 8);
+    REQ(10, SYS_TH_READ_REGS, 4, 0x10);                       /* copy_to_user */
+    go(10);
+    CHECK(res(10, 0) == T_EFAULT && res(10, 1) == T_EFAULT && res(10, 2) == T_EFAULT);
+    CHECK(tstate(10) == THREAD_INACTIVE && tstate(40) == THREAD_BLOCKED_RECV);   /* no message */
+    CHECK(tfault(10).vector == 0 && ep_ok(e));
+    ut_teardown();
+}
+
+/* P68, P69: trap boundary, the thread's own kernel-half address, no
+ * capability or data in a fault reply, and an unforgeable fault bit. */
+static void test_fault_contract(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    struct ipc_buffer *hb = fault_handler(40, 110);
+    struct cspace c40 = task_cs(40);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &c40, 2, 1) == T_OK);
+    go(40);
+    /* #BP is a trap: RIP is the next instruction. */
+    CHECK(spawn(10, P(f_bp), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0));
+    /* An IPC buffer with an offer: ignored for a fault (P69). */
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 10 + T_DATA) == T_OK);
+    tbuf(10)->recv_count = 3;
+    tbuf(10)->recv_slots[0] = 5;
+    tbuf(10)->words[0] = 0xABAB;
+    run_user();
+    CHECK(hb->words[0] == 3 && hb->words[1] == 0 && hb->words[2] == 0);
+    CHECK(hb->words[3] == UCODE_VA + 1 && th(10)->offer.count == 0);
+    /* The binding has GRANT, but a fault reply carries nothing. */
+    hb->caps[0] = 2;
+    struct cspace c10 = task_cs(10);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    const struct thread *who[] = { th(10), th(40) };
+    snapshot(&snap_a, who, 2);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(0, 0) | CAPS(1)) == T_EPERM);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(0, 1)) == T_EINVAL);
+    world_take(&world_b);
+    snapshot(&snap_b, who, 2);
+    CHECK(world_same(&world_a, &world_b) && memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0);
+    CHECK(endpoint_reply(th(40), &c40, MSG_INFO(7, 0)) == T_OK);
+    CHECK(tstate(10) == THREAD_FAULTED && tbuf(10)->words[0] == 0xABAB);
+    CHECK(c10.slots[5].type == CAP_NULL);
+    unpark(40);
+    ut_teardown();
+
+    /* A kernel-half address the thread itself used is reported as is. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    hb = fault_handler(40, 110);
+    go(40);
+    CHECK(spawn(10, P(f_pf_kernel), false, NULL));
+    CHECK(fault_bind(10, 1, CAP_R_WRITE, 0));
+    run_user();
+    CHECK(hb->words[0] == 14 && hb->words[2] == 0xFFFF800000001000ull);
+    CHECK(hb->words[1] == 5 && hb->words[3] == UCODE_VA + 10);   /* present, user */
+    unpark(40);
+    ut_teardown();
+
+    /* No thread can forge the fault bit; the label alone is not proof. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(ep_thread(40, false, 0, 0, CAP_R_READ));
+    CHECK(ep_thread(10, true, 0, 0, CAP_R_WRITE));
+    th(10)->regs.rsi = FAULT_INFO;
+    test_report_count = 0;
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && reports_with(T_EINVAL) == 1);
+    CHECK(ep_thread(20, true, 0, 0, CAP_R_WRITE));
+    th(20)->regs.rsi = ((uint64_t)FAULT_LABEL << 32) | FAULT_WORDS;
+    test_report_count = 0;
+    run_user();
+    bool plain = false;
+    for (unsigned i = 0; i < test_report_count; i++)
+        if (test_reports[i].c == 0 && test_reports[i].b == (((uint64_t)FAULT_LABEL << 32) | FAULT_WORDS))
+            plain = true;                             /* the receiver: no bit 11 */
+    CHECK(plain && ep_ok(e));
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -3799,6 +4227,14 @@ static const struct {
     { "reply_gone", test_reply_gone },
     { "reply_recv", test_reply_recv },
     { "reply_recv_edges", test_reply_recv_edges },
+    { "fault_deliver", test_fault_deliver },
+    { "fault_authority", test_fault_authority },
+    { "fault_nohandler", test_fault_nohandler },
+    { "fault_handler_gone", test_fault_handler_gone },
+    { "fault_self", test_fault_self },
+    { "fault_nested", test_fault_nested },
+    { "fault_kernel_paths", test_fault_kernel_paths },
+    { "fault_contract", test_fault_contract },
     { "cpu_hardening", test_cpu_hardening },
 };
 

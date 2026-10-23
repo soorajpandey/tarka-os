@@ -85,11 +85,13 @@ enum reply_state {
     REPLY_CALLER_GONE,      /* authority held, but the caller is gone */
 };
 #define REPLY_CALL_GRANT (1u << 0)  /* the call carried GRANT (P23a) */
+#define REPLY_FAULT      (1u << 1)  /* the caller is delivering a fault (P69) */
 
 /* Staged IPC flags in a waiting thread's TCB (P59). */
 #define IPC_CALL          (1u << 0)  /* BLOCKED_SEND: it is a call */
 #define IPC_CALL_GRANT    (1u << 1)  /* BLOCKED_SEND: ... made with GRANT */
 #define IPC_REPLY_SKIPPED (1u << 2)  /* BLOCKED_RECV: reply_recv found the caller gone */
+#define IPC_FAULT         (1u << 3)  /* BLOCKED_SEND: the call is a fault (P69) */
 
 /* Binding slots (T1, T2). */
 enum {

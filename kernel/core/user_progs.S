@@ -312,6 +312,24 @@ PROG f_ac
     ud2                            /* reached only if #AC was not raised */
 END f_ac
 
+/* ADR 0009 P68-P71: faults a fault handler can resume. */
+PROG f_ud_go                      /* resumed past the ud2: reports 0x600D */
+    ud2
+    movl $0x600D, %edi
+    REPORT
+    EXIT
+END f_ud_go
+PROG f_pf_retry                   /* resumed unchanged: retries the load */
+    movq 0x500A08, %rax
+    movq %rax, %rdi
+    REPORT
+    EXIT
+END f_pf_retry
+PROG f_pf_kernel                  /* touches a kernel-half address */
+    movabsq $0xFFFF800000001000, %rax
+    movq (%rax), %rbx
+END f_pf_kernel
+
 /* Blocks on test wait queue `rdi`, then reports its syscall result. */
 PROG block
     movl $0x7F01, %eax

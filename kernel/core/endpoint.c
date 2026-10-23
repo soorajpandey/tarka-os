@@ -198,8 +198,6 @@ static int thread_cspace(struct thread *t, struct cspace *out)
     return cnode_view_cap(&t->bind[TS_CSPACE], out);
 }
 
-#define INFO_REPLY_SKIPPED (1ull << 10)   /* P19, P63 */
-
 /* Commit a delivery into a receiver (cannot fail: validated by the
  * caller). P54: derive, then write exactly `length` words, nothing else of
  * the buffer; RSI = info with the delivered count (and `extra` bits), RDI
@@ -268,7 +266,7 @@ static int64_t send_common(struct thread *t, struct cspace *cs, cap_slot_t slot,
         if (!call)
             return T_OK;
         t->offer = o;
-        ipc_call_link(r, t, grant);        /* straight to BLOCKED_REPLY */
+        ipc_call_link(r, t, grant ? REPLY_CALL_GRANT : 0);   /* to BLOCKED_REPLY */
         return SYS_NORESULT;
     }
     /* Commit: block with the message (and a call's offer and flags) held
@@ -341,7 +339,8 @@ static int64_t recv_commit(struct thread *t, struct endpoint *e, struct thread *
         KASSERT(e->receivers.head == NULL);
         deliver(t, &s->msg, p, skipped ? INFO_REPLY_SKIPPED : 0);
         if (s->ipc_flags & IPC_CALL)
-            ipc_call_link(t, s, (s->ipc_flags & IPC_CALL_GRANT) != 0);   /* P58 */
+            ipc_call_link(t, s, ((s->ipc_flags & IPC_CALL_GRANT) ? REPLY_CALL_GRANT : 0) |
+                                ((s->ipc_flags & IPC_FAULT) ? REPLY_FAULT : 0));   /* P58, P69 */
         else
             thread_wake(s, T_OK);   /* leaving the queue consumes s->msg (P42) */
         return T_OK;
@@ -379,6 +378,18 @@ static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
     KASSERT(t->reply_state == REPLY_PENDING && caller);
     if ((rc = validate_info(info)))
         return rc;
+    if (t->reply_flags & REPLY_FAULT) {
+        /* P69: a fault reply is a label only: it never writes to the
+         * faulting thread's buffer and carries no capabilities. */
+        if (MSG_NCAPS(info) > 0)
+            return T_EPERM;
+        if (MSG_LEN(info) > 0)
+            return T_EINVAL;
+        memset(m, 0, sizeof(*m));
+        m->info = info;
+        memset(p, 0, sizeof(*p));
+        return T_OK;
+    }
     const struct ipc_buffer *b = ipcbuf(t);
     if (!b && (MSG_LEN(info) > 0 || MSG_NCAPS(info) > 0))
         return T_EINVAL;
@@ -392,6 +403,18 @@ static int reply_check(struct thread *t, const struct cspace *cs, uint64_t info,
     if ((rc = thread_cspace(caller, &ccs)))
         return rc;
     return check_fit(&ccs, &caller->offer, p);
+}
+
+/* P61 step 4, P71: commit a checked reply. A fault caller gets no
+ * delivery: label 0 resumes it, any other label leaves it FAULTED. */
+static void reply_commit(struct thread *t, const struct ipc_msg *m, const struct xfer_plan *p)
+{
+    if (t->reply_flags & REPLY_FAULT) {
+        reply_complete(t, MSG_LABEL(m->info) == 0 ? T_OK : T_EINVAL);
+        return;
+    }
+    deliver(t->reply_to, m, p, 0);
+    reply_complete(t, T_OK);
 }
 
 int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info)
@@ -408,8 +431,7 @@ int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info)
     }
     if ((rc = reply_check(t, cs, info, &m, &p)))
         return rc;         /* the authority is kept (P18) */
-    deliver(t->reply_to, &m, &p, 0);
-    reply_complete(t);
+    reply_commit(t, &m, &p);
     return T_OK;
 }
 
@@ -442,8 +464,7 @@ int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot
     /* Phase 5: commit the reply, then receive. */
     bool skipped = false;
     if (pending) {
-        deliver(t->reply_to, &rm, &rp, 0);
-        reply_complete(t);
+        reply_commit(t, &rm, &rp);
     } else if (t->reply_state == REPLY_CALLER_GONE) {
         reply_consume_gone(t);
         skipped = true;
@@ -455,4 +476,49 @@ int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot
                 check_fit(cs, &o, &p) == T_OK);
     }
     return recv_commit(t, e, s, &p, &o, skipped);
+}
+
+/* P67-P69: a ring-3 exception of the current thread `t` (its fault record
+ * already written) becomes a call made by the kernel from its TS_FAULT
+ * binding. Returns T_OK if `t` is now delivering (BLOCKED_SEND or
+ * BLOCKED_REPLY); otherwise an error, and the caller leaves it FAULTED.
+ * Writes none of `t`'s registers (P70) and touches no user address. */
+int endpoint_fault(struct thread *t)
+{
+    const struct cap *c = &t->bind[TS_FAULT];
+    struct ipc_msg m;
+    struct xfer_plan p;
+
+    KASSERT(t->state == THREAD_RUNNING);
+    if (c->type != CAP_ENDPOINT || !(c->rights & CAP_R_WRITE))
+        return T_EBADCAP;  /* no handler */
+    struct endpoint *e = endpoint_of(c);
+    struct thread *r = waitq_first(&e->receivers);
+    if (!r && count_with(c, CAP_R_READ, NULL) == 0)
+        return T_EDEAD;    /* nobody can ever handle it */
+
+    /* P68: only the thread's own state; no offer, no call_grant. */
+    memset(&m, 0, sizeof(m));
+    m.info = ((uint64_t)FAULT_LABEL << 32) | FAULT_WORDS | INFO_FAULT;
+    m.words[0] = t->fault.vector;
+    m.words[1] = t->fault.error;
+    m.words[2] = t->fault.addr;
+    m.words[3] = t->fault.rip;
+    m.words[4] = t->regs.rsp;
+    m.words[5] = t->regs.rflags & RFLAGS_USER_MASK;
+    m.badge = c->badge;
+    memset(&p, 0, sizeof(p));
+
+    if (r) {
+        KASSERT(e->senders.head == NULL);
+        uint64_t extra = (r->ipc_flags & IPC_REPLY_SKIPPED) ? INFO_REPLY_SKIPPED : 0;
+        deliver(r, &m, &p, extra);
+        thread_wake(r, T_OK);
+        ipc_call_link(r, t, REPLY_FAULT);
+        return T_OK;
+    }
+    t->msg = m;
+    t->ipc_flags = IPC_CALL | IPC_FAULT;
+    waitq_block(t, &e->senders);
+    return T_OK;
 }

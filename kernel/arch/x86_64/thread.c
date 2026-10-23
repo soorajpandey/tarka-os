@@ -277,6 +277,7 @@ int thread_resume(struct cspace *cs, cap_slot_t thr)
         return T_EBUSY;
     if (!thread_runnable_safe(t))
         return T_EPERM;             /* T4 */
+    memset(&t->fault, 0, sizeof(t->fault));   /* ADR 0009 P73 */
     t->state = THREAD_RUNNABLE;
     t->ret_path = RETURN_IRET;
     runq_push(t);

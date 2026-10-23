@@ -22,6 +22,14 @@ _Static_assert(sizeof(struct endpoint) <= 64, "endpoint must fit its 64-byte obj
 #define MSG_LABEL(info)   ((uint32_t)((info) >> 32))
 #define MSG_RESERVED_IN   0x00000000FFFFFF00ull
 
+/* Output-only info bits (P3): never accepted on input. */
+#define INFO_REPLY_SKIPPED (1ull << 10)   /* P63 */
+#define INFO_FAULT         (1ull << 11)   /* a kernel-generated fault message (P68) */
+
+/* The fault message (P68, frozen ABI). */
+#define FAULT_LABEL 0xFFFFFFFFu
+#define FAULT_WORDS 6   /* vector, error, address, RIP, RSP, RFLAGS */
+
 void endpoint_boot(void);
 void endpoint_obj_init(paddr_t obj);
 struct endpoint *endpoint_of(const struct cap *c);
@@ -33,6 +41,7 @@ int64_t endpoint_send(struct thread *t, struct cspace *cs, cap_slot_t slot, uint
 int64_t endpoint_call(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
 int64_t endpoint_reply(struct thread *t, struct cspace *cs, uint64_t info);
 int64_t endpoint_reply_recv(struct thread *t, struct cspace *cs, cap_slot_t slot, uint64_t info);
+__must_check int endpoint_fault(struct thread *t);
 int64_t endpoint_recv(struct thread *t, struct cspace *cs, cap_slot_t slot);
 
 #endif
