@@ -8,7 +8,7 @@ struct limine_memmap_response;
 /* Physical page frame allocator (bitmap). Frames are zeroed on free so
  * that no data leaks between owners. */
 void pmm_init(struct limine_memmap_response *memmap);
-__must_check paddr_t pmm_alloc(void);          /* 0 on failure */
+__must_check paddr_t pmm_alloc(void);          /* null (pa_is_null) on failure */
 __must_check int pmm_free(paddr_t frame);      /* T_EDOUBLEFREE, T_EINVAL */
 uint64_t pmm_free_count(void);
 

@@ -75,37 +75,38 @@ static void test_overflow_helpers(void)
 static void test_pmm(void)
 {
     uint64_t before = pmm_free_count();
-    paddr_t a = pmm_alloc();
-    paddr_t b = pmm_alloc();
+    /* Raw values: this test does arithmetic on physical addresses. */
+    uint64_t a = pa_raw(pmm_alloc());
+    uint64_t b = pa_raw(pmm_alloc());
 
     CHECK(a != 0 && b != 0 && a != b);
     CHECK(a % PAGE_SIZE == 0 && b % PAGE_SIZE == 0);
     CHECK(pmm_free_count() == before - 2);
 
     /* Fresh frames never contain stale data. */
-    const uint8_t *q = phys_to_virt(b);
+    const uint8_t *q = phys_to_virt(pa(b));
     bool fresh = true;
     for (size_t i = 0; i < PAGE_SIZE; i++)
         fresh &= q[i] == 0;
     CHECK(fresh);
 
     /* Freed frames are scrubbed. */
-    memset(phys_to_virt(a), 0xAA, PAGE_SIZE);
-    CHECK(pmm_free(a) == T_OK);
-    const uint8_t *p = phys_to_virt(a);
+    memset(phys_to_virt(pa(a)), 0xAA, PAGE_SIZE);
+    CHECK(pmm_free(pa(a)) == T_OK);
+    const uint8_t *p = phys_to_virt(pa(a));
     bool zeroed = true;
     for (size_t i = 0; i < PAGE_SIZE; i++)
         zeroed &= p[i] == 0;
     CHECK(zeroed);
 
-    CHECK(pmm_free(a) == T_EDOUBLEFREE);
-    CHECK(pmm_free(b + 1) == T_EINVAL);
-    CHECK(pmm_free(0) == T_EINVAL);
-    CHECK(pmm_free(~0ull & ~(PAGE_SIZE - 1)) == T_EINVAL);
+    CHECK(pmm_free(pa(a)) == T_EDOUBLEFREE);
+    CHECK(pmm_free(pa(b + 1)) == T_EINVAL);
+    CHECK(pmm_free(pa(0)) == T_EINVAL);
+    CHECK(pmm_free(pa(~0ull & ~(PAGE_SIZE - 1))) == T_EINVAL);
     /* Frames the allocator never owned (legacy VGA hole, always reserved
      * on PC) cannot be pushed into the free pool. */
-    CHECK(pmm_free(0xA0000) == T_EINVAL);
-    CHECK(pmm_free(b) == T_OK);
+    CHECK(pmm_free(pa(0xA0000)) == T_EINVAL);
+    CHECK(pmm_free(pa(b)) == T_OK);
     CHECK(pmm_free_count() == before);
 
     /* Leak check: allocate and release many frames, nothing may be lost. */
@@ -113,7 +114,7 @@ static void test_pmm(void)
     for (size_t i = 0; i < ARRAY_SIZE(frames); i++)
         frames[i] = pmm_alloc();
     for (size_t i = 0; i < ARRAY_SIZE(frames); i++)
-        CHECK(frames[i] != 0 && pmm_free(frames[i]) == T_OK);
+        CHECK(!pa_is_null(frames[i]) && pmm_free(frames[i]) == T_OK);
     CHECK(pmm_free_count() == before);
 }
 
@@ -325,11 +326,12 @@ static void ut_teardown(void)
     cspace_destroy(&uts); /* revokes the test Untyped, then deletes it */
 }
 
-static paddr_t slot_paddr(cap_slot_t s) { return cap_obj_paddr(&ut_store[s]); }
+/* Raw physical address, for test arithmetic only. */
+static uint64_t slot_paddr(cap_slot_t s) { return pa_raw(cap_obj_paddr(&ut_store[s])); }
 
-static bool page_is(paddr_t p, uint8_t v)
+static bool page_is(uint64_t p, uint8_t v)
 {
-    const uint8_t *b = phys_to_virt(p);
+    const uint8_t *b = phys_to_virt(pa(p));
     for (size_t i = 0; i < PAGE_SIZE; i++)
         if (b[i] != v)
             return false;
@@ -352,19 +354,19 @@ static void test_untyped_ownership(void)
         const struct cap *a = &root->slots[i];
         if (a->type != CAP_UNTYPED)
             continue;
-        paddr_t base = cap_obj_paddr(a);
+        uint64_t base = pa_raw(cap_obj_paddr(a));
         uint64_t size = 1ull << cap_obj_bits(a);
 
         frames += size / PAGE_SIZE;
         if (base % size)
             disjoint = false; /* not naturally aligned */
-        for (paddr_t p = base; p < base + size; p += PAGE_SIZE)
-            owned_once &= !pmm_frame_is_free(p);
+        for (uint64_t p = base; p < base + size; p += PAGE_SIZE)
+            owned_once &= !pmm_frame_is_free(pa(p));
         for (cap_slot_t j = i + 1; j < root->nslots; j++) {
             const struct cap *b = &root->slots[j];
             if (b->type != CAP_UNTYPED)
                 continue;
-            paddr_t bb = cap_obj_paddr(b);
+            uint64_t bb = pa_raw(cap_obj_paddr(b));
             if (base < bb + (1ull << cap_obj_bits(b)) && bb < base + size)
                 disjoint = false;
         }
@@ -381,7 +383,7 @@ static void test_untyped_rules(void)
     struct cap_info info;
 
     CHECK(ut_setup(16));
-    paddr_t base = slot_paddr(0);
+    uint64_t base = slot_paddr(0);
 
     /* Memory authority cannot be duplicated. */
     CHECK(cap_derive(&uts, 0, 1, CAP_R_ALL, 0) == T_EINVAL);
@@ -389,7 +391,7 @@ static void test_untyped_rules(void)
     /* Holding an Untyped without WRITE confers no right to create. The
      * fabricated capability is never successfully used, so it owns
      * nothing. */
-    CHECK(cap_install(&uts, 90, CAP_UNTYPED, CAP_R_READ, cap_obj_encode(base, 16)) == T_OK);
+    CHECK(cap_install(&uts, 90, CAP_UNTYPED, CAP_R_READ, cap_obj_encode(pa(base), 16)) == T_OK);
     CHECK(cap_retype(&uts, 90, CAP_FRAME, 0, &uts, 1, 1) == T_EPERM);
     CHECK(cap_delete(&uts, 90) == T_OK);
 
@@ -432,9 +434,9 @@ static void test_untyped_rules(void)
 static void test_untyped_exhaustion(void)
 {
     CHECK(ut_setup(16)); /* 16 frames */
-    paddr_t base = slot_paddr(0);
+    uint64_t base = slot_paddr(0);
 
-    memset(phys_to_virt(base), 0xAA, 16 * PAGE_SIZE);
+    memset(phys_to_virt(pa(base)), 0xAA, 16 * PAGE_SIZE);
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 1, 16) == T_OK);
     bool zeroed = true, placed = true;
     for (cap_slot_t i = 1; i <= 16; i++) {
@@ -451,7 +453,7 @@ static void test_untyped_exhaustion(void)
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 17, 1) == T_ENOMEM);
 
     /* ...freeing all of them does. */
-    memset(phys_to_virt(slot_paddr(1)), 0x55, PAGE_SIZE);
+    memset(phys_to_virt(pa(slot_paddr(1))), 0x55, PAGE_SIZE);
     CHECK(cap_revoke(&uts, 0, 0) == T_OK);
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 1, 16) == T_OK);
     CHECK(slot_paddr(1) == base || slot_paddr(16) == base);
@@ -481,7 +483,7 @@ static void test_untyped_exhaustion(void)
 }
 
 /* O5: random retype sequences never produce overlapping objects. */
-static struct { paddr_t base; uint64_t size; int parent; } objs[96];
+static struct { uint64_t base; uint64_t size; int parent; } objs[96];
 
 static uint64_t rng_state;
 static uint32_t rng(uint32_t n)
@@ -627,14 +629,14 @@ static bool build_as(cap_slot_t as, cap_slot_t pt)
 {
     return cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, as, 1) == T_OK &&
            cap_retype(&uts, 0, CAP_PAGE_TABLE, 0, &uts, pt, 3) == T_OK &&
-           vspace_install(&uts, as, pt, VA0, 1) == T_OK &&
-           vspace_install(&uts, as, pt + 1, VA0, 2) == T_OK &&
-           vspace_install(&uts, as, pt + 2, VA0, 3) == T_OK;
+           vspace_install(&uts, as, pt, ua(VA0), 1) == T_OK &&
+           vspace_install(&uts, as, pt + 1, ua(VA0), 2) == T_OK &&
+           vspace_install(&uts, as, pt + 2, ua(VA0), 3) == T_OK;
 }
 
 /* Hardware truth: the effective P/W/U/NX flags the MMU sees for `va` with
  * the address space active, or 0 if unmapped. */
-static uint64_t hw_flags(const struct cspace *cs, cap_slot_t as, vaddr_t va)
+static uint64_t hw_flags(const struct cspace *cs, cap_slot_t as, uint64_t va)
 {
     uint64_t f = 0;
 
@@ -650,30 +652,30 @@ static inline void smap_open(void)  { if (cpu_sec.smap) __asm__ volatile("stac" 
 static inline void smap_close(void) { if (cpu_sec.smap) __asm__ volatile("clac" ::: "memory"); }
 
 /* Access user memory through the user address, as user code would. */
-static uint64_t user_read64(cap_slot_t as, vaddr_t va)
+static uint64_t user_read64(cap_slot_t as, uint64_t va)
 {
     uint64_t v;
 
     if (vspace_activate(&uts, as) != T_OK)
         return 0;
     smap_open();
-    v = *(volatile uint64_t *)va;
+    v = *(volatile uint64_t *)(uintptr_t)va;
     smap_close();
     vspace_activate_kernel();
     return v;
 }
 
-static void user_write64(cap_slot_t as, vaddr_t va, uint64_t v)
+static void user_write64(cap_slot_t as, uint64_t va, uint64_t v)
 {
     if (vspace_activate(&uts, as) != T_OK)
         return;
     smap_open();
-    *(volatile uint64_t *)va = v;
+    *(volatile uint64_t *)(uintptr_t)va = v;
     smap_close();
     vspace_activate_kernel();
 }
 
-static bool cr3_is_kernel(paddr_t master)
+static bool cr3_is_kernel(uint64_t master)
 {
     return (read_cr3() & 0x000FFFFFFFFFF000ull) == master;
 }
@@ -686,17 +688,17 @@ static void test_vspace_perms(void)
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 10, 6) == T_OK); /* frames 10-15 */
 
     /* Only R, RW and RX are mappings. */
-    CHECK(vspace_map(&uts, 1, 10, VA0, 0) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 10, VA0, RW | CAP_R_EXEC) == T_EINVAL);   /* RWX */
-    CHECK(vspace_map(&uts, 1, 10, VA0, CAP_R_WRITE | CAP_R_EXEC) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 10, VA0, CAP_R_WRITE) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 10, VA0, CAP_R_EXEC) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 10, VA0, RW | CAP_R_GRANT) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), 0) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RW | CAP_R_EXEC) == T_EINVAL);   /* RWX */
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), CAP_R_WRITE | CAP_R_EXEC) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), CAP_R_WRITE) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), CAP_R_EXEC) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RW | CAP_R_GRANT) == T_EINVAL);
     CHECK(!ut_store[10].map_state);
 
-    CHECK(vspace_map(&uts, 1, 10, VA0 + 0x0000, RO) == T_OK);
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x1000, RW) == T_OK);
-    CHECK(vspace_map(&uts, 1, 12, VA0 + 0x2000, RX) == T_OK);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0 + 0x0000), RO) == T_OK);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RW) == T_OK);
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x2000), RX) == T_OK);
 
     uint64_t fr = hw_flags(&uts, 1, VA0), fw = hw_flags(&uts, 1, VA0 + 0x1000),
              fx = hw_flags(&uts, 1, VA0 + 0x2000);
@@ -727,10 +729,10 @@ static void test_vspace_perms(void)
 
     /* V8: write-then-execute is a fresh map, needing WRITE+EXEC authority. */
     CHECK(vspace_unmap(&uts, 11) == T_OK);
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x1000, RX) == T_OK);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RX) == T_OK);
     CHECK(cap_derive(&uts, 13, 20, RW | CAP_R_GRANT, 0) == T_OK);   /* no EXEC */
-    CHECK(vspace_map(&uts, 1, 20, VA0 + 0x4000, RX) == T_EPERM);
-    CHECK(vspace_map(&uts, 1, 20, VA0 + 0x4000, RW) == T_OK);
+    CHECK(vspace_map(&uts, 1, 20, ua(VA0 + 0x4000), RX) == T_EPERM);
+    CHECK(vspace_map(&uts, 1, 20, ua(VA0 + 0x4000), RW) == T_OK);
 
     CHECK(vspace_audit(&uts, 1));
     ut_teardown();
@@ -749,26 +751,26 @@ static void test_vspace_alias(void)
     CHECK(cap_derive(&uts, 10, 13, CAP_R_ALL, 0) == T_OK);
 
     /* RX first: no writable alias anywhere. */
-    CHECK(vspace_map(&uts, 1, 10, VA0, RX) == T_OK);
-    CHECK(vspace_map(&uts, 5, 11, VA0, RW) == T_EPERM);          /* other AS */
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x1000, RW) == T_EPERM); /* same AS */
-    CHECK(vspace_map(&uts, 5, 11, VA0, RO) == T_OK);             /* RO alias ok */
-    CHECK(vspace_map(&uts, 5, 12, VA0 + 0x1000, RX) == T_OK);    /* RX alias ok */
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RX) == T_OK);
+    CHECK(vspace_map(&uts, 5, 11, ua(VA0), RW) == T_EPERM);          /* other AS */
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RW) == T_EPERM); /* same AS */
+    CHECK(vspace_map(&uts, 5, 11, ua(VA0), RO) == T_OK);             /* RO alias ok */
+    CHECK(vspace_map(&uts, 5, 12, ua(VA0 + 0x1000), RX) == T_OK);    /* RX alias ok */
 
     /* Remove every executable mapping; now RW is allowed... */
     CHECK(vspace_unmap(&uts, 10) == T_OK);
-    CHECK(vspace_map(&uts, 1, 13, VA0 + 0x2000, RW) == T_EPERM); /* 12 still RX */
+    CHECK(vspace_map(&uts, 1, 13, ua(VA0 + 0x2000), RW) == T_EPERM); /* 12 still RX */
     CHECK(vspace_unmap(&uts, 12) == T_OK);
-    CHECK(vspace_map(&uts, 1, 13, VA0 + 0x2000, RW) == T_OK);
+    CHECK(vspace_map(&uts, 1, 13, ua(VA0 + 0x2000), RW) == T_OK);
 
     /* ...and RW first blocks RX, in the other order too. */
-    CHECK(vspace_map(&uts, 1, 10, VA0, RX) == T_EPERM);
-    CHECK(vspace_map(&uts, 5, 12, VA0 + 0x1000, RX) == T_EPERM);
-    CHECK(vspace_map(&uts, 5, 12, VA0 + 0x1000, RO) == T_OK);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RX) == T_EPERM);
+    CHECK(vspace_map(&uts, 5, 12, ua(VA0 + 0x1000), RX) == T_EPERM);
+    CHECK(vspace_map(&uts, 5, 12, ua(VA0 + 0x1000), RO) == T_OK);
 
     /* Deleting a writable alias's capability lifts the block. */
     CHECK(cap_delete(&uts, 13) == T_OK);
-    CHECK(vspace_map(&uts, 1, 10, VA0, RX) == T_OK);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0), RX) == T_OK);
 
     /* A copy never inherits a mapping (V10), and frames take no badge. */
     CHECK(cap_derive(&uts, 10, 14, CAP_R_ALL, 0) == T_OK);
@@ -792,48 +794,48 @@ static void test_vspace_deputy(void)
     /* Task B holds a copy of the AS capability but no frame. */
     cspace_init(&bcs, b_store, ARRAY_SIZE(b_store));
     CHECK(cap_derive_to(&uts, 1, &bcs, 0, CAP_R_ALL, 0) == T_OK);
-    CHECK(vspace_map(&bcs, 0, 10, VA0, RW) == T_EBADCAP);      /* slot 10 is A's, not B's */
-    CHECK(vspace_map(&bcs, 0, 1, VA0, RW) == T_EBADCAP);
+    CHECK(vspace_map(&bcs, 0, 10, ua(VA0), RW) == T_EBADCAP);      /* slot 10 is A's, not B's */
+    CHECK(vspace_map(&bcs, 0, 1, ua(VA0), RW) == T_EBADCAP);
     /* A delegates read-only; B cannot widen it. */
     CHECK(cap_derive_to(&uts, 10, &bcs, 1, CAP_R_READ | CAP_R_GRANT, 0) == T_OK);
-    CHECK(vspace_map(&bcs, 0, 1, VA0, RW) == T_EPERM);
-    CHECK(vspace_map(&bcs, 0, 1, VA0, RX) == T_EPERM);
+    CHECK(vspace_map(&bcs, 0, 1, ua(VA0), RW) == T_EPERM);
+    CHECK(vspace_map(&bcs, 0, 1, ua(VA0), RX) == T_EPERM);
     CHECK(cap_derive(&bcs, 1, 2, CAP_R_ALL, 0) == T_OK);        /* re-derive cannot widen */
-    CHECK(vspace_map(&bcs, 0, 2, VA0, RW) == T_EPERM);
+    CHECK(vspace_map(&bcs, 0, 2, ua(VA0), RW) == T_EPERM);
     /* An AS capability without WRITE confers no right to map. */
     CHECK(cap_derive_to(&uts, 1, &bcs, 3, CAP_R_READ, 0) == T_OK);
-    CHECK(vspace_map(&bcs, 3, 1, VA0, RO) == T_EPERM);
-    CHECK(vspace_map(&bcs, 0, 1, VA0, RO) == T_OK);              /* with real authority */
+    CHECK(vspace_map(&bcs, 3, 1, ua(VA0), RO) == T_EPERM);
+    CHECK(vspace_map(&bcs, 0, 1, ua(VA0), RO) == T_OK);              /* with real authority */
 
     /* Only Frames can be mapped. */
-    CHECK(vspace_map(&uts, 1, 12, VA0 + 0x1000, RO) == T_EBADCAP); /* CNode */
-    CHECK(vspace_map(&uts, 1, 13, VA0 + 0x1000, RO) == T_EBADCAP); /* Endpoint */
-    CHECK(vspace_map(&uts, 1, 1, VA0 + 0x1000, RO) == T_EBADCAP);  /* AddressSpace */
-    CHECK(vspace_map(&uts, 1, 14, VA0 + 0x1000, RO) == T_EBADCAP); /* PageTable */
-    CHECK(vspace_map(&uts, 1, 0, VA0 + 0x1000, RO) == T_EBADCAP);  /* Untyped */
+    CHECK(vspace_map(&uts, 1, 12, ua(VA0 + 0x1000), RO) == T_EBADCAP); /* CNode */
+    CHECK(vspace_map(&uts, 1, 13, ua(VA0 + 0x1000), RO) == T_EBADCAP); /* Endpoint */
+    CHECK(vspace_map(&uts, 1, 1, ua(VA0 + 0x1000), RO) == T_EBADCAP);  /* AddressSpace */
+    CHECK(vspace_map(&uts, 1, 14, ua(VA0 + 0x1000), RO) == T_EBADCAP); /* PageTable */
+    CHECK(vspace_map(&uts, 1, 0, ua(VA0 + 0x1000), RO) == T_EBADCAP);  /* Untyped */
 
     /* Kernel and non-user addresses are unreachable. */
-    CHECK(vspace_map(&uts, 1, 11, USER_TOP, RO) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 11, 0xFFFF800000000000ull, RO) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 11, 0xFFFFFFFF80000000ull, RO) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 8, RO) == T_EINVAL);
-    CHECK(vspace_map(&uts, 1, 11, USER_TOP - PAGE_SIZE, RO) == T_ENOENT); /* user, no table */
-    CHECK(vspace_install(&uts, 1, 14, 0xFFFF800000000000ull, 1) == T_EINVAL);
-    CHECK(vspace_install(&uts, 1, 14, 0xFFFFFF8000000000ull, 1) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 11, ua(USER_TOP), RO) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 11, ua(0xFFFF800000000000ull), RO) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 11, ua(0xFFFFFFFF80000000ull), RO) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 8), RO) == T_EINVAL);
+    CHECK(vspace_map(&uts, 1, 11, ua(USER_TOP - PAGE_SIZE), RO) == T_ENOENT); /* user, no table */
+    CHECK(vspace_install(&uts, 1, 14, ua(0xFFFF800000000000ull), 1) == T_EINVAL);
+    CHECK(vspace_install(&uts, 1, 14, ua(0xFFFFFF8000000000ull), 1) == T_EINVAL);
 
     /* Install rules. */
-    CHECK(vspace_install(&uts, 1, 14, VA0, 0) == T_EINVAL);
-    CHECK(vspace_install(&uts, 1, 14, VA0, 4) == T_EINVAL);
-    CHECK(vspace_install(&uts, 1, 14, VA0 + 0x1000, 3) == T_EINVAL); /* misaligned */
-    CHECK(vspace_install(&uts, 1, 14, VA0, 3) == T_EBUSY);           /* entry used */
-    CHECK(vspace_install(&uts, 1, 2, 2 * VA0, 1) == T_EBUSY);        /* already installed */
-    CHECK(vspace_install(&uts, 1, 14, 2 * VA0, 3) == T_ENOENT);      /* no PDPT/PD there */
+    CHECK(vspace_install(&uts, 1, 14, ua(VA0), 0) == T_EINVAL);
+    CHECK(vspace_install(&uts, 1, 14, ua(VA0), 4) == T_EINVAL);
+    CHECK(vspace_install(&uts, 1, 14, ua(VA0 + 0x1000), 3) == T_EINVAL); /* misaligned */
+    CHECK(vspace_install(&uts, 1, 14, ua(VA0), 3) == T_EBUSY);           /* entry used */
+    CHECK(vspace_install(&uts, 1, 2, ua(2 * VA0), 1) == T_EBUSY);        /* already installed */
+    CHECK(vspace_install(&uts, 1, 14, ua(2 * VA0), 3) == T_ENOENT);      /* no PDPT/PD there */
     CHECK(cap_derive(&uts, 14, 15, CAP_R_ALL, 0) == T_EINVAL);       /* not copyable */
 
     /* One mapping per capability; one frame per entry. */
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x1000, RO) == T_OK);
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x2000, RO) == T_EBUSY);
-    CHECK(vspace_map(&uts, 1, 10, VA0 + 0x1000, RO) == T_EBUSY);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RO) == T_OK);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x2000), RO) == T_EBUSY);
+    CHECK(vspace_map(&uts, 1, 10, ua(VA0 + 0x1000), RO) == T_EBUSY);
 
     CHECK(vspace_audit(&uts, 1));
     cspace_destroy(&bcs);
@@ -845,14 +847,14 @@ static void test_vspace_deputy(void)
 /* V11-V13: teardown in every order leaves nothing dangling. */
 static void test_vspace_teardown(void)
 {
-    paddr_t master = read_cr3() & 0x000FFFFFFFFFF000ull;
+    uint64_t master = read_cr3() & 0x000FFFFFFFFFF000ull;
 
     CHECK(ut_setup(20));
     CHECK(build_as(1, 2));
     CHECK(build_as(5, 6));
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 10, 4) == T_OK);
     for (cap_slot_t i = 0; i < 4; i++)
-        CHECK(vspace_map(&uts, 1, 10 + i, VA0 + i * PAGE_SIZE, RW) == T_OK);
+        CHECK(vspace_map(&uts, 1, 10 + i, ua(VA0 + i * PAGE_SIZE), RW) == T_OK);
 
     /* Frame first: deleting the capability unmaps it, and the TLB no
      * longer translates it. */
@@ -864,8 +866,8 @@ static void test_vspace_teardown(void)
     /* Deleting a copy removes only the copy's mapping. */
     CHECK(cap_derive(&uts, 11, 20, CAP_R_ALL, 0) == T_OK);
     CHECK(vspace_unmap(&uts, 11) == T_OK);
-    CHECK(vspace_map(&uts, 5, 20, VA0, RW) == T_OK);
-    CHECK(vspace_map(&uts, 1, 11, VA0 + 0x1000, RW) == T_OK);
+    CHECK(vspace_map(&uts, 5, 20, ua(VA0), RW) == T_OK);
+    CHECK(vspace_map(&uts, 1, 11, ua(VA0 + 0x1000), RW) == T_OK);
     CHECK(cap_delete(&uts, 20) == T_OK);
     CHECK(hw_flags(&uts, 5, VA0) == 0 && (hw_flags(&uts, 1, VA0 + 0x1000) & PTE_P));
 
@@ -875,7 +877,7 @@ static void test_vspace_teardown(void)
     CHECK(ut_store[12].map_state == 0 && ut_store[13].map_state == 0);
     CHECK(hw_flags(&uts, 1, VA0 + 0x1000) == 0);
     CHECK(vspace_audit(&uts, 1));
-    CHECK(vspace_map(&uts, 5, 11, VA0 + 0x1000, RW) == T_OK);
+    CHECK(vspace_map(&uts, 5, 11, ua(VA0 + 0x1000), RW) == T_OK);
 
     /* Address space first, while active: the CPU falls back to the kernel
      * tables, and its tables become installable elsewhere. */
@@ -885,7 +887,7 @@ static void test_vspace_teardown(void)
     CHECK(ut_store[2].map_state == 0 && ut_store[2].map_entry == NULL);
     CHECK(ut_store[3].map_state == 0 && ut_store[3].map_entry == NULL); /* V15 */
     CHECK(cap_retype(&uts, 0, CAP_ADDRESS_SPACE, 0, &uts, 1, 1) == T_OK);
-    CHECK(vspace_install(&uts, 1, 2, VA0, 1) == T_OK);
+    CHECK(vspace_install(&uts, 1, 2, ua(VA0), 1) == T_OK);
     CHECK(vspace_audit(&uts, 1));
 
 
@@ -895,7 +897,7 @@ static void test_vspace_teardown(void)
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 30, 2) == T_OK);
     *(volatile uint64_t *)phys_to_virt(cap_obj_paddr(&ut_store[30])) = 0xAAAA;
     *(volatile uint64_t *)phys_to_virt(cap_obj_paddr(&ut_store[31])) = 0xBBBB;
-    CHECK(vspace_map(&uts, 5, 30, VA0 + 0x8000, RO) == T_OK);
+    CHECK(vspace_map(&uts, 5, 30, ua(VA0 + 0x8000), RO) == T_OK);
     uint64_t before = 0, after = 0;
     int rc_unmap = -1, rc_map = -1;
     if (vspace_activate(&uts, 5) == T_OK) {
@@ -903,7 +905,7 @@ static void test_vspace_teardown(void)
         before = *(volatile uint64_t *)(VA0 + 0x8000);
         smap_close();
         rc_unmap = vspace_unmap(&uts, 30);
-        rc_map = vspace_map(&uts, 5, 31, VA0 + 0x8000, RO);
+        rc_map = vspace_map(&uts, 5, 31, ua(VA0 + 0x8000), RO);
         smap_open();
         after = *(volatile uint64_t *)(VA0 + 0x8000);
         smap_close();
@@ -916,13 +918,13 @@ static void test_vspace_teardown(void)
      * space. Populate AS 5's tables, pull its PDPT out, and install it in
      * AS 1 instead: nothing that was mapped may become visible there. */
     CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 40, 2) == T_OK);
-    CHECK(vspace_map(&uts, 5, 40, VA0 + 0x10000, RW) == T_OK);
-    CHECK(vspace_map(&uts, 5, 41, VA0 + 0x11000, RO) == T_OK);
+    CHECK(vspace_map(&uts, 5, 40, ua(VA0 + 0x10000), RW) == T_OK);
+    CHECK(vspace_map(&uts, 5, 41, ua(VA0 + 0x11000), RO) == T_OK);
     CHECK(vspace_uninstall(&uts, 6) == T_OK);              /* AS 5's PDPT */
     CHECK(ut_store[40].map_state == 0 && ut_store[41].map_state == 0);
     CHECK(ut_store[7].map_state == 0 && ut_store[8].map_state == 0);
     CHECK(cap_delete(&uts, 2) == T_OK);                    /* free AS 1's slot */
-    CHECK(vspace_install(&uts, 1, 6, VA0, 1) == T_OK);
+    CHECK(vspace_install(&uts, 1, 6, ua(VA0), 1) == T_OK);
     CHECK(hw_flags(&uts, 1, VA0 + 0x10000) == 0 && hw_flags(&uts, 1, VA0 + 0x11000) == 0);
     CHECK(vspace_audit(&uts, 1) && vspace_audit(&uts, 5));
 
@@ -943,17 +945,17 @@ extern const char __data_start[], __data_end[];
 
 extern char boot_stack_guard[], df_stack_guard[], nmi_stack_guard[];
 
-static bool is_stack_guard(vaddr_t va)
+static bool is_stack_guard(uintptr_t va)
 {
-    return va == (vaddr_t)boot_stack_guard || va == (vaddr_t)df_stack_guard ||
-           va == (vaddr_t)nmi_stack_guard;
+    return va == (uintptr_t)boot_stack_guard || va == (uintptr_t)df_stack_guard ||
+           va == (uintptr_t)nmi_stack_guard;
 }
 
 /* Every page in [start, end) must have exactly the expected W and NX bits;
  * the only unmapped pages allowed are the stack guards. */
 static bool range_has(const char *start, const char *end, bool want_w, bool want_nx)
 {
-    for (vaddr_t va = ALIGN_DOWN((vaddr_t)start, PAGE_SIZE); va < (vaddr_t)end; va += PAGE_SIZE) {
+    for (uintptr_t va = ALIGN_DOWN((uintptr_t)start, PAGE_SIZE); va < (uintptr_t)end; va += PAGE_SIZE) {
         uint64_t f;
         if (paging_query(va, &f) != 0) {
             if (is_stack_guard(va))
@@ -979,9 +981,9 @@ static void test_stack_guards(void)
     uint64_t f;
     char probe;
 
-    CHECK(paging_query((vaddr_t)boot_stack_guard, &f) == -1);
-    CHECK(paging_query((vaddr_t)df_stack_guard, &f) == -1);
-    CHECK(paging_query((vaddr_t)nmi_stack_guard, &f) == -1);
+    CHECK(paging_query((uintptr_t)boot_stack_guard, &f) == -1);
+    CHECK(paging_query((uintptr_t)df_stack_guard, &f) == -1);
+    CHECK(paging_query((uintptr_t)nmi_stack_guard, &f) == -1);
     /* We are running on the guarded boot stack. */
     CHECK(&probe > boot_stack_guard + PAGE_SIZE && &probe < boot_stack_top);
 }

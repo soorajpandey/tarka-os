@@ -5,8 +5,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef uint64_t paddr_t;
-typedef uint64_t vaddr_t;
+/*
+ * Address kinds are distinct types (ADR 0008, T34). Kernel virtual
+ * addresses are ordinary C pointers. Physical and user addresses are
+ * single-field structs: they cannot be dereferenced, mixed with each other
+ * or with integers, and convert only through the explicit helpers below
+ * (and phys_to_virt / virt_to_phys in kernel.h, copy_*_user for user
+ * addresses).
+ */
+typedef struct { uint64_t raw; } paddr_t;   /* physical address */
+typedef struct { uint64_t raw; } uaddr_t;   /* user virtual address */
+
+static inline paddr_t pa(uint64_t raw) { return (paddr_t){ raw }; }
+static inline uint64_t pa_raw(paddr_t p) { return p.raw; }
+static inline bool pa_is_null(paddr_t p) { return p.raw == 0; }
+static inline paddr_t pa_add(paddr_t p, uint64_t off) { return (paddr_t){ p.raw + off }; }
+
+static inline uaddr_t ua(uint64_t raw) { return (uaddr_t){ raw }; }
+static inline uint64_t ua_raw(uaddr_t u) { return u.raw; }
 
 #define PAGE_SIZE ((uint64_t)4096)
 

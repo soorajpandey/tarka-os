@@ -11,11 +11,11 @@
 
 /* Walk the active page tables and report the effective P/W/U/NX flags for
  * `va`. Returns 0 if mapped, -1 if not. Used to verify W^X at runtime. */
-int paging_query(vaddr_t va, uint64_t *flags_out);
+int paging_query(uint64_t va, uint64_t *flags_out);
 
 /* Unmap one 4 KiB kernel page. Returns 0, or -1 if `va` is unmapped or
  * part of a large page. */
-int paging_unmap_4k(vaddr_t va);
+int paging_unmap_4k(uint64_t va);
 
 /* Unmap the guard page below every kernel stack (see entry.S). */
 void stack_guards_init(void);

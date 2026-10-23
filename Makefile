@@ -84,6 +84,7 @@ run: build/release/tarka.iso
 	$(QEMU) -M q35 -cpu max -m 256M -cdrom $< -serial stdio -no-reboot
 
 test: build/test/tarka.iso
+	scripts/check-address-types.sh
 	scripts/run-tests.sh $<
 
 clean:

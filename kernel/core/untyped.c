@@ -36,7 +36,7 @@ static struct cspace cnode_of(paddr_t paddr, unsigned obj_bits)
 static void cnode_finalise(enum cap_type type, uint64_t object)
 {
     (void)type;
-    struct cspace cs = cnode_of(object & ~CAP_OBJ_BITS_MASK,
+    struct cspace cs = cnode_of(pa(object & ~CAP_OBJ_BITS_MASK),
                                 (unsigned)(object & CAP_OBJ_BITS_MASK));
     cspace_destroy(&cs);
 }
@@ -132,7 +132,7 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
         return T_ENOMEM;
 
     /* No state has changed so far. From here on the operation cannot fail. */
-    paddr_t base = cap_obj_paddr(ut) + start;
+    paddr_t base = pa_add(cap_obj_paddr(ut), start);
 
     /* 8. zero (O6); child Untypeds hold no data */
     if (type != CAP_UNTYPED)
@@ -141,7 +141,7 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
     /* Type-specific initialisation of the zeroed objects. */
     if (type == CAP_ADDRESS_SPACE) {
         for (uint32_t i = 0; i < count; i++)
-            vspace_as_init(base + i * obj_size);
+            vspace_as_init(pa_add(base, i * obj_size));
     }
 
     /* 9. capabilities, as children of the Untyped. Untyped and PageTable
@@ -154,7 +154,7 @@ int cap_retype(struct cspace *cs, cap_slot_t ut_slot, enum cap_type type,
         memset(c, 0, sizeof(*c));
         c->type = type;
         c->rights = rights;
-        c->object = cap_obj_encode(base + i * obj_size, obj_bits);
+        c->object = cap_obj_encode(pa_add(base, i * obj_size), obj_bits);
         cap_insert_child(ut, c);
     }
     ut->ut_watermark = end;

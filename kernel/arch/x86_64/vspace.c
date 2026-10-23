@@ -35,6 +35,10 @@ _Static_assert((PAGE_SIZE - 1) >= (MS_MAPPED | MS_RIGHTS), "map_state flags must
 static paddr_t master_pml4;
 
 static inline uint64_t *table_va(paddr_t p) { return phys_to_virt(p); }
+static inline paddr_t cr3_pa(void) { return pa(read_cr3() & PTE_ADDR_MASK); }
+static inline void load_cr3(paddr_t p) { write_cr3(pa_raw(p)); }
+static inline paddr_t pte_pa(uint64_t e) { return pa(e & PTE_ADDR_MASK); }
+static inline uint64_t pte_make(paddr_t p, uint64_t flags) { return pa_raw(p) | flags; }
 static inline struct cap **shadow_of(uint64_t *entry) { return (struct cap **)(entry + ENTRIES); }
 
 /* Phase 1 of V13: one CPU; drop every non-global translation. User
@@ -112,10 +116,10 @@ static void pt_finalise(enum cap_type type, uint64_t object)
 
 static void as_finalise(enum cap_type type, uint64_t object)
 {
-    paddr_t pml4 = object & ~CAP_OBJ_BITS_MASK;
+    paddr_t pml4 = pa(object & ~CAP_OBJ_BITS_MASK);
 
     (void)type;
-    if ((read_cr3() & PTE_ADDR_MASK) == pml4)
+    if (pa_raw(cr3_pa()) == pa_raw(pml4))
         vspace_activate_kernel();
     subtree_teardown(pml4, 0, USER_ENTRIES);
     tlb_flush_user();
@@ -123,7 +127,7 @@ static void as_finalise(enum cap_type type, uint64_t object)
 
 void vspace_boot(void)
 {
-    master_pml4 = read_cr3() & PTE_ADDR_MASK;
+    master_pml4 = cr3_pa();
 
     /* V4: make the whole kernel half supervisor-only at the top level. The
      * bootloader sets U=1 on intermediate entries and relies on every leaf
@@ -132,7 +136,7 @@ void vspace_boot(void)
     uint64_t *master = table_va(master_pml4);
     for (unsigned i = USER_ENTRIES; i < ENTRIES; i++)
         master[i] &= ~PTE_U;
-    write_cr3(master_pml4);
+    load_cr3(master_pml4);
 
     cap_set_cleanup(CAP_FRAME, frame_cleanup);
     cap_set_cleanup(CAP_PAGE_TABLE, pt_cleanup);
@@ -145,7 +149,7 @@ void vspace_as_init(paddr_t as)
     uint64_t *pml4 = table_va(as);
     const uint64_t *master = table_va(master_pml4);
 
-    KASSERT(master_pml4 != 0); /* vspace_boot() must run first */
+    KASSERT(!pa_is_null(master_pml4)); /* vspace_boot() must run first */
     /* V4: the kernel half is copied once and never written again. */
     for (unsigned i = USER_ENTRIES; i < ENTRIES; i++)
         pml4[i] = master[i];
@@ -153,7 +157,7 @@ void vspace_as_init(paddr_t as)
 
 void vspace_activate_kernel(void)
 {
-    write_cr3(master_pml4);
+    load_cr3(master_pml4);
 }
 
 int vspace_activate(struct cspace *cs, cap_slot_t as)
@@ -163,18 +167,18 @@ int vspace_activate(struct cspace *cs, cap_slot_t as)
 
     if (rc)
         return rc;
-    write_cr3(cap_obj_paddr(a));
+    load_cr3(cap_obj_paddr(a));
     return T_OK;
 }
 
-static unsigned index_at(vaddr_t va, unsigned depth)
+static unsigned index_at(uaddr_t va, unsigned depth)
 {
-    return (va >> (39 - 9 * depth)) & (ENTRIES - 1);
+    return (ua_raw(va) >> (39 - 9 * depth)) & (ENTRIES - 1);
 }
 
 /* The entry at table `depth` (0 = PML4) covering `va`, if every table
  * above it is present; NULL otherwise. */
-static uint64_t *entry_at(paddr_t pml4, vaddr_t va, unsigned depth)
+static uint64_t *entry_at(paddr_t pml4, uaddr_t va, unsigned depth)
 {
     uint64_t *t = table_va(pml4);
 
@@ -182,7 +186,7 @@ static uint64_t *entry_at(paddr_t pml4, vaddr_t va, unsigned depth)
         uint64_t e = t[index_at(va, d)];
         if (!(e & PTE_P))
             return NULL;
-        t = table_va(e & PTE_ADDR_MASK);
+        t = table_va(pte_pa(e));
     }
     return &t[index_at(va, depth)];
 }
@@ -220,7 +224,7 @@ static bool alias_conflict(struct cap *frame, cap_rights_t want)
     return false;
 }
 
-int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, vaddr_t va, unsigned depth)
+int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, uaddr_t va, unsigned depth)
 {
     const struct cap *a, *p;
     int rc;
@@ -234,7 +238,7 @@ int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, vaddr_t va, 
 
     /* The table at `depth` covers 2^(48 - 9*depth) bytes. */
     uint64_t span = 1ull << (48 - 9 * depth);
-    if (va >= USER_TOP || va % span)
+    if (ua_raw(va) >= USER_TOP || ua_raw(va) % span)
         return T_EINVAL; /* V3: never in the kernel half */
 
     struct cap *ptc = cap_slot(cs, pt);
@@ -248,7 +252,7 @@ int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt, vaddr_t va, 
         return T_EBUSY;
 
     /* Intermediate entries are permissive; leaves decide R/W/X. */
-    *entry = cap_obj_paddr(ptc) | PTE_P | PTE_W | PTE_U;
+    *entry = pte_make(cap_obj_paddr(ptc), PTE_P | PTE_W | PTE_U);
     *shadow_of(entry) = ptc;
     ptc->map_state = depth | MS_INSTALLED;
     ptc->map_entry = entry;
@@ -269,7 +273,7 @@ int vspace_uninstall(struct cspace *cs, cap_slot_t pt)
     return T_OK;
 }
 
-int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, vaddr_t va,
+int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, uaddr_t va,
                cap_rights_t rights)
 {
     const struct cap *a, *f;
@@ -281,7 +285,7 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, vaddr_t va,
         return rc;
     if (!rights_valid(rights))
         return T_EINVAL; /* V5: no RWX, no WX, no empty mapping */
-    if (va >= USER_TOP || va % PAGE_SIZE)
+    if (ua_raw(va) >= USER_TOP || ua_raw(va) % PAGE_SIZE)
         return T_EINVAL; /* V1/V3: user half only */
     if ((f->rights & rights) != rights)
         return T_EPERM;  /* V9: cannot grant more than the frame cap holds */
@@ -298,9 +302,9 @@ int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame, vaddr_t va,
     if (*entry & PTE_P)
         return T_EBUSY;
 
-    *entry = cap_obj_paddr(fc) | pte_flags(rights);
+    *entry = pte_make(cap_obj_paddr(fc), pte_flags(rights));
     *shadow_of(entry) = fc;
-    fc->map_state = va | rights | MS_MAPPED;
+    fc->map_state = ua_raw(va) | rights | MS_MAPPED;
     fc->map_entry = entry;
     return T_OK;
 }
@@ -335,7 +339,7 @@ int vspace_protect(struct cspace *cs, cap_slot_t frame, cap_rights_t rights)
     if (!rights_valid(rights) || (rights & ~cur))
         return T_EPERM;
 
-    *fc->map_entry = cap_obj_paddr(fc) | pte_flags(rights);
+    *fc->map_entry = pte_make(cap_obj_paddr(fc), pte_flags(rights));
     fc->map_state = (fc->map_state & ~(uint64_t)MS_RIGHTS) | rights;
     tlb_flush_user();
     return T_OK;
@@ -356,7 +360,7 @@ static bool audit_table(paddr_t table, unsigned depth, unsigned nentries)
                 return false; /* stale entry or stale shadow */
             continue;
         }
-        if (!c || c->map_entry != &t[i] || (e & PTE_ADDR_MASK) != cap_obj_paddr(c))
+        if (!c || c->map_entry != &t[i] || pa_raw(pte_pa(e)) != pa_raw(cap_obj_paddr(c)))
             return false;
         if (!(e & PTE_U))
             return false;

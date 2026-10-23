@@ -7,9 +7,9 @@
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ull
 
 /* Find the leaf entry mapping `va`; *level_out is 0 for a 4 KiB page. */
-static uint64_t *walk(vaddr_t va, int *level_out)
+static uint64_t *walk(uint64_t va, int *level_out)
 {
-    uint64_t *table = phys_to_virt(read_cr3() & PTE_ADDR_MASK);
+    uint64_t *table = phys_to_virt(pa(read_cr3() & PTE_ADDR_MASK));
 
     for (int level = 3; level >= 0; level--) {
         uint64_t *e = &table[(va >> (12 + 9 * level)) & 0x1FF];
@@ -20,12 +20,12 @@ static uint64_t *walk(vaddr_t va, int *level_out)
             *level_out = level;
             return e;
         }
-        table = phys_to_virt(*e & PTE_ADDR_MASK);
+        table = phys_to_virt(pa(*e & PTE_ADDR_MASK));
     }
     return NULL;
 }
 
-int paging_unmap_4k(vaddr_t va)
+int paging_unmap_4k(uint64_t va)
 {
     int level;
     uint64_t *e = walk(va, &level);
@@ -44,14 +44,14 @@ void stack_guards_init(void)
     char *const guards[] = { boot_stack_guard, df_stack_guard, nmi_stack_guard };
 
     for (size_t i = 0; i < ARRAY_SIZE(guards); i++) {
-        if (paging_unmap_4k((vaddr_t)guards[i]) != 0)
+        if (paging_unmap_4k((uint64_t)(uintptr_t)guards[i]) != 0)
             panic("cannot unmap stack guard page %p", guards[i]);
     }
 }
 
-int paging_query(vaddr_t va, uint64_t *flags_out)
+int paging_query(uint64_t va, uint64_t *flags_out)
 {
-    uint64_t *table = phys_to_virt(read_cr3() & PTE_ADDR_MASK);
+    uint64_t *table = phys_to_virt(pa(read_cr3() & PTE_ADDR_MASK));
     uint64_t writable = PTE_W, user = PTE_U, nx = 0;
 
     for (int level = 3; level >= 0; level--) {
@@ -73,7 +73,7 @@ int paging_query(vaddr_t va, uint64_t *flags_out)
             *flags_out = PTE_P | writable | user | nx;
             return 0;
         }
-        table = phys_to_virt(e & PTE_ADDR_MASK);
+        table = phys_to_virt(pa(e & PTE_ADDR_MASK));
     }
     return -1;
 }

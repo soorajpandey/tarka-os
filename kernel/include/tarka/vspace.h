@@ -17,10 +17,10 @@ void vspace_boot(void);
 void vspace_as_init(paddr_t as);
 
 __must_check int vspace_install(struct cspace *cs, cap_slot_t as, cap_slot_t pt,
-                                vaddr_t va, unsigned depth);
+                                uaddr_t va, unsigned depth);
 __must_check int vspace_uninstall(struct cspace *cs, cap_slot_t pt);
 __must_check int vspace_map(struct cspace *cs, cap_slot_t as, cap_slot_t frame,
-                            vaddr_t va, cap_rights_t rights);
+                            uaddr_t va, cap_rights_t rights);
 __must_check int vspace_unmap(struct cspace *cs, cap_slot_t frame);
 __must_check int vspace_protect(struct cspace *cs, cap_slot_t frame, cap_rights_t rights);
 

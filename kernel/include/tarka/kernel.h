@@ -29,7 +29,7 @@ __noreturn void kmain(void);
 /* Higher-half direct map offset supplied by the bootloader. */
 extern uint64_t hhdm_offset;
 
-static inline void *phys_to_virt(paddr_t p) { return (void *)(p + hhdm_offset); }
-static inline paddr_t virt_to_phys_hhdm(const void *v) { return (paddr_t)v - hhdm_offset; }
+static inline void *phys_to_virt(paddr_t p) { return (void *)(pa_raw(p) + hhdm_offset); }
+static inline paddr_t virt_to_phys_hhdm(const void *v) { return pa((uint64_t)v - hhdm_offset); }
 
 #endif

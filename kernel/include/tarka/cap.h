@@ -84,12 +84,12 @@ _Static_assert(sizeof(struct cap_info) == 16, "struct cap_info must have no padd
 
 static inline uint64_t cap_obj_encode(paddr_t paddr, unsigned bits)
 {
-    return paddr | bits;
+    return pa_raw(paddr) | bits;
 }
 
 static inline paddr_t cap_obj_paddr(const struct cap *c)
 {
-    return c->object & ~CAP_OBJ_BITS_MASK;
+    return pa(c->object & ~CAP_OBJ_BITS_MASK);
 }
 
 static inline unsigned cap_obj_bits(const struct cap *c)

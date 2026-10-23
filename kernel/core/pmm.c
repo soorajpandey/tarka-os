@@ -48,12 +48,12 @@ void pmm_init(struct limine_memmap_response *memmap)
     nframes = top / PAGE_SIZE;
     uint64_t one_bitmap = (nframes + 63) / 64 * sizeof(uint64_t);
     uint64_t bitmap_bytes = ALIGN_UP(2 * one_bitmap, PAGE_SIZE);
-    paddr_t bitmap_phys = 0;
+    uint64_t bitmap_phys = 0; /* raw: bootloader-provided, validated here */
 
     /* Place both bitmaps in the first usable region big enough for them. */
     for (uint64_t i = 0; i < memmap->entry_count && !bitmap_phys; i++) {
         struct limine_memmap_entry *e = memmap->entries[i];
-        paddr_t base = ALIGN_UP(e->base, PAGE_SIZE);
+        uint64_t base = ALIGN_UP(e->base, PAGE_SIZE);
 
         if (e->type != LIMINE_MEMMAP_USABLE || base == 0)
             continue;
@@ -63,7 +63,7 @@ void pmm_init(struct limine_memmap_response *memmap)
     if (!bitmap_phys)
         panic("pmm: no region large enough for %lu-byte bitmaps", bitmap_bytes);
 
-    used = phys_to_virt(bitmap_phys);
+    used = phys_to_virt(pa(bitmap_phys));
     managed = used + one_bitmap / sizeof(uint64_t);
 
     /* Everything starts used and unmanaged; only usable RAM is released. */
@@ -78,7 +78,7 @@ void pmm_init(struct limine_memmap_response *memmap)
         uint64_t first = ALIGN_UP(e->base, PAGE_SIZE) / PAGE_SIZE;
         uint64_t last = ALIGN_DOWN(e->base + e->length, PAGE_SIZE) / PAGE_SIZE;
         for (uint64_t f = first; f < last; f++) {
-            paddr_t p = f * PAGE_SIZE;
+            uint64_t p = f * PAGE_SIZE;
             if (p >= bitmap_phys && p < bitmap_phys + bitmap_bytes)
                 continue;
             /* Never hand out frame 0: a physical address of 0 is our
@@ -109,19 +109,21 @@ paddr_t pmm_alloc(void)
             next_hint = f + 1;
             /* Never return garbage: frames that were usable at boot were
              * never scrubbed and may hold bootloader or firmware data. */
-            memset(phys_to_virt(f * PAGE_SIZE), 0, PAGE_SIZE);
-            return f * PAGE_SIZE;
+            memset(phys_to_virt(pa(f * PAGE_SIZE)), 0, PAGE_SIZE);
+            return pa(f * PAGE_SIZE);
         }
     }
-    return 0;
+    return pa(0);
 }
 
 int pmm_free(paddr_t frame)
 {
-    if (frame % PAGE_SIZE || frame == 0 || frame / PAGE_SIZE >= nframes)
+    uint64_t p = pa_raw(frame);
+
+    if (p % PAGE_SIZE || p == 0 || p / PAGE_SIZE >= nframes)
         return T_EINVAL;
 
-    uint64_t f = frame / PAGE_SIZE;
+    uint64_t f = p / PAGE_SIZE;
     if (!test_bit(managed, f))
         return T_EINVAL;
     if (!test_bit(used, f))
@@ -167,7 +169,7 @@ bool pmm_take_block(unsigned max_bits, uint64_t keep, paddr_t *base, unsigned *b
             for (uint64_t i = f; i < f + n; i++)
                 set_bit(used, i);
             free_frames -= n;
-            *base = f * PAGE_SIZE;
+            *base = pa(f * PAGE_SIZE);
             *bits = b;
             return true;
         }
@@ -177,7 +179,7 @@ bool pmm_take_block(unsigned max_bits, uint64_t keep, paddr_t *base, unsigned *b
 
 bool pmm_frame_is_free(paddr_t frame)
 {
-    uint64_t f = frame / PAGE_SIZE;
+    uint64_t f = pa_raw(frame) / PAGE_SIZE;
     return f < nframes && test_bit(managed, f) && !test_bit(used, f);
 }
 
