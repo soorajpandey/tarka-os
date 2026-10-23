@@ -27,6 +27,12 @@ struct cap *cap_slot(const struct cspace *cs, cap_slot_t slot);
 
 bool cap_has_children(const struct cap *c);
 
+/* Derivation in two halves (ADR 0009, P49). cap_derive_check() reports
+ * every error derivation can give (`d` NULL: source checks only);
+ * cap_derive_commit() requires a passing check and cannot fail. */
+__must_check int cap_derive_check(const struct cap *s, const struct cap *d, uint64_t badge);
+void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge);
+
 static inline bool cap_badged_type(uint32_t type)
 {
 #ifdef TARKA_SELFTEST

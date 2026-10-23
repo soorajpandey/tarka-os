@@ -236,7 +236,10 @@ int cap_identify(const struct cspace *cs, cap_slot_t slot, struct cap_info *out)
     return T_OK;
 }
 
-static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
+/* ADR 0009 P49: derivation is a check, which reports every error, and a
+ * commit, which cannot fail. `d` may be NULL to check the source alone
+ * (a transfer whose destination is not known yet). */
+int cap_derive_check(const struct cap *s, const struct cap *d, uint64_t badge)
 {
     if (s->type == CAP_NULL)
         return T_EBADCAP;
@@ -246,13 +249,18 @@ static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badg
         return T_EINVAL; /* only endpoints and notifications carry badges */
     if (!(s->rights & CAP_R_GRANT))
         return T_EPERM;
-    if (d->type != CAP_NULL)
+    if (d && d->type != CAP_NULL)
         return T_EBUSY;
     /* A badge identifies a client to a server; once set it must not be
      * rewritten, or a client could impersonate another. */
     if (badge && s->badge)
         return T_EPERM;
+    return T_OK;
+}
 
+void cap_derive_commit(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
+{
+    KASSERT(d != NULL && cap_derive_check(s, d, badge) == T_OK);
     KASSERT(d->pending_link == 0);
     cap_slot_clear(d);
     d->type = s->type;
@@ -266,6 +274,15 @@ static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badg
     /* Everything else (mapping state, map_entry) stays zero: a copy holds
      * authority, not the source's mappings. */
     cap_insert_child(s, d);
+}
+
+static int derive(struct cap *s, struct cap *d, cap_rights_t mask, uint64_t badge)
+{
+    int rc = cap_derive_check(s, d, badge);
+
+    if (rc)
+        return rc;
+    cap_derive_commit(s, d, mask, badge);
     return T_OK;
 }
 

@@ -43,6 +43,9 @@ static void waitq_remove(struct thread *t)
      * it ends (rendezvous, T_EDEAD, suspension, destruction). */
     if (q->kind == THREAD_BLOCKED_SEND)
         memset(&t->msg, 0, sizeof(t->msg));
+    /* P50: likewise a receiver's staged offer of slots. */
+    if (q->kind == THREAD_BLOCKED_RECV)
+        memset(&t->offer, 0, sizeof(t->offer));
     if (t->wait_prev)
         t->wait_prev->wait_next = t->wait_next;
     else
@@ -235,6 +238,20 @@ bool ipc_audit(struct waitq *const *extra, size_t nextra)
             return false;
         for (unsigned i = len; i < MSG_MAX_WORDS; i++)
             if (t->msg.words[i])
+                return false;
+        unsigned nc = t->state == THREAD_BLOCKED_SEND ? MSG_NCAPS(t->msg.info) : 0;
+        for (unsigned i = nc; i < MSG_MAX_CAPS; i++)
+            if (t->msg.caps[i])
+                return false;
+        if (t->msg.reserved)
+            return false;
+        /* 8 (P50): an offer of receive slots is staged only while blocked
+         * receiving; nothing lies beyond its count. */
+        unsigned oc = t->state == THREAD_BLOCKED_RECV ? t->offer.count : 0;
+        if (oc > MSG_MAX_CAPS || (t->state != THREAD_BLOCKED_RECV && t->offer.count))
+            return false;
+        for (unsigned i = oc; i < MSG_MAX_CAPS; i++)
+            if (t->offer.slots[i])
                 return false;
         /* Reply authority held as a server. */
         switch (t->reply_state) {

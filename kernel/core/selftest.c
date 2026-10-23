@@ -1792,6 +1792,7 @@ struct ipc_snap {
         const void *wait_q, *wait_next, *wait_prev, *reply_to, *reply_from;
         struct user_regs regs;
         struct ipc_msg msg;
+        struct ipc_offer offer;
     } th[SNAP_MAX];
     const struct thread *runq[SNAP_MAX];
     struct waitq q[TEST_WAITQS];
@@ -1816,6 +1817,7 @@ static void snapshot(struct ipc_snap *s, const struct thread *const *threads, un
         s->th[i].reply_from = t->reply_from;
         s->th[i].regs = t->regs;
         s->th[i].msg = t->msg;
+        s->th[i].offer = t->offer;
     }
     unsigned k = 0;
     for (struct thread *t = runq_pop(); t; t = runq_pop()) {
@@ -2379,11 +2381,11 @@ static void test_ep_format(void)
     snapshot(&snap_a, who, 1);
     struct thread *snd = th(10);
     static const uint64_t bad_info[] = {
-        MSG_INFO(1, 33), MSG_INFO(1, 1) | (1u << 8), MSG_INFO(1, 1) | (1u << 6), /* caps: 5.4 */
-        MSG_INFO(1, 1) | (1ull << 31),
+        MSG_INFO(1, 33), MSG_INFO(1, 1) | (1u << 8), MSG_INFO(1, 1) | (1ull << 31),
     };
     for (unsigned i = 0; i < ARRAY_SIZE(bad_info); i++)
         CHECK(endpoint_send(snd, &cs, 1, bad_info[i]) == T_EINVAL);
+    CHECK(endpoint_send(snd, &cs, 1, MSG_INFO(1, 1) | (1u << 6)) == T_EPERM);  /* caps, no GRANT */
     CHECK(endpoint_send(snd, &cs, 2, MSG_INFO(1, 1)) == T_EPERM);      /* READ only */
     CHECK(endpoint_send(snd, &cs, 9, MSG_INFO(1, 1)) == T_EBADCAP);
     snapshot(&snap_b, who, 1);
@@ -2634,6 +2636,467 @@ static void test_ep_ipcbuf_wx(void)
     ut_teardown();
 }
 
+/* ---- Capability transfer (ADR 0009, step 5.4) ---- */
+
+#define G_ CAP_R_GRANT
+#define CAPS(n) ((uint64_t)(n) << 6)
+
+/* P55, authority conservation: a byte-exact copy of every capability
+ * record in a set of tables (the test cspace, and each task's cspace and
+ * its thread's binding slots). */
+#define WORLD_TABLES 16
+#define WORLD_MAX    384
+struct world {
+    unsigned n;
+    struct cap *at[WORLD_MAX];
+    struct cap v[WORLD_MAX];
+};
+static struct world world_a, world_b;
+static struct cspace world_t[WORLD_TABLES];
+static unsigned world_nt;
+
+static void world_tables(const cap_slot_t *tasks, unsigned n)
+{
+    world_nt = 0;
+    world_t[world_nt++] = uts;
+    for (unsigned i = 0; i < n; i++) {
+        KASSERT(world_nt + 2 <= WORLD_TABLES);
+        world_t[world_nt++] = task_cs(tasks[i]);
+        world_t[world_nt++] = (struct cspace){ th(tasks[i])->bind, TS_COUNT };
+    }
+}
+
+static void world_take(struct world *w)
+{
+    memset(w, 0, sizeof(*w));
+    for (unsigned t = 0; t < world_nt; t++)
+        for (uint32_t i = 0; i < world_t[t].nslots; i++) {
+            KASSERT(w->n < WORLD_MAX);                     /* bounded copy */
+            w->at[w->n] = &world_t[t].slots[i];
+            memcpy(&w->v[w->n], &world_t[t].slots[i], sizeof(struct cap));
+            w->n++;
+        }
+}
+
+static bool world_same(const struct world *a, const struct world *b)
+{
+    return a->n == b->n && memcmp(a->at, b->at, a->n * sizeof(a->at[0])) == 0 &&
+           memcmp(a->v, b->v, a->n * sizeof(a->v[0])) == 0;
+}
+
+static int in_list(const struct cap *c, struct cap *const *list, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+        if (list[i] == c)
+            return (int)i;
+    return -1;
+}
+
+/* In pre-order with depths, a record's parent is the nearest earlier
+ * record with a smaller depth, which must be exactly one less. */
+static const struct cap *cdt_parent(const struct cap *c)
+{
+    for (const struct cap *p = c->prev; p; p = p->prev)
+        if (p->depth < c->depth)
+            return p->depth + 1 == c->depth ? p : NULL;
+    return NULL;
+}
+
+/* P55, success: exactly the n records dst[i] appeared, each a CDT child of
+ * src[i] with its type, object, rights and badge and no mapping state;
+ * every other record is unchanged apart from its links; and with the new
+ * records skipped, every link is exactly what it was. */
+static bool world_transferred(const struct world *a, const struct world *b,
+                              struct cap *const *src, struct cap *const *dst, unsigned n)
+{
+    static const struct cap zero;
+    unsigned found = 0;
+
+    if (a->n != b->n || memcmp(a->at, b->at, a->n * sizeof(a->at[0])) != 0)
+        return false;
+    for (unsigned i = 0; i < a->n; i++) {
+        const struct cap *was = &a->v[i], *now = &b->v[i];
+        int k = in_list(a->at[i], dst, n);
+        if (k >= 0) {
+            const struct cap *s = src[k];
+            bool badged = s->type == CAP_ENDPOINT || s->type == CAP_NOTIFICATION;
+            found++;
+            if (memcmp(was, &zero, sizeof(zero)) != 0)
+                return false;                              /* was empty */
+            if (now->type != s->type || now->object != s->object ||
+                now->rights != s->rights || now->badge != (badged ? s->badge : 0) ||
+                now->map_entry || now->slot_flags || now->pending_link ||
+                now->depth != s->depth + 1 || cdt_parent(a->at[i]) != s)
+                return false;
+            continue;
+        }
+        struct cap x, y;
+        memcpy(&x, was, sizeof(x));
+        memcpy(&y, now, sizeof(y));
+        x.prev = x.next = y.prev = y.next = NULL;
+        if (memcmp(&x, &y, sizeof(x)) != 0)
+            return false;
+        const struct cap *nx = now->next, *pv = now->prev;
+        while (nx && in_list(nx, dst, n) >= 0)
+            nx = nx->next;
+        while (pv && in_list(pv, dst, n) >= 0)
+            pv = pv->prev;
+        if (nx != was->next || pv != was->prev)
+            return false;
+    }
+    return found == n;
+}
+
+/* A sender at b (sys1) of one word `tag` and the capabilities in its
+ * cspace slots `caps`: slot 1 is its endpoint capability (RW, GRANT);
+ * slots 2 and 3 hold receive-only and send-only copies with GRANT. */
+static bool xfer_sender(cap_slot_t b, uint64_t label, uint64_t tag, const uint32_t *caps,
+                        unsigned n)
+{
+    if (!ep_thread(b, true, label, tag, RW_ | G_))
+        return false;
+    struct cspace cs = task_cs(b);
+    if (cap_derive_to(&uts, 1, &cs, 2, CAP_R_READ | G_, 0) != T_OK ||
+        cap_derive_to(&uts, 1, &cs, 3, CAP_R_WRITE | G_, 0) != T_OK)
+        return false;
+    for (unsigned i = 0; i < n; i++)
+        tbuf(b)->caps[i] = caps[i];
+    th(b)->regs.rsi = MSG_INFO(label, 1) | CAPS(n);
+    return true;
+}
+
+/* A receiver at b (sys1) offering `slots` of its cspace. */
+static bool xfer_receiver(cap_slot_t b, const uint32_t *slots, unsigned n)
+{
+    if (!ep_thread(b, false, 0, 0, CAP_R_READ | G_))
+        return false;
+    for (unsigned i = 0; i < n; i++)
+        tbuf(b)->recv_slots[i] = slots[i];
+    tbuf(b)->recv_count = n;
+    return true;
+}
+
+static unsigned reports_with(int64_t a)
+{
+    unsigned k = 0;
+    for (unsigned i = 0; i < test_report_count; i++)
+        k += (int64_t)test_reports[i].a == a;
+    return k;
+}
+
+/* P50-P55: transfers of one and three capabilities, both arrival orders. */
+static void test_ep_xfer_basic(void)
+{
+    /* Receiver first; three capabilities: a badged notification, a frame
+     * and the endpoint itself. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &uts, 2, 1) == T_OK);
+    CHECK(cap_derive(&uts, 2, 3, W_, 0x40) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7, 8, 9 }, 3));
+    CHECK(ep_thread(10, true, 5, 0xAB, RW_ | G_));
+    struct cspace c10 = task_cs(10), c40 = task_cs(40);
+    CHECK(cap_derive_to(&uts, 3, &c10, 2, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 10 + T_STACK, &c10, 3, RW | G_, 0) == T_OK);
+    tbuf(10)->caps[0] = 2;
+    tbuf(10)->caps[1] = 3;
+    tbuf(10)->caps[2] = 1;
+    th(10)->regs.rsi = MSG_INFO(5, 1) | CAPS(3);
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && th(40)->offer.count == 3 && ep_ok(e));
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    test_report_count = 0;
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    run_user();
+    world_take(&world_b);
+    struct cap *src3[] = { &c10.slots[2], &c10.slots[3], &c10.slots[1] };
+    struct cap *dst3[] = { &c40.slots[7], &c40.slots[8], &c40.slots[9] };
+    CHECK(world_transferred(&world_a, &world_b, src3, dst3, 3));
+    CHECK(c40.slots[7].badge == 0x40 && c40.slots[9].rights == (RW_ | G_));
+    CHECK(test_report_count == 2 && reports_with(T_OK) == 2);
+    CHECK(test_reports[1].b == (MSG_INFO(5, 1) | CAPS(3) | (3ull << 8)));  /* P54 */
+    CHECK(got(40) == 0xAB && ep_ok(e) && !e->senders.head && !e->receivers.head);
+    /* P27a: counts follow the new records. */
+    struct cspace *all[] = { &uts, &c10, &c40 };
+    CHECK(endpoint_caps_with(&ut_store[1], CAP_R_READ) == 4 &&
+          scan_ep_caps(&ut_store[1], CAP_R_READ, all, 3) == 4);
+    CHECK(endpoint_caps_with(&ut_store[1], CAP_R_WRITE) == 3 &&
+          scan_ep_caps(&ut_store[1], CAP_R_WRITE, all, 3) == 3);
+    /* P25: delegation is revocable, and revocation reaches only copies. */
+    CHECK(cap_revoke(&c10, 3, 1000) == T_OK && c40.slots[8].type == CAP_NULL);
+    CHECK(cap_revoke(&c10, 1, 1000) == T_OK && c40.slots[9].type == CAP_NULL);
+    CHECK(c40.slots[7].type == CAP_NOTIFICATION && c40.slots[1].type == CAP_ENDPOINT);
+    CHECK(endpoint_caps_with(&ut_store[1], CAP_R_READ) == 3 && ep_ok(e));
+    ut_teardown();
+
+    /* Sender first; one capability, staged with the message. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_sender(10, 6, 0xCD, (const uint32_t[]){ 2 }, 1));
+    tbuf(10)->caps[1] = tbuf(10)->caps[2] = 0x55;     /* beyond ncaps: never staged */
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && th(10)->msg.caps[0] == 2 && ep_ok(e));
+    CHECK(th(10)->msg.caps[1] == 0 && th(10)->msg.caps[2] == 0);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 3 }, 1));
+    c10 = task_cs(10);
+    c40 = task_cs(40);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    struct cap *src1[] = { &c10.slots[2] }, *dst1[] = { &c40.slots[3] };
+    CHECK(world_transferred(&world_a, &world_b, src1, dst1, 1));
+    CHECK(test_report_count == 2 && reports_with(T_OK) == 2);
+    CHECK(test_reports[0].b == (MSG_INFO(6, 1) | CAPS(1) | (1ull << 8)));
+    CHECK(got(40) == 0xCD && ep_ok(e));
+    ut_teardown();
+}
+
+/* P51, P55: every sender-side refusal, with a receiver waiting, leaves
+ * every record, thread and queue byte-for-byte unchanged. */
+static void test_ep_xfer_refuse(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7, 8, 9 }, 3));
+    run_user();
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV);
+    CHECK(spawn(10, P(runner), false, NULL));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    struct cspace c10 = task_cs(10), c40 = task_cs(40);
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &uts, 70, 1) == T_OK);
+    CHECK(thread_bind(&uts, 10 + T_THR, TS_IPCBUF, &uts, 70) == T_OK);
+    struct ipc_buffer *sb = phys_to_virt(cap_obj_paddr(&ut_store[70]));
+    CHECK(cap_derive_to(&uts, 1, &c10, 1, RW_ | G_, 0) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &c10, 2, CAP_R_WRITE, 0) == T_OK);     /* no GRANT */
+    CHECK(cap_retype(&uts, 0, CAP_FRAME, 0, &c10, 3, 1) == T_OK);
+    CHECK(cap_derive_to(&c10, 3, &c10, 4, RW, 0) == T_OK);              /* no GRANT */
+    CHECK(cap_retype(&uts, 0, CAP_UNTYPED, 12, &c10, 5, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_PAGE_TABLE, 0, &c10, 6, 1) == T_OK);
+
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    const struct thread *who[] = { th(10), th(40) };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 2);
+    static const struct { cap_slot_t ep; uint32_t caps[3]; unsigned n; int rc; } bad[] = {
+        { 2, { 3 }, 1, T_EPERM },           /* endpoint without GRANT */
+        { 1, { 4 }, 1, T_EPERM },           /* capability without GRANT */
+        { 1, { 5 }, 1, T_EINVAL },          /* Untyped */
+        { 1, { 6 }, 1, T_EINVAL },          /* PageTable */
+        { 1, { 7 }, 1, T_EBADCAP },         /* empty slot */
+        { 1, { 99 }, 1, T_ERANGE },         /* out of range */
+        { 1, { 3, 3, 7 }, 3, T_EBADCAP },   /* the third is bad: none moves */
+        { 1, { 3, 1, 4 }, 3, T_EPERM },
+        { 1, { 1, 3, 5 }, 3, T_EINVAL },
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(bad); i++) {
+        for (unsigned j = 0; j < MSG_MAX_CAPS; j++)
+            sb->caps[j] = bad[i].caps[j];
+        CHECK(endpoint_send(th(10), &c10, bad[i].ep, MSG_INFO(1, 1) | CAPS(bad[i].n)) ==
+              bad[i].rc);
+    }
+    world_take(&world_b);
+    snapshot(&snap_b, who, 2);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    CHECK(ep_ok(e));
+
+    /* The same capability listed twice is two derivations. */
+    sb->caps[0] = 3;
+    sb->caps[1] = 3;
+    sb->caps[2] = 1;
+    CHECK(endpoint_send(th(10), &c10, 1, MSG_INFO(1, 1) | CAPS(3)) == T_OK);
+    world_take(&world_b);
+    struct cap *src[] = { &c10.slots[3], &c10.slots[3], &c10.slots[1] };
+    struct cap *dst[] = { &c40.slots[7], &c40.slots[8], &c40.slots[9] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 3));
+    CHECK(tstate(40) == THREAD_RUNNABLE && ep_ok(e));
+    run_user();
+
+    /* P25, P51: with nobody waiting, the same refusals come at once, from
+     * ring 3: the sender never blocks on capabilities it cannot give. */
+    static const uint32_t never[] = { 4, 5, 6, 7, 99 };
+    static const int never_rc[] = { T_EPERM, T_EINVAL, T_EINVAL, T_EBADCAP, T_ERANGE };
+    for (unsigned i = 0; i < ARRAY_SIZE(never); i++) {
+        sb->caps[0] = never[i];
+        nreq = 0;
+        REQ(10, SYS_SEND, 1, MSG_INFO(1, 1) | CAPS(1));
+        struct user_regs r = { .rip = UCODE_VA, .rsp = USTACK_TOP };
+        CHECK(thread_write_regs(&uts, 10 + T_THR, &r) == T_OK);
+        CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+        world_take(&world_a);
+        run_user();
+        world_take(&world_b);
+        CHECK(res(10, 0) == never_rc[i] && tstate(10) == THREAD_INACTIVE);
+        CHECK(world_same(&world_a, &world_b) && !e->senders.head && ep_ok(e));
+    }
+    ut_teardown();
+
+    /* P50: the receiver's own offer, refused with a sender queued. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_sender(10, 1, 0x11, (const uint32_t[]){ 2 }, 1));
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7 }, 1));
+    CHECK(thread_suspend(&uts, 40 + T_THR) == T_OK);
+    c40 = task_cs(40);
+    struct ipc_buffer *rb = tbuf(40);
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    e0 = *e;
+    snapshot(&snap_a, who, 2);
+    static const struct { uint32_t slots[3], count, reserved; int rc; } offers[] = {
+        { { 7, 8, 9 }, 4, 0, T_EINVAL },     /* more than three */
+        { { 7 }, 1, 1, T_EINVAL },           /* reserved word set */
+        { { 99 }, 1, 0, T_EINVAL },          /* out of range */
+        { { 7, 8, 7 }, 3, 0, T_EINVAL },     /* duplicate */
+        { { 7, 1 }, 2, 0, T_EBUSY },         /* occupied */
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(offers); i++) {
+        for (unsigned j = 0; j < MSG_MAX_CAPS; j++)
+            rb->recv_slots[j] = offers[i].slots[j];
+        rb->recv_count = offers[i].count;
+        rb->reserved = offers[i].reserved;
+        CHECK(endpoint_recv(th(40), &c40, 1) == offers[i].rc);
+    }
+    world_take(&world_b);
+    snapshot(&snap_b, who, 2);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    CHECK(th(10)->msg.caps[0] == 2 && e->senders.head == th(10) && ep_ok(e));
+    rb->reserved = 0;
+    run_user();
+    ut_teardown();
+}
+
+/* P24, P52, P56: a receive slot filled, from ring 3 by another thread of
+ * the receiver's task, between the offer and the delivery. */
+static void test_ep_xfer_collision(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 5, 6, 7 }, 3));
+    /* B: a second thread sharing the receiver's cspace. */
+    CHECK(spawn(50, P(runner), false, NULL));
+    CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);
+    CHECK(thread_unbind(&uts, 50 + T_THR, TS_CSPACE) == T_OK);
+    CHECK(thread_bind(&uts, 50 + T_THR, TS_CSPACE, &uts, 40 + T_CS) == T_OK);
+    nreq = 0;
+    REQ(50, SYS_CAP_DERIVE, 1, 6, CAP_R_READ, 0);
+    CHECK(xfer_sender(10, 3, 0x33, (const uint32_t[]){ 2, 3, 1 }, 3));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    run_user();                                     /* the offer is captured */
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && th(40)->offer.count == 3);
+    CHECK(thread_resume(&uts, 50 + T_THR) == T_OK);
+    run_user();                                     /* B fills slot 6 */
+    struct cspace c40 = task_cs(40);
+    CHECK(res(50, 0) == T_OK && c40.slots[6].type == CAP_ENDPOINT);
+
+    world_tables((const cap_slot_t[]){ 10, 40, 50 }, 3);
+    world_take(&world_a);
+    const struct thread *who[] = { th(40) };
+    struct endpoint e0 = *e;
+    snapshot(&snap_a, who, 1);
+    test_report_count = 0;
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_OK);
+    run_user();                                     /* the transfer fails whole */
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EBUSY);
+    world_take(&world_b);
+    snapshot(&snap_b, who, 1);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(memcmp(&snap_a, &snap_b, sizeof(snap_a)) == 0 && memcmp(&e0, e, sizeof(e0)) == 0);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && ep_ok(e));
+
+    /* Only the slots used must be empty: slot 7 occupied, two capabilities
+     * go to 5 and 6. */
+    CHECK(cap_delete(&c40, 6) == T_OK);
+    CHECK(cap_derive_to(&uts, 1, &c40, 7, CAP_R_READ, 0) == T_OK);
+    CHECK(xfer_sender(20, 4, 0x44, (const uint32_t[]){ 2, 3 }, 2));
+    struct cspace c20 = task_cs(20);
+    world_tables((const cap_slot_t[]){ 10, 20, 40, 50 }, 4);
+    world_take(&world_a);
+    run_user();
+    world_take(&world_b);
+    struct cap *src[] = { &c20.slots[2], &c20.slots[3] };
+    struct cap *dst[] = { &c40.slots[5], &c40.slots[6] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 2));
+    CHECK(got(40) == 0x44 && ep_ok(e));
+    ut_teardown();
+}
+
+/* P25, P51, P53: a queued sender's message re-validated at delivery. */
+static void test_ep_xfer_queued(void)
+{
+    /* S1's third capability (its own endpoint capability) goes while it
+     * waits: S1 fails whole and the receiver takes S2's message. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    struct endpoint *e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_sender(10, 1, 0x10, (const uint32_t[]){ 2, 3, 1 }, 3));
+    CHECK(xfer_sender(20, 2, 0x20, (const uint32_t[]){ 3 }, 1));
+    run_user();
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND && tstate(20) == THREAD_BLOCKED_SEND && ep_ok(e));
+    struct cspace c10 = task_cs(10), c20 = task_cs(20);
+    CHECK(cap_delete(&c10, 1) == T_OK);
+    CHECK(tstate(10) == THREAD_BLOCKED_SEND);       /* P43: not cancelled */
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7, 8, 9 }, 3));
+    struct cspace c40 = task_cs(40);
+    world_tables((const cap_slot_t[]){ 10, 20, 40 }, 3);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    struct cap *src[] = { &c20.slots[3] }, *dst[] = { &c40.slots[7] };
+    CHECK(world_transferred(&world_a, &world_b, src, dst, 1));
+    CHECK(got(40) == 0x20 && c40.slots[8].type == CAP_NULL);
+    CHECK(test_report_count == 3 && reports_with(T_EBADCAP) == 1 && reports_with(T_OK) == 2);
+    CHECK(ep_ok(e) && !e->senders.head && !e->receivers.head);
+    ut_teardown();
+
+    /* Too many capabilities for the offer: the sender fails, and the
+     * receiver goes on to block with its offer. */
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    e = endpoint_of(&ut_store[1]);
+    CHECK(xfer_sender(10, 1, 0x10, (const uint32_t[]){ 2, 3 }, 2));
+    run_user();
+    CHECK(xfer_receiver(40, (const uint32_t[]){ 7 }, 1));
+    world_tables((const cap_slot_t[]){ 10, 40 }, 2);
+    world_take(&world_a);
+    test_report_count = 0;
+    run_user();
+    world_take(&world_b);
+    CHECK(world_same(&world_a, &world_b));
+    CHECK(test_report_count == 1 && (int64_t)test_reports[0].a == T_EINVAL);
+    CHECK(tstate(40) == THREAD_BLOCKED_RECV && th(40)->offer.count == 1 &&
+          th(40)->offer.slots[0] == 7 && ep_ok(e));
+
+    /* The offer was captured: rewriting the buffer now changes nothing. */
+    tbuf(40)->recv_slots[0] = 8;
+    tbuf(40)->recv_count = 0;
+    CHECK(xfer_sender(20, 2, 0x20, (const uint32_t[]){ 2 }, 1));
+    c20 = task_cs(20);
+    c40 = task_cs(40);
+    world_tables((const cap_slot_t[]){ 10, 20, 40 }, 3);
+    world_take(&world_a);
+    run_user();
+    world_take(&world_b);
+    struct cap *src2[] = { &c20.slots[2] }, *dst2[] = { &c40.slots[7] };
+    CHECK(world_transferred(&world_a, &world_b, src2, dst2, 1));
+    CHECK(got(40) == 0x20 && ep_ok(e));
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -2697,6 +3160,10 @@ static const struct {
     { "ep_liveness", test_ep_liveness },
     { "ep_destroy", test_ep_destroy },
     { "ep_ipcbuf_wx", test_ep_ipcbuf_wx },
+    { "ep_xfer_basic", test_ep_xfer_basic },
+    { "ep_xfer_refuse", test_ep_xfer_refuse },
+    { "ep_xfer_collision", test_ep_xfer_collision },
+    { "ep_xfer_queued", test_ep_xfer_queued },
     { "cpu_hardening", test_cpu_hardening },
 };
 
