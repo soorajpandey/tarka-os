@@ -2,6 +2,8 @@
 
 #include "cpu.h"
 #include "gdt.h"
+#include "percpu.h"
+#include "lapic.h"
 
 #include <tarka/kernel.h>
 #include <tarka/selftest.h>
@@ -90,8 +92,20 @@ static __noreturn void fatal(const struct trap_frame *tf, const char *where)
  * every exception is a kernel bug (T30). */
 void isr_dispatch(struct trap_frame *tf)
 {
-    if (tf->vector >= 32)
-        return; /* spurious: nothing is configured to raise it */
+    if (tf->vector >= 32) {
+        /* The kernel runs with interrupts disabled, so this arrives only
+         * inside an explicit interrupt window. */
+#ifdef TARKA_SELFTEST
+        uint64_t rflags;
+        __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+        entry_obs.kernel_irqs++;
+        entry_obs.kernel_irq_rflags = rflags;
+        entry_obs.kernel_irq_gs_ok = rdmsr(MSR_GS_BASE) == (uint64_t)this_cpu();
+#endif
+        if (tf->vector != VEC_SPURIOUS)
+            lapic_eoi();
+        return;
+    }
     if (tf->vector == 14) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -119,6 +133,7 @@ void paranoid_dispatch(struct trap_frame *tf)
         entry_obs.nmis++;
         entry_obs.nmi_last_rflags = rflags;
         entry_obs.nmi_last_from_user = (tf->cs & 3) == 3;
+        entry_obs.nmi_gs_ok = rdmsr(MSR_GS_BASE) == (uint64_t)this_cpu();
 #endif
         return;
     }

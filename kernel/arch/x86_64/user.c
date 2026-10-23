@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
+#include "lapic.h"
 #include "percpu.h"
 
 #include <tarka/errno.h>
@@ -198,9 +199,17 @@ void entry_from_user(struct trap_frame *tf)
         syscall_handle(t);
     } else {
         t->ret_path = RETURN_IRET;
-        if (tf->vector < 32)
+        if (tf->vector < 32) {
             user_fault(t, tf);
-        /* Interrupt vectors: nothing to do yet; the thread continues. */
+        } else if (tf->vector != VEC_SPURIOUS) {
+            /* An interrupt while user code ran: acknowledge it; the
+             * thread continues (preemption arrives with step 6). */
+#ifdef TARKA_SELFTEST
+            entry_obs.user_irqs++;
+            entry_obs.last_user_irq = tf->vector;
+#endif
+            lapic_eoi();
+        }
     }
     schedule();
 }

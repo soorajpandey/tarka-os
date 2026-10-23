@@ -20,6 +20,7 @@ static uint64_t *used;
 static uint64_t *managed;
 static uint64_t  nframes;     /* frames covered by the bitmaps */
 static uint64_t  free_frames;
+static uint64_t  kernel_frames;  /* allocated by pmm_alloc, not yet freed */
 static uint64_t  total_frames;
 static uint64_t  next_hint;   /* search start, in frames */
 
@@ -106,6 +107,7 @@ paddr_t pmm_alloc(void)
         if (!test_bit(used, f)) {
             set_bit(used, f);
             free_frames--;
+            kernel_frames++;
             next_hint = f + 1;
             /* Never return garbage: frames that were usable at boot were
              * never scrubbed and may hold bootloader or firmware data. */
@@ -133,6 +135,7 @@ int pmm_free(paddr_t frame)
     memset(phys_to_virt(frame), 0, PAGE_SIZE);
     clear_bit(used, f);
     free_frames++;
+    kernel_frames--;
     return T_OK;
 }
 
@@ -184,4 +187,5 @@ bool pmm_frame_is_free(paddr_t frame)
 }
 
 uint64_t pmm_free_count(void) { return free_frames; }
+uint64_t pmm_kernel_count(void) { return kernel_frames; }
 uint64_t pmm_total_count(void) { return total_frames; }

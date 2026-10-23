@@ -4,6 +4,7 @@
 #include "stacks.h"
 
 #include <tarka/kernel.h>
+#include <tarka/pmm.h>
 
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ull
 
@@ -36,6 +37,37 @@ int paging_unmap_4k(uint64_t va)
     *e = 0;
     __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
     return 0;
+}
+
+#define PTE_PWT (1ull << 3)
+#define PTE_PCD (1ull << 4)
+
+void *paging_map_mmio(paddr_t p)
+{
+    uint64_t va = pa_raw(p) + hhdm_offset;
+    uint64_t *table = phys_to_virt(pa(read_cr3() & PTE_ADDR_MASK));
+
+    for (int level = 3; level > 0; level--) {
+        uint64_t *e = &table[(va >> (12 + 9 * level)) & 0x1FF];
+
+        if (!(*e & PTE_P)) {
+            if (level == 3)
+                return NULL; /* never add kernel-half PML4 entries (V4) */
+            paddr_t t = pmm_alloc();   /* zeroed */
+            if (pa_is_null(t))
+                return NULL;
+            *e = pa_raw(t) | PTE_P | PTE_W;
+        } else if (*e & PTE_PS) {
+            return NULL;     /* covered by a large page: wrong cache type */
+        }
+        table = phys_to_virt(pa(*e & PTE_ADDR_MASK));
+    }
+    uint64_t *leaf = &table[(va >> 12) & 0x1FF];
+    if (*leaf & PTE_P)
+        return NULL;
+    *leaf = pa_raw(p) | PTE_P | PTE_W | PTE_PCD | PTE_PWT | PTE_NX;
+    __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+    return (void *)va;
 }
 
 void stack_guards_init(void)

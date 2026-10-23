@@ -11,6 +11,8 @@ void pmm_init(struct limine_memmap_response *memmap);
 __must_check paddr_t pmm_alloc(void);          /* null (pa_is_null) on failure */
 __must_check int pmm_free(paddr_t frame);      /* T_EDOUBLEFREE, T_EINVAL */
 uint64_t pmm_free_count(void);
+/* Frames the kernel itself holds (pmm_alloc without pmm_free). */
+uint64_t pmm_kernel_count(void);
 
 /* Take the largest naturally aligned block of 2^bits bytes (12 <= bits <=
  * max_bits) whose frames are all free, provided at least `keep` frames

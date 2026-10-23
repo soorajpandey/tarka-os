@@ -312,6 +312,19 @@ PROG f_ac
     ud2                            /* reached only if #AC was not raised */
 END f_ac
 
+/* Spins long enough for a timer interrupt to arrive in ring 3, then
+ * reports how far it got (a = iterations, proving it ran to the end). */
+PROG spin
+    movl $20000000, %ecx
+    xorl %edi, %edi
+1:
+    incq %rdi
+    decl %ecx
+    jnz 1b
+    REPORT
+    EXIT
+END spin
+
 /* Syscall request runner: executes the list of requests at UDATA_VA,
  * 64 bytes each { nr, a0..a5, result }, until nr == -1, then exits. */
 PROG runner

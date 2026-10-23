@@ -25,6 +25,7 @@
 #include "../arch/x86_64/cpu.h"
 #include "../arch/x86_64/paging.h"
 #include "../arch/x86_64/gdt.h"
+#include "../arch/x86_64/lapic.h"
 #include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/qemu.h"
 #include "../arch/x86_64/stacks.h"
@@ -347,7 +348,7 @@ static bool page_is(uint64_t p, uint8_t v)
 
 static bool frames_conserved(void)
 {
-    return untyped_boot_frames() + pmm_free_count() == pmm_total_count();
+    return untyped_boot_frames() + pmm_free_count() + pmm_kernel_count() == pmm_total_count();
 }
 
 /* O1: every frame has exactly one owner, and no memory went missing. */
@@ -381,7 +382,8 @@ static void test_untyped_ownership(void)
     CHECK(frames == untyped_boot_frames() && frames > 0);
     CHECK(owned_once);   /* no Untyped frame can also be allocated by pmm */
     CHECK(disjoint);     /* no frame belongs to two root Untypeds */
-    CHECK(frames + pmm_free_count() == pmm_total_count()); /* conservation */
+    /* Conservation: every frame is free, held by the kernel, or Untyped. */
+    CHECK(frames + pmm_free_count() + pmm_kernel_count() == pmm_total_count());
 }
 
 /* O2-O4: authority and validation; failed calls change nothing. */
@@ -1233,7 +1235,7 @@ static void test_thread_lifecycle(void)
 #define UDATA_VA   0x401000ull
 #define USTACK_TOP 0x403000ull
 
-#define PROGS(X) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
+#define PROGS(X) X(spin) X(runner) X(hello) X(fresh) X(fpu_a) X(fpu_b) X(preserve) X(ac) X(segbase) X(badsys) \
     X(f_ud) X(f_bp) X(f_de) X(f_pf_read) X(f_pf_write) X(f_pf_exec) X(f_gp_hlt) X(f_gp_io) \
     X(f_gp_int) X(f_gp_noncanon) X(f_ss) X(f_xm) X(f_ac) X(sysret_edge)
 #define DECL(n) extern const char prog_##n##_start[], prog_##n##_end[];
@@ -1707,6 +1709,69 @@ static void test_syscall_lifecycle(void)
     ut_teardown();
 }
 
+/* T32: every entry path reaches common code in the same sanitised state:
+ * AC = 0, DF = 0, the kernel's GS base. */
+extern long copy_user_nmi_probe(void *dst, const void *src, size_t len, volatile uint32_t *icr);
+
+#define AC_DF ((1u << 18) | (1u << 10))
+
+static void test_entry_paths(void)
+{
+    CHECK(lapic_present());
+    if (!lapic_present())
+        return;
+
+    /* NMI while the kernel runs (paranoid path, GS already the kernel's). */
+    uint64_t nmis = entry_obs.nmis;
+    lapic_self_nmi();
+    CHECK(entry_obs.nmis == nmis + 1 && !entry_obs.nmi_last_from_user);
+    CHECK(!(entry_obs.nmi_last_rflags & AC_DF) && entry_obs.nmi_gs_ok);
+    CHECK(rdmsr(MSR_GS_BASE) == (uint64_t)this_cpu());
+
+    /* An ordinary interrupt in kernel code, inside a one-instruction
+     * interrupt window. */
+    uint64_t kirqs = entry_obs.kernel_irqs;
+    lapic_self_ipi(VEC_TEST_IPI);
+    __asm__ volatile("sti; nop; cli" ::: "memory");
+    CHECK(entry_obs.kernel_irqs == kirqs + 1);
+    CHECK(!(entry_obs.kernel_irq_rflags & AC_DF) && entry_obs.kernel_irq_gs_ok);
+
+    /* NMI inside the copy routine's open-SMAP window: the handler runs with
+     * AC clear, and IRETQ restores AC so the interrupted copy completes (a
+     * failure would fault on user memory at an unrecoverable RIP). */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL));
+    CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
+    uint8_t *data = phys_to_virt(cap_obj_paddr(&ut_store[10 + T_DATA]));
+    for (int i = 0; i < 64; i++)
+        data[i] = (uint8_t)(0xC0 + i);
+    CHECK(vspace_activate(&uts, 10 + T_AS) == T_OK);
+    memset(kbuf, 0, 64);
+    nmis = entry_obs.nmis;
+    long rc = copy_user_nmi_probe(kbuf, (const void *)(uintptr_t)UDATA_VA, 64, lapic_icr_lo_mmio());
+    vspace_activate_kernel();
+    CHECK(rc == 0 && memcmp(kbuf, data, 64) == 0);
+    CHECK(entry_obs.nmis == nmis + 1);
+    CHECK(!(entry_obs.nmi_last_rflags & AC_DF));          /* handler: AC clear */
+    uint64_t rflags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+    CHECK(!(rflags & (1u << 18)));                        /* and closed after */
+    ut_teardown();
+
+    /* A timer interrupt while user code runs: an entry from ring 3 that is
+     * neither a syscall nor a fault; the thread carries on to the end. */
+    uint64_t uirqs = entry_obs.user_irqs, viol = entry_obs.violations;
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(spin), false, NULL));
+    lapic_timer_oneshot(20000);
+    run_user();
+    lapic_timer_stop();
+    CHECK(entry_obs.user_irqs >= uirqs + 1 && entry_obs.last_user_irq == VEC_TIMER);
+    CHECK(test_report_count == 1 && test_reports[0].a == 20000000);
+    CHECK(entry_obs.violations == viol);
+    ut_teardown();
+}
+
 static void test_cpu_hardening(void)
 {
     extern uintptr_t __stack_chk_guard;
@@ -1755,6 +1820,7 @@ static const struct {
     { "uaccess", test_uaccess },
     { "syscalls", test_syscalls },
     { "syscall_lifecycle", test_syscall_lifecycle },
+    { "entry_paths", test_entry_paths },
     { "cpu_hardening", test_cpu_hardening },
 };
 

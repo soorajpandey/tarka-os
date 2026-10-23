@@ -11,6 +11,7 @@
 #include "../arch/x86_64/cpu.h"
 #include "../arch/x86_64/gdt.h"
 #include "../arch/x86_64/idt.h"
+#include "../arch/x86_64/lapic.h"
 #include "../arch/x86_64/paging.h"
 #include "../arch/x86_64/percpu.h"
 #include "../arch/x86_64/serial.h"
@@ -80,6 +81,7 @@ __noreturn __no_canary void kmain(void)
     stack_protector_init(boot_entropy());
     pmm_init(memmap_req.response);
     untyped_boot();
+    (void)lapic_init();     /* may map MMIO: before the first AddressSpace */
     vspace_boot();
     thread_boot();
     user_boot();

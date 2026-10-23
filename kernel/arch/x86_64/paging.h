@@ -17,6 +17,12 @@ int paging_query(uint64_t va, uint64_t *flags_out);
  * part of a large page. */
 int paging_unmap_4k(uint64_t va);
 
+/* Map one device page (uncached, NX, supervisor-only) at its HHDM address,
+ * taking any missing table pages from the kernel allocator. Boot only:
+ * must run before the first AddressSpace is created (ADR 0007, V4).
+ * Returns NULL if the address is already covered by another mapping. */
+void *paging_map_mmio(paddr_t p);
+
 /* Unmap the guard page below every kernel stack (see entry.S). */
 void stack_guards_init(void);
 
