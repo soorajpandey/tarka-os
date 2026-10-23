@@ -95,7 +95,15 @@ invariants and tests here.
 | U2 | A task cannot map kernel memory or another task's memory without a frame capability. Structural: user leaves are only ever Frames, user intermediate entries only PageTables, the kernel half is supervisor-only at the top level (ADR 0007, V1–V4, V9) | self-tests `vspace_deputy`, `vspace_*` audits | ✅ tested |
 | U3 | No user mapping is both writable and executable, and no physical frame is writable through one mapping while executable through another; in-place changes only remove rights (ADR 0007, V5–V8) | self-tests `vspace_perms`, `vspace_alias` | ✅ tested |
 | U5 | Removing a mapping, table or address space leaves no stale entry, shadow pointer or record, and an uninstalled table carries no mappings (ADR 0007, V11, V12, V15) | self-test `vspace_teardown` + structural audit | ✅ tested |
-| U4 | A user-space fault never panics the kernel | | planned (ADR 0003) |
+| U4 | A user-space fault never panics the kernel | | planned (ADR 0008, T29) |
+| T-A | Thread state is read or changed only with a Thread capability carrying the right | | planned (ADR 0008) |
+| T-B | A thread can be runnable only with a bound address space, a bound cspace, and valid entry state | | planned (ADR 0008) |
+| T-C | No user-controlled value reaches RIP, RSP, RFLAGS, CS, SS, FS or GS base, or XRSTOR without validation | | planned (ADR 0008) |
+| T-D | The complete thread context, including all extended (FPU/vector) state, is saved and restored on every switch; no thread observes another's registers | | planned (ADR 0008) |
+| T-E | Every kernel entry from user mode clears AC and swaps GS correctly; SMAP is never silently disabled | | planned (ADR 0008) |
+| T-F | SYSRET never runs with a non-canonical return address | | planned (ADR 0008) |
+| T-G | The kernel touches user memory only through the copy routines, reading each value once | | planned (ADR 0008; completes K3) |
+| T-H | Syscalls are authorised only by capabilities; the syscall layer adds no permission logic | | planned (ADR 0008) |
 | O1 | Every physical frame has exactly one owner: the kernel allocator or one Untyped; total memory is conserved | self-test `untyped_ownership` | ✅ tested |
 | O2 | Memory authority is never duplicated: Untypeds cannot be copied | self-test `untyped_rules` | ✅ tested |
 | O3 | Retype never creates authority from nothing: it needs an Untyped with WRITE and free space in it | self-test `untyped_rules`, `untyped_exhaustion` | ✅ tested |
