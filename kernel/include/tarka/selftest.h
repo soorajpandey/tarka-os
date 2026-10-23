@@ -35,6 +35,7 @@ struct entry_observation {
     uint64_t copy_faults;        /* recovered user-copy faults (T35) */
     uint64_t user_irqs, last_user_irq;
     uint64_t kernel_irqs, kernel_irq_rflags, kernel_irq_gs_ok;
+    uint64_t kernel_irq_rip, kernel_irq_vector, kernel_irq_in_idle;
     uint64_t nmi_gs_ok;
 };
 extern struct entry_observation entry_obs;

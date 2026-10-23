@@ -5,6 +5,7 @@
 #include "percpu.h"
 #include "lapic.h"
 
+#include <tarka/sched.h>
 #include <tarka/kernel.h>
 #include <tarka/selftest.h>
 #include <tarka/uaccess.h>
@@ -101,6 +102,9 @@ void isr_dispatch(struct trap_frame *tf)
         entry_obs.kernel_irqs++;
         entry_obs.kernel_irq_rflags = rflags;
         entry_obs.kernel_irq_gs_ok = rdmsr(MSR_GS_BASE) == (uint64_t)this_cpu();
+        entry_obs.kernel_irq_rip = tf->rip;
+        entry_obs.kernel_irq_vector = tf->vector;
+        entry_obs.kernel_irq_in_idle = sched_current() == sched_idle();
 #endif
         if (tf->vector != VEC_SPURIOUS)
             lapic_eoi();

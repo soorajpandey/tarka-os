@@ -36,6 +36,7 @@ enum thread_state {
     THREAD_BLOCKED_RECV,    /* in an endpoint's receive queue */
     THREAD_BLOCKED_REPLY,   /* linked to exactly one server */
     THREAD_BLOCKED_NOTIF,   /* in a notification's wait queue */
+    THREAD_IDLE,            /* ADR 0010 SC5: a CPU's idle thread, and only it */
     THREAD_STATE_COUNT,
 };
 
@@ -153,6 +154,8 @@ struct thread {
     struct fault_record fault;
     struct thread      *rq_next;     /* run queue (internal references, O10) */
     struct thread      *rq_prev;
+    uint32_t            home_cpu;    /* ADR 0010 SC3: set at creation, never changed */
+    uint32_t            sched_reserved;
     /* IPC (ADR 0009). Every pointer here is an internal reference,
      * cleared before the thread or object it names can be freed. */
     struct waitq       *wait_q;      /* the queue this thread is in, or NULL */
@@ -180,9 +183,6 @@ static inline void *thread_xsave_area(struct thread *t)
     return (uint8_t *)t + 4096;
 }
 
-#ifdef TARKA_SELFTEST
-extern uint64_t thread_stop_reaper_units;   /* reaper units done at the last stop */
-#endif
 
 /* Boot: register the binding hook and the thread finaliser. */
 void thread_boot(void);
@@ -204,16 +204,16 @@ __must_check int thread_suspend(struct cspace *cs, cap_slot_t thr);
 __must_check int thread_read_fault(struct cspace *cs, cap_slot_t thr, struct fault_record *out);
 __must_check int thread_get_state(struct cspace *cs, cap_slot_t thr, uint32_t *out);
 
-/* Scheduler interface (step 4: a minimal FIFO run queue). */
-struct thread *runq_pop(void);
-bool runq_empty(void);
-bool runq_contains(const struct thread *t);
-void thread_enqueue(struct thread *t);
-
 /* T4: may this thread's saved state be loaded and run? */
 bool thread_runnable_safe(const struct thread *t);
 
 /* The thread object behind a Thread capability (kernel use only). */
 struct thread *thread_of(const struct cap *c);
+
+#ifdef TARKA_SELFTEST
+/* Thread teardowns, and those that ran while the thread was `current`
+ * (ADR 0010 G3: none may). */
+extern uint64_t thread_teardowns, thread_teardowns_while_current;
+#endif
 
 #endif

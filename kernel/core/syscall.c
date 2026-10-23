@@ -14,6 +14,7 @@
 #include <tarka/endpoint.h>
 #include <tarka/kernel.h>
 #include <tarka/notification.h>
+#include <tarka/sched.h>
 #include <tarka/selftest.h>
 #include <tarka/uaccess.h>
 #include <tarka/untyped.h>
@@ -52,8 +53,7 @@ typedef int64_t (*sys_fn)(struct sysctx *c, const struct sysargs *a);
 static int64_t sys_yield(struct sysctx *c, const struct sysargs *a)
 {
     (void)a;
-    c->t->state = THREAD_RUNNABLE;
-    thread_enqueue(c->t);
+    KASSERT(sched_yield(c->t) == T_OK);
     return T_OK;
 }
 
@@ -61,9 +61,9 @@ static int64_t sys_exit(struct sysctx *c, const struct sysargs *a)
 {
     (void)a;
     /* ADR 0009 P64: exiting is stopping, so reply authority held dies
-     * with it and its caller is woken with T_EDEAD (P28). */
-    ipc_detach(c->t, false);
-    c->t->state = THREAD_INACTIVE;
+     * with it and its caller is woken with T_EDEAD (P28). The one funnel
+     * (ADR 0010 G1). */
+    KASSERT(sched_stop(c->t, false) == T_OK);
     return T_OK;
 }
 

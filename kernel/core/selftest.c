@@ -17,6 +17,7 @@
 #include <tarka/cont.h>
 #include <tarka/pmm.h>
 #include <tarka/reaper.h>
+#include <tarka/sched.h>
 #include <tarka/string.h>
 #include <tarka/thread.h>
 #include <tarka/uaccess.h>
@@ -1759,7 +1760,7 @@ static void test_user_basics(void)
     CHECK((test_reports[0].c & RFLAGS_IF) && !(test_reports[0].c & (3u << 12)));
     CHECK(test_reports[0].d == 0x7a72);
     CHECK(tstate(10) == THREAD_INACTIVE);       /* exited */
-    CHECK(cr3_is_kernel(read_cr3() & 0x000FFFFFFFFFF000ull) && this_cpu()->current == NULL);
+    CHECK(cr3_is_kernel(read_cr3() & 0x000FFFFFFFFFF000ull) && this_cpu()->current == sched_idle());
     ut_teardown();
 
     /* T7, T28: a new thread finds nothing of anyone else's. */
@@ -2148,7 +2149,7 @@ static void test_syscall_lifecycle(void)
     CHECK(cs.slots[11].type == CAP_NULL);
     CHECK(dying->regs.rax == 0xDDDDDDDDDDDDDDDDull);  /* no result written to the dead TCB */
     CHECK(test_report_count == 1 && test_reports[0].d == 0x7a72);  /* only hello reported */
-    CHECK(this_cpu()->current == NULL && cr3_is_kernel(master));
+    CHECK(this_cpu()->current == sched_idle() && cr3_is_kernel(master));
     CHECK(cdt_consistent(&uts));
     ut_teardown();
 }
@@ -2263,12 +2264,11 @@ static void snapshot(struct ipc_snap *s, const struct thread *const *threads, un
         s->th[i].ipc_flags = t->ipc_flags;
     }
     unsigned k = 0;
-    for (struct thread *t = runq_pop(); t; t = runq_pop()) {
+    /* A read-only walk: taking the snapshot must not touch the queue. */
+    for (const struct thread *t = runq_first(); t; t = t->rq_next) {
         KASSERT(k < SNAP_MAX);                       /* bounded copy */
         s->runq[k++] = t;
     }
-    for (unsigned i = 0; i < k; i++)                 /* restore the order */
-        thread_enqueue((struct thread *)s->runq[i]);
     for (unsigned i = 0; i < TEST_WAITQS; i++)
         s->q[i] = test_waitqs[i];
     s->current = this_cpu()->current;
@@ -2329,7 +2329,7 @@ static void test_ipc_states(void)
 
     /* Blocked means not runnable (P10); FIFO by arrival (P11). */
     struct thread *a = th(10), *b = th(20), *c = th(30);
-    CHECK(runq_empty() && this_cpu()->current == NULL);
+    CHECK(runq_empty() && this_cpu()->current == sched_idle());
     CHECK(test_waitqs[0].head == a && a->wait_next == b && b->wait_next == c &&
           test_waitqs[0].tail == c);
     CHECK(tstate(10) == THREAD_BLOCKED_RECV && tstate(30) == THREAD_BLOCKED_RECV);
@@ -2413,6 +2413,18 @@ static void test_ipc_states(void)
 }
 
 /* P16, P17, P28, P29: reply links when either side disappears. */
+/* Give a stopped caller reply-wait through real transitions (ADR 0010
+ * G1: INACTIVE -> BLOCKED_REPLY is not an edge): start it, dispatch it to
+ * RUNNING, link it as if it had called, then hand the CPU back to idle. */
+static void link_reply(cap_slot_t server, cap_slot_t caller, uint32_t flags)
+{
+    CHECK(runq_empty() && sched_current() == sched_idle());
+    CHECK(thread_resume(&uts, caller + T_THR) == T_OK);
+    CHECK(sched_dispatch() == th(caller) && tstate(caller) == THREAD_RUNNING);
+    reply_link(th(server), th(caller), flags);
+    CHECK(sched_dispatch() == sched_idle());
+}
+
 static void test_ipc_reply_links(void)
 {
     CHECK(ut_setup(20));
@@ -2431,7 +2443,7 @@ static void test_ipc_reply_links(void)
     CHECK(tstate(10) == THREAD_BLOCKED_NOTIF && tstate(70) == THREAD_BLOCKED_NOTIF);
 
     /* Caller destroyed: the server keeps its authority, marked gone. */
-    reply_link(th(10), th(20), REPLY_CALL_GRANT);
+    link_reply(10, 20, REPLY_CALL_GRANT);
     CHECK(tstate(20) == THREAD_BLOCKED_REPLY && th(10)->reply_to == th(20));
     CHECK(AUDIT());
     CHECK(cap_delete(&uts, 20 + T_THR) == T_OK);
@@ -2440,7 +2452,7 @@ static void test_ipc_reply_links(void)
     th(10)->reply_state = REPLY_NONE;    /* (a reply would consume it, step 5.5) */
 
     /* Server suspended: the caller wakes with T_EDEAD. */
-    reply_link(th(10), th(30), 0);
+    link_reply(10, 30, 0);
     CHECK(thread_suspend(&uts, 10 + T_THR) == T_OK);
     CHECK(tstate(30) == THREAD_RUNNABLE && runq_contains(th(30)));
     CHECK(th(30)->regs.rax == (uint64_t)(int64_t)T_EDEAD && th(30)->reply_from == NULL);
@@ -2449,14 +2461,14 @@ static void test_ipc_reply_links(void)
     CHECK(thread_suspend(&uts, 30 + T_THR) == T_OK);
 
     /* Server destroyed: the same. */
-    reply_link(th(40), th(50), 0);
+    link_reply(40, 50, 0);
     CHECK(cap_delete(&uts, 40 + T_THR) == T_OK);
     CHECK(tstate(50) == THREAD_RUNNABLE && th(50)->regs.rax == (uint64_t)(int64_t)T_EDEAD);
     CHECK(AUDIT());
     CHECK(thread_suspend(&uts, 50 + T_THR) == T_OK);
 
     /* Caller suspended: T_EINTR for it, "caller gone" for the server. */
-    reply_link(th(70), th(60), 0);
+    link_reply(70, 60, 0);
     CHECK(thread_suspend(&uts, 60 + T_THR) == T_OK);
     CHECK(tstate(60) == THREAD_INACTIVE && th(60)->regs.rax == (uint64_t)(int64_t)T_EINTR);
     CHECK(th(70)->reply_state == REPLY_CALLER_GONE && th(60)->reply_from == NULL);
@@ -2947,7 +2959,7 @@ static void test_ep_capture(void)
      * (only WRITE); holding reply authority, pending or caller-gone. */
     struct cspace c40 = task_cs(40);
     CHECK(cap_derive_to(&uts, 1, &c40, 2, CAP_R_WRITE, 0) == T_OK);
-    reply_link(th(40), th(50), 0);
+    link_reply(40, 50, 0);
     const struct thread *who[] = { th(10), th(20), th(40), th(50) };
     struct endpoint e0 = *e;
     snapshot(&snap_a, who, 4);
@@ -5929,6 +5941,7 @@ static void test_reaper_r6(void)
             CHECK(ep_thread(w[i], false, 0, 0, CAP_R_READ));
         run_user();
         CHECK(spawn(70, P(runner), false, NULL) && thread_suspend(&uts, 70 + T_THR) == T_OK);
+        const struct thread *deleter = th(70);   /* while uts holds its capability */
         struct cspace c70 = task_cs(70);
         CHECK(cap_derive_to(&uts, 1, &c70, 2, CAP_R_ALL, 0) == T_OK);
         CHECK(cap_derive_to(&uts, 70 + T_THR, &c70, 3, CAP_R_ALL, 0) == T_OK);
@@ -5951,15 +5964,17 @@ static void test_reaper_r6(void)
         reap_trace_n = 0;
         test_report_count = 0;
         uint64_t units = reaper_units_total;
+        sched_stop_watch = deleter;
+        sched_stop_watch_units = UINT64_MAX;
         run_user();
+        sched_stop_watch = NULL;
         if (how == 0)
             CHECK(tstate(70) == THREAD_INACTIVE);
         else
             CHECK(ut_store[70 + T_THR].type == CAP_NULL && c70.slots[3].type == CAP_NULL);
-        /* The deleter was stopped before the reaper's first unit (the last
-         * thread_stop of the run is its own; the waiters exit by
-         * SYS_EXIT), and the reaper did all the work after. */
-        CHECK(thread_stop_reaper_units == units && reaper_units_total > units);
+        /* The deleter was stopped before the reaper's first unit, and the
+         * reaper did all the work after. */
+        CHECK(sched_stop_watch_units == units && reaper_units_total > units);
         CHECK(reap_trace_n > 0 && reaper_idle() && ut_store[100].ut.dying == 0);
         CHECK(e->meta.flags == 0 && e->meta.serial == 0);   /* retired */
         CHECK(reports_with(T_EDEAD) == ARRAY_SIZE(w));      /* each waiter once */
@@ -6248,6 +6263,446 @@ static void test_drain_reply_bound(void)
     ut_teardown();
 }
 
+/* ---- Scheduler (ADR 0010 stage 5, revision 3f: G1-G11) ---- */
+
+/* The G9 fixture: one thread in every state a thread can be in, plus the
+ * idle thread. Slot 1 is an endpoint with a queued sender. */
+#define SE_N 9
+static const cap_slot_t se_slot[SE_N - 1] = { 10, 20, 30, 40, 50, 60, 70, 80 };
+static const uint32_t se_state[SE_N - 1] = {
+    THREAD_INACTIVE, THREAD_RUNNABLE, THREAD_BLOCKED_RECV, THREAD_BLOCKED_NOTIF,
+    THREAD_BLOCKED_SEND, THREAD_BLOCKED_REPLY, THREAD_FAULTED, THREAD_RUNNING,
+};
+static struct thread *se_th[SE_N];   /* [SE_N - 1] is the idle thread */
+
+/* Everything a refused transition must leave alone, byte for byte: every
+ * fixture TCB (the idle thread's included), the run queue's ends and
+ * length, `current`, and the IPC queues the fixture uses. */
+struct se_view {
+    const struct thread *rq_first, *rq_last, *cur;
+    uint32_t rq_len, pad;
+    struct waitq q[TEST_WAITQS];
+    struct endpoint ep;
+};
+static uint8_t se_bytes[SE_N][sizeof(struct thread)];
+static struct se_view se_before, se_now;
+
+static void se_view_fill(struct se_view *v)
+{
+    memset(v, 0, sizeof(*v));
+    v->rq_first = runq_first();
+    v->rq_last = runq_last();
+    v->rq_len = runq_len();
+    v->cur = sched_current();
+    for (unsigned i = 0; i < TEST_WAITQS; i++)
+        v->q[i] = test_waitqs[i];
+    v->ep = *endpoint_of(&ut_store[1]);
+}
+
+static void se_take(void)
+{
+    for (unsigned i = 0; i < SE_N; i++)
+        memcpy(se_bytes[i], se_th[i], sizeof(struct thread));
+    se_view_fill(&se_before);
+}
+
+static bool se_same(void)
+{
+    for (unsigned i = 0; i < SE_N; i++)
+        if (memcmp(se_bytes[i], se_th[i], sizeof(struct thread)) != 0)
+            return false;
+    se_view_fill(&se_now);
+    return memcmp(&se_before, &se_now, sizeof(se_now)) == 0;
+}
+
+enum {
+    E_START, E_WAKE, E_YIELD, E_BLOCK_RECV, E_BLOCK_SEND, E_BLOCK_NOTIF,
+    E_BLOCK_AS_REPLY, E_BLOCK_AS_IDLE, E_BLOCK_REPLY, E_FAULT, E_STOP, E_COUNT,
+};
+
+static int se_call(unsigned e, struct thread *t)
+{
+    switch (e) {
+    case E_START:          return sched_start(t);
+    case E_WAKE:           return sched_wake(t);
+    case E_YIELD:          return sched_yield(t);
+    case E_BLOCK_RECV:     return sched_block(t, THREAD_BLOCKED_RECV);
+    case E_BLOCK_SEND:     return sched_block(t, THREAD_BLOCKED_SEND);
+    case E_BLOCK_NOTIF:    return sched_block(t, THREAD_BLOCKED_NOTIF);
+    case E_BLOCK_AS_REPLY: return sched_block(t, THREAD_BLOCKED_REPLY);  /* not a queue kind */
+    case E_BLOCK_AS_IDLE:  return sched_block(t, THREAD_IDLE);
+    case E_BLOCK_REPLY:    return sched_block_reply(t);
+    case E_FAULT:          return sched_fault(t);
+    default:               return sched_stop(t, false);
+    }
+}
+
+/* Is (e, fixture thread i) an edge this fixture can take? Everything else
+ * is refused: a from-state outside the edge, or (for an edge's own
+ * from-state) IPC links that are not in the state the edge needs. */
+static bool se_allowed(unsigned e, unsigned i)
+{
+    if (i == SE_N - 1)
+        return false;   /* the idle thread leaves IDLE by no edge */
+    uint32_t s = se_state[i];
+    switch (e) {
+    case E_START: return s == THREAD_INACTIVE || s == THREAD_FAULTED;
+    case E_YIELD: return s == THREAD_RUNNING;
+    case E_FAULT: return s == THREAD_RUNNING;   /* the blocked ones still hold links */
+    case E_STOP:  return true;
+    default:      return false;
+    }
+}
+
+static void se_build(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_ENDPOINT, 0, &uts, 1, 1) == T_OK);
+    CHECK(spawn(30, P(block), false, &(struct user_regs){ .rdi = 0 }));
+    CHECK(spawn(40, P(block), false, &(struct user_regs){ .rdi = 1 }));
+    CHECK(ep_thread(50, true, 7, 0x5E, CAP_R_WRITE));   /* no receiver: queued */
+    CHECK(spawn(70, P(f_ud), false, NULL));             /* no handler: FAULTED */
+    run_user();
+    CHECK(spawn(10, P(hello), false, NULL) && thread_suspend(&uts, 10 + T_THR) == T_OK);
+    CHECK(spawn(60, P(hello), false, NULL) && thread_suspend(&uts, 60 + T_THR) == T_OK);
+    link_reply(40, 60, 0);
+    CHECK(spawn(80, P(hello), false, NULL));
+    CHECK(sched_dispatch() == th(80));
+    CHECK(spawn(20, P(hello), false, NULL));
+    for (unsigned i = 0; i < SE_N - 1; i++) {
+        se_th[i] = th(se_slot[i]);
+        CHECK(tstate(se_slot[i]) == se_state[i]);
+    }
+    se_th[SE_N - 1] = sched_idle();
+    CHECK(AUDIT());
+}
+
+/* G9, G1: every primitive refuses every from-state outside its edge, and
+ * a refusal changes nothing; every edge commits its state and run-queue
+ * membership together (G11). */
+static void test_sched_edges(void)
+{
+    se_build();
+
+    unsigned refused = 0, exact = 0;
+    for (unsigned e = 0; e < E_COUNT; e++)
+        for (unsigned i = 0; i < SE_N; i++) {
+            if (se_allowed(e, i))
+                continue;
+            se_take();
+            int rc = se_call(e, se_th[i]);
+            refused += rc == T_EINVAL;
+            exact += se_same();
+            if (rc != T_EINVAL || !se_same())
+                kprintf("    edge %u on fixture thread %u: rc %d\n", e, i, rc);
+        }
+    /* 11 primitives x 9 threads, less the 2 + 1 + 1 + 8 edges taken. */
+    CHECK(refused == E_COUNT * SE_N - 12 && exact == refused);
+    CHECK(AUDIT());
+
+    /* The edges. RUNNING -> RUNNABLE: to the tail; still `current` until
+     * the boundary. */
+    struct thread *a = th(80), *b = th(20);
+    CHECK(sched_yield(a) == T_OK && a->state == THREAD_RUNNABLE);
+    CHECK(runq_first() == b && runq_last() == a && runq_len() == 2 && sched_current() == a);
+    /* RUNNABLE -> RUNNING: the head, off the queue, and `current`. */
+    CHECK(sched_dispatch() == b && b->state == THREAD_RUNNING && sched_current() == b);
+    CHECK(runq_first() == a && runq_last() == a && runq_len() == 1 && !b->rq_next && !b->rq_prev);
+    CHECK(AUDIT());
+    /* RUNNING -> FAULTED: owned by nothing. */
+    CHECK(sched_fault(b) == T_OK && b->state == THREAD_FAULTED && runq_len() == 1);
+    CHECK(sched_dispatch() == a && sched_current() == a && runq_empty() && AUDIT());
+    /* RUNNING -> INACTIVE, then the boundary hands the CPU to idle. */
+    CHECK(sched_stop(a, false) == T_OK && a->state == THREAD_INACTIVE && runq_empty());
+    /* G3: until that boundary `current` still names it, stopped. Being
+     * `current` is not being RUNNING: every edge out of RUNNING refuses. */
+    CHECK(sched_current() == a);
+    for (unsigned e = 0; e < E_COUNT; e++) {
+        if (e == E_START || e == E_STOP)
+            continue;
+        se_take();
+        CHECK(se_call(e, a) == T_EINVAL && se_same());
+    }
+    CHECK(sched_dispatch() == sched_idle() && sched_current() == sched_idle() && AUDIT());
+    /* INACTIVE, FAULTED -> RUNNABLE, in order, at the tail. */
+    struct thread *c = th(10), *f = th(70);
+    CHECK(sched_start(c) == T_OK && sched_start(f) == T_OK && sched_start(b) == T_OK);
+    CHECK(runq_first() == c && c->rq_next == f && f->rq_next == b && runq_last() == b);
+    CHECK(runq_len() == 3 && AUDIT());
+    /* RUNNING -> BLOCKED_RECV (IPC links it first, P9), then the wake. */
+    CHECK(sched_dispatch() == c);
+    /* sched_block takes only a wait-queue kind, even if the thread's queue
+     * claims another (queues are IPC's; the primitive checks for itself). */
+    static struct waitq bogus;
+    static const uint32_t bad_kind[] = { THREAD_BLOCKED_REPLY, THREAD_IDLE, THREAD_RUNNABLE };
+    for (unsigned i = 0; i < ARRAY_SIZE(bad_kind); i++) {
+        bogus = (struct waitq){ .kind = bad_kind[i] };
+        c->wait_q = &bogus;
+        se_take();
+        CHECK(sched_block(c, bad_kind[i]) == T_EINVAL && se_same());
+        c->wait_q = NULL;
+    }
+    waitq_block(c, &test_waitqs[0]);
+    CHECK(c->state == THREAD_BLOCKED_RECV && c->wait_q == &test_waitqs[0] && runq_len() == 2);
+    /* G3: blocked but still `current` until the boundary: only the stop
+     * funnel applies (the wake needs IPC to unlink it first). */
+    CHECK(sched_current() == c);
+    for (unsigned e = 0; e < E_COUNT; e++) {
+        if (e == E_STOP)
+            continue;
+        se_take();
+        CHECK(se_call(e, c) == T_EINVAL && se_same());
+    }
+    CHECK(sched_dispatch() == f && AUDIT());
+    CHECK(sched_stop(f, false) == T_OK && sched_dispatch() == b && AUDIT());
+    CHECK(sched_stop(b, false) == T_OK && sched_dispatch() == sched_idle() && AUDIT());
+    thread_wake(c, 0x77);   /* IPC unlinks, then BLOCKED -> RUNNABLE */
+    CHECK(c->state == THREAD_RUNNABLE && !c->wait_q && runq_first() == c && runq_len() == 1);
+    CHECK(c->regs.rax == 0x77 && AUDIT());
+    /* Every other state -> INACTIVE: the one funnel. */
+    for (unsigned i = 0; i < SE_N - 1; i++) {
+        CHECK(thread_suspend(&uts, se_slot[i] + T_THR) == T_OK);
+        CHECK(se_th[i]->state == THREAD_INACTIVE && !se_th[i]->wait_q && !se_th[i]->reply_from);
+    }
+    CHECK(runq_empty() && sched_current() == sched_idle() && AUDIT());
+    /* G7: nothing moved a thread off its home CPU. */
+    for (unsigned i = 0; i < SE_N - 1; i++)
+        CHECK(se_th[i]->home_cpu == 0);
+    CHECK(sched_idle()->home_cpu == this_cpu()->cpu_id);
+
+    /* SC8: a stopped thread without what it needs to run is refused, at
+     * the capability (T_EPERM) and at the primitive (T_EINVAL), with
+     * nothing changed. */
+    CHECK(thread_unbind(&uts, 10 + T_THR, TS_ASPACE) == T_OK);
+    se_take();
+    CHECK(thread_resume(&uts, 10 + T_THR) == T_EPERM && se_same());
+    CHECK(sched_start(c) == T_EINVAL && se_same());
+    /* A destroyed thread never becomes RUNNABLE again. */
+    struct thread *dead = th(20);
+    CHECK(cap_delete(&uts, 20 + T_THR) == T_OK && dead->state == THREAD_INACTIVE);
+    CHECK(sched_start(dead) == T_EINVAL && sched_wake(dead) == T_EINVAL);
+    CHECK(dead->state == THREAD_INACTIVE && !dead->rq_next && runq_empty());
+    CHECK(thread_resume(&uts, 20 + T_THR) == T_EBADCAP && AUDIT());
+    ut_teardown();
+}
+
+/* G3: `current` is never NULL at a boundary; a thread that suspends or
+ * destroys itself hands it to the idle thread, and nothing of a thread is
+ * torn down while it is still `current`. */
+static void test_sched_current(void)
+{
+    CHECK(sched_current() == sched_idle() && sched_idle()->state == THREAD_IDLE);
+
+    /* Self-suspension: stopped inside its own syscall; the boundary then
+     * dispatches idle. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL));
+    struct cspace cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 10 + T_THR, &cs, 3, CAP_R_ALL, 0) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_TH_SUSPEND, 3);
+    REQ(10, SYS_TEST_REPORT, 0xBAD);
+    run_user();
+    CHECK(tstate(10) == THREAD_INACTIVE && test_report_count == 0);
+    CHECK(sched_current() == sched_idle() && AUDIT());
+    ut_teardown();
+
+    /* Self-destruction: the handoff happens, and before the teardown. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(runner), false, NULL));
+    cs = task_cs(10);
+    CHECK(cap_derive_to(&uts, 10 + T_THR, &cs, 3, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_delete(&uts, 10 + T_THR) == T_OK);   /* its own copy is the last */
+    nreq = 0;
+    REQ(10, SYS_CAP_DELETE, 3);
+    REQ(10, SYS_TEST_REPORT, 0xBAD);
+    uint64_t hand = sched_handoffs, td = thread_teardowns, bad = thread_teardowns_while_current;
+    run_user();
+    CHECK(sched_handoffs == hand + 1 && thread_teardowns == td + 1);   /* not vacuous */
+    CHECK(thread_teardowns_while_current == bad);
+    CHECK(test_report_count == 0 && cs.slots[3].type == CAP_NULL);
+    CHECK(sched_current() == sched_idle() && AUDIT());
+    ut_teardown();
+
+    /* Destroyed from outside (not current): no handoff. */
+    CHECK(ut_setup(20));
+    CHECK(spawn(10, P(hello), false, NULL));
+    hand = sched_handoffs;
+    td = thread_teardowns;
+    CHECK(cap_delete(&uts, 10 + T_THR) == T_OK);
+    CHECK(sched_handoffs == hand && thread_teardowns == td + 1 && runq_empty());
+    CHECK(thread_teardowns_while_current == bad && AUDIT());
+    ut_teardown();
+}
+
+/* G4: the idle thread's halt and wake. Unarmed, the driver regains control
+ * at the pre-HLT boundary without halting; armed, the idle thread always
+ * halts, and the interrupt arrives at the instruction after its HLT. */
+static void halt_wake_case(uint8_t vector)
+{
+    uint64_t h = sched_idle_halts, w = sched_idle_wakes, k = entry_obs.kernel_irqs;
+
+    entry_obs.kernel_irq_rip = 0;
+    entry_obs.kernel_irq_vector = 0;
+    entry_obs.kernel_irq_in_idle = 0;
+    sched_wake_armed = true;
+    if (vector == VEC_TEST_IPI)
+        lapic_self_ipi(VEC_TEST_IPI);     /* pending before the halt */
+    else
+        lapic_timer_oneshot(100000);      /* fires after it */
+    run_user();
+    lapic_timer_stop();
+    CHECK(!sched_wake_armed && sched_idle_halts == h + 1 && sched_idle_wakes == w + 1);
+    CHECK(entry_obs.kernel_irqs == k + 1 && entry_obs.kernel_irq_vector == vector);
+    CHECK(entry_obs.kernel_irq_rip == (uint64_t)(uintptr_t)idle_hlt_resume);
+    CHECK(entry_obs.kernel_irq_in_idle && sched_current() == sched_idle());
+}
+
+static void test_sched_halt_wake(void)
+{
+    CHECK(lapic_present());
+    if (!lapic_present())
+        return;
+    CHECK(runq_empty() && reaper_idle() && sched_current() == sched_idle());
+
+    uint64_t h = sched_idle_halts, w = sched_idle_wakes, k = entry_obs.kernel_irqs;
+    run_user();   /* nothing armed: the escape, and no halt */
+    CHECK(sched_idle_halts == h && sched_idle_wakes == w && entry_obs.kernel_irqs == k);
+
+    halt_wake_case(VEC_TEST_IPI);
+    halt_wake_case(VEC_TIMER);
+    CHECK(AUDIT());
+}
+
+/* G5, R5: with nothing to run, the idle loop drains the reaper one chunk
+ * per pass. */
+static void test_sched_idle_reap(void)
+{
+    struct cspace cn;
+
+    CHECK(ut_setup(20));
+    CHECK(cap_retype(&uts, 0, CAP_NOTIFICATION, 0, &uts, 1, 1) == T_OK);
+    CHECK(cap_retype(&uts, 0, CAP_CNODE, 5, &uts, 2, 1) == T_OK);
+    CHECK(cnode_view_cap(&ut_store[2], &cn) == T_OK && cn.nslots == 32);
+    for (cap_slot_t i = 0; i < 32; i++)
+        CHECK(cap_derive_to(&uts, 1, &cn, i, CAP_R_ALL, 0) == T_OK);
+    CHECK(cap_delete(&uts, 2) == T_OK && !reaper_idle());   /* dying: listed */
+
+    uint64_t units = reaper_units_total, passes = sched_idle_reap_passes;
+    sched_reap_max_pass = 0;
+    run_user();
+    units = reaper_units_total - units;
+    passes = sched_idle_reap_passes - passes;
+    CHECK(reaper_idle() && units >= 33);                    /* a unit per slot, then done */
+    CHECK(sched_reap_max_pass == REAP_CHUNK);               /* chunked, and full chunks */
+    CHECK(passes * REAP_CHUNK >= units && passes >= (units + REAP_CHUNK - 1) / REAP_CHUNK);
+    CHECK(sched_current() == sched_idle() && AUDIT());
+    ut_teardown();
+}
+
+/* G6: a thread with a continuation is queued like any other: each
+ * unfinished chunk ends at the tail, behind the threads already waiting. */
+static void test_sched_fair_cont(void)
+{
+    static struct cap fan_store[64];
+    struct cspace fan;
+    const cap_slot_t order[] = { 10, 20, 30 };
+
+    CHECK(ut_setup(20));
+    for (unsigned i = 0; i < ARRAY_SIZE(order); i++)
+        CHECK(spawn(order[i], P(runner), false, NULL) &&
+              thread_suspend(&uts, order[i] + T_THR) == T_OK);
+    struct cspace cs = task_cs(10);
+    CHECK(cap_install(&cs, 5, CAP_TEST_TOKEN, CAP_R_ALL, 0x7000) == T_OK);
+    cspace_init(&fan, fan_store, ARRAY_SIZE(fan_store));
+    for (cap_slot_t i = 0; i < ARRAY_SIZE(fan_store); i++)
+        CHECK(cap_derive_to(&cs, 5, &fan, i, CAP_R_ALL, 0) == T_OK);
+    nreq = 0;
+    REQ(10, SYS_CAP_REVOKE, 5);
+    for (unsigned b = 1; b < ARRAY_SIZE(order); b++) {
+        nreq = 0;
+        for (unsigned i = 0; i < 20; i++)
+            REQ(order[b], SYS_YIELD);
+    }
+    const struct thread *who[3];
+    for (unsigned i = 0; i < ARRAY_SIZE(order); i++) {
+        who[i] = th(order[i]);
+        CHECK(thread_resume(&uts, order[i] + T_THR) == T_OK);
+    }
+    sched_trace_n = 0;
+    run_user();
+
+    /* The revoker's dispatches, and round robin among all three up to
+     * its last one. */
+    unsigned na = 0, last = 0;
+    for (unsigned i = 0; i < sched_trace_n && i < SCHED_TRACE_MAX; i++)
+        if (sched_trace[i] == who[0]) {
+            na++;
+            last = i;
+        }
+    bool rr = true;
+    for (unsigned i = 0; i <= last; i++)
+        rr &= sched_trace[i] == who[i % 3];
+    CHECK(sched_trace_n <= SCHED_TRACE_MAX && na >= 4 && last == 3 * (na - 1) && rr);
+    CHECK(res(10, 0) == T_OK && cs.slots[5].type == CAP_TEST_TOKEN);
+    bool gone = true;
+    for (cap_slot_t i = 0; i < ARRAY_SIZE(fan_store); i++)
+        gone &= fan.slots[i].type == CAP_NULL;
+    CHECK(gone && AUDIT());
+    cspace_destroy(&fan);
+    ut_teardown();
+}
+
+/* G8: the audit notices each kind of scheduler corruption. */
+static void test_sched_audit_detects(void)
+{
+    CHECK(ut_setup(20));
+    CHECK(spawn(30, P(block), false, &(struct user_regs){ .rdi = 0 }));
+    run_user();
+    CHECK(spawn(10, P(hello), false, NULL) && spawn(20, P(hello), false, NULL));
+    CHECK(spawn(40, P(hello), false, NULL) && thread_suspend(&uts, 40 + T_THR) == T_OK);
+    struct thread *a = th(10), *b = th(20), *blk = th(30), *in = th(40), *idle = sched_idle();
+    CHECK(runq_first() == a && runq_last() == b && AUDIT());
+
+    b->rq_next = a;                       /* a cycle: a repeat in the queue */
+    CHECK(!AUDIT());
+    b->rq_next = NULL;
+    a->rq_next = NULL;                    /* a RUNNABLE thread cut off */
+    CHECK(!AUDIT());
+    a->rq_next = b;
+    in->rq_next = a;                      /* a stale link on a stopped thread */
+    CHECK(!AUDIT());
+    in->rq_next = NULL;
+    blk->rq_prev = b;                     /* a blocked thread also queued to run */
+    b->rq_next = blk;
+    CHECK(!AUDIT());
+    b->rq_next = NULL;
+    blk->rq_prev = NULL;
+    a->home_cpu = 1;                      /* SC3 */
+    CHECK(!AUDIT());
+    a->home_cpu = 0;
+    idle->regs.rax = 1;                   /* SC5: the idle thread is clean */
+    CHECK(!AUDIT());
+    idle->regs.rax = 0;
+    idle->state = THREAD_INACTIVE;
+    CHECK(!AUDIT());
+    idle->state = THREAD_IDLE;
+    this_cpu()->current = NULL;           /* SC2 */
+    CHECK(!AUDIT());
+    this_cpu()->current = a;              /* RUNNABLE but current */
+    CHECK(!AUDIT());
+    this_cpu()->current = idle;
+    CHECK(AUDIT());
+    CHECK(sched_dispatch() == a);
+    this_cpu()->current = idle;           /* RUNNING but not current */
+    CHECK(!AUDIT());
+    this_cpu()->current = a;
+    CHECK(AUDIT());
+    CHECK(sched_stop(a, false) == T_OK && sched_dispatch() == b && sched_stop(b, false) == T_OK);
+    CHECK(sched_dispatch() == idle && AUDIT());
+    ut_teardown();
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -6337,6 +6792,12 @@ static const struct {
     { "drain_identity", test_drain_identity },
     { "drain_reply_bound", test_drain_reply_bound },
     { "reaper_r6", test_reaper_r6 },
+    { "sched_edges", test_sched_edges },
+    { "sched_current", test_sched_current },
+    { "sched_halt_wake", test_sched_halt_wake },
+    { "sched_idle_reap", test_sched_idle_reap },
+    { "sched_fair_cont", test_sched_fair_cont },
+    { "sched_audit_detects", test_sched_audit_detects },
     { "cpu_hardening", test_cpu_hardening },
 };
 

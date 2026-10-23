@@ -17,68 +17,11 @@
 #include <tarka/ipc.h>
 #include <tarka/kernel.h>
 #include <tarka/reaper.h>
+#include <tarka/sched.h>
 #include <tarka/string.h>
 #include <tarka/vspace.h>
 
 _Static_assert(offsetof(struct thread, bind) % sizeof(struct cap) == 0, "binding slots must be slot-aligned");
-
-/* ---- run queue (FIFO; internal references, removed by the finaliser) ---- */
-
-static struct thread *rq_head, *rq_tail;
-
-static bool on_runq(const struct thread *t)
-{
-    return t->rq_prev || t->rq_next || rq_head == t;
-}
-
-static void runq_push(struct thread *t)
-{
-    KASSERT(!on_runq(t));
-    t->rq_next = NULL;
-    t->rq_prev = rq_tail;
-    if (rq_tail)
-        rq_tail->rq_next = t;
-    else
-        rq_head = t;
-    rq_tail = t;
-}
-
-static void runq_remove(struct thread *t)
-{
-    if (!on_runq(t))
-        return;
-    if (t->rq_prev)
-        t->rq_prev->rq_next = t->rq_next;
-    else
-        rq_head = t->rq_next;
-    if (t->rq_next)
-        t->rq_next->rq_prev = t->rq_prev;
-    else
-        rq_tail = t->rq_prev;
-    t->rq_next = t->rq_prev = NULL;
-}
-
-struct thread *runq_pop(void)
-{
-    struct thread *t = rq_head;
-
-    if (t)
-        runq_remove(t);
-    return t;
-}
-
-bool runq_empty(void)
-{
-    return rq_head == NULL;
-}
-
-bool runq_contains(const struct thread *t)
-{
-    for (const struct thread *x = rq_head; x; x = x->rq_next)
-        if (x == t)
-            return true;
-    return false;
-}
 
 /* ---- validation (T11-T15) ---- */
 
@@ -89,11 +32,6 @@ bool user_regs_valid(const struct user_regs *r)
            (r->rflags & ~(uint64_t)RFLAGS_USER_MASK) == 0;
 }
 
-void thread_enqueue(struct thread *t)
-{
-    runq_push(t);
-}
-
 /* T4: the conditions for being runnable. */
 bool thread_runnable_safe(const struct thread *t)
 {
@@ -102,27 +40,10 @@ bool thread_runnable_safe(const struct thread *t)
            user_regs_valid(&t->regs);
 }
 
-/* Stop a thread: it leaves the run queue and will not run again until
- * resumed. If it is running on this CPU, the CPU leaves its address
- * space now, before whatever is being deleted can be freed. */
-#ifdef TARKA_SELFTEST
-uint64_t thread_stop_reaper_units;   /* reaper units done at the last stop */
-#endif
-
-static void thread_stop(struct thread *t, enum thread_state to, bool destroying)
+/* Stop a thread (ADR 0010 SC6/G1: the one funnel, in sched.c). */
+static void thread_stop(struct thread *t, bool destroying)
 {
-#ifdef TARKA_SELFTEST
-    thread_stop_reaper_units = reaper_units_total;
-#endif
-    /* ADR 0009 P28-P31: leave every queue and reply link first. A thread
-     * stopped in the middle of a blocking syscall gets T_EINTR as that
-     * syscall's result when it is resumed (unless it is being destroyed). */
-    cont_abandon(t, destroying);   /* F6, E1: the one funnel, first */
-    ipc_detach(t, destroying);
-    runq_remove(t);
-    t->state = to;
-    if (this_cpu()->current == t)
-        vspace_activate_kernel();
+    KASSERT(sched_stop(t, destroying) == T_OK);
 }
 
 /* ---- object lifecycle ---- */
@@ -139,6 +60,7 @@ void thread_obj_init(paddr_t obj)
     /* Already zeroed by retype (O6): every register starts at 0. */
     for (unsigned i = 0; i < TS_COUNT; i++)
         t->bind[i].slot_flags = SLOT_BINDING | i;
+    sched_thread_init(t);                  /* ADR 0010 SC3: its home CPU */
     fpu_init_area(thread_xsave_area(t));   /* T7 */
 #ifdef TARKA_SELFTEST
     thread_registry_add(t);
@@ -152,22 +74,23 @@ static void binding_lost(struct cap *c)
     struct thread *t = (struct thread *)((uint8_t *)(c - idx) - offsetof(struct thread, bind));
 
     if ((idx == TS_ASPACE || idx == TS_CSPACE) && t->state != THREAD_INACTIVE)
-        thread_stop(t, THREAD_INACTIVE, false);
+        thread_stop(t, false);
     /* P6a: only a receiving thread needs its IPC buffer while blocked. */
     else if (idx == TS_IPCBUF && t->state == THREAD_BLOCKED_RECV)
-        thread_stop(t, THREAD_INACTIVE, false);
+        thread_stop(t, false);
 }
 
-/* T5: last Thread capability deleted. */
-static void thread_finalise(enum cap_type type, uint64_t object)
-{
-    struct thread *t = phys_to_virt(pa(object & ~CAP_OBJ_BITS_MASK));
-
-    (void)type;
-    thread_stop(t, THREAD_INACTIVE, true);
-    if (this_cpu()->current == t)
-        this_cpu()->current = NULL;
 #ifdef TARKA_SELFTEST
+uint64_t thread_teardowns, thread_teardowns_while_current;
+#endif
+
+/* Everything of a stopped thread's TCB that goes away with it. */
+static void tcb_teardown(struct thread *t)
+{
+#ifdef TARKA_SELFTEST
+    thread_teardowns++;
+    if (sched_current() == t)
+        thread_teardowns_while_current++;   /* G3: must never happen */
     thread_registry_remove(t);
 #endif
     for (unsigned i = 0; i < TS_COUNT; i++)
@@ -177,6 +100,19 @@ static void thread_finalise(enum cap_type type, uint64_t object)
      * a destroyed thread afterwards (e.g. a syscall result). */
     memset(&t->regs, 0xDD, sizeof(t->regs));
 #endif
+}
+
+/* T5: last Thread capability deleted. */
+static void thread_finalise(enum cap_type type, uint64_t object)
+{
+    struct thread *t = phys_to_virt(pa(object & ~CAP_OBJ_BITS_MASK));
+
+    (void)type;
+    /* G3: stop it, and if it is destroying itself hand `current` to the
+     * idle thread, before anything of it is torn down. */
+    thread_stop(t, true);
+    sched_release_current(t);
+    tcb_teardown(t);
 }
 
 void thread_boot(void)
@@ -288,9 +224,8 @@ int thread_resume(struct cspace *cs, cap_slot_t thr)
     if (!thread_runnable_safe(t))
         return T_EPERM;             /* T4 */
     memset(&t->fault, 0, sizeof(t->fault));   /* ADR 0009 P73 */
-    t->state = THREAD_RUNNABLE;
     t->ret_path = RETURN_IRET;
-    runq_push(t);
+    KASSERT(sched_start(t) == T_OK);   /* SC8: checked above */
     return T_OK;
 }
 
@@ -301,7 +236,7 @@ int thread_suspend(struct cspace *cs, cap_slot_t thr)
 
     if ((rc = lookup(cs, thr, CAP_R_WRITE, &t)))
         return rc;
-    thread_stop(t, THREAD_INACTIVE, false);
+    thread_stop(t, false);
     return T_OK;
 }
 

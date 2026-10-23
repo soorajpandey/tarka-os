@@ -16,6 +16,7 @@
 #include <tarka/cont.h>
 #include <tarka/kernel.h>
 #include <tarka/reaper.h>
+#include <tarka/sched.h>
 #include <tarka/selftest.h>
 #include <tarka/syscall.h>
 #include <tarka/vspace.h>
@@ -104,7 +105,7 @@ static void try_exit_to_user(struct thread *t)
 {
     if (!thread_runnable_safe(t)) {
         t->fault = (struct fault_record){ .vector = VEC_BAD_STATE, .rip = t->regs.rip };
-        t->state = THREAD_FAULTED;
+        KASSERT(sched_fault(t) == T_OK);
         return;
     }
 
@@ -130,30 +131,63 @@ static void try_exit_to_user(struct thread *t)
     return_iret(&t->regs, rflags);
 }
 
+/* G4: the idle thread with nothing to do. The real path halts until an
+ * interrupt: `sti; hlt` is atomic, so no wake-up is lost. In test builds
+ * the driver regains control here, at the pre-HLT boundary, and only
+ * when no wake source is armed: the escape never stands in for an armed
+ * halt. */
+static __attribute__((noinline)) void idle_wait(void)
+{
+    KASSERT(runq_empty() && reaper_idle() && sched_current() == sched_idle());
+#ifdef TARKA_SELFTEST
+    if (!sched_wake_armed)
+        kcont_resume(&idle_cont);   /* to the self-test driver */
+    sched_wake_armed = false;
+    sched_idle_halts++;
+#endif
+    /* An interrupt taken here returns to idle_hlt_resume. */
+    __asm__ volatile("sti\n\thlt\n"
+                     ".globl idle_hlt_resume\n"
+                     "idle_hlt_resume:\n\t"
+                     "cli" ::: "memory");
+#ifdef TARKA_SELFTEST
+    sched_idle_wakes++;
+#endif
+}
+
+/* The scheduling boundary (ADR 0010 SC5, SC6, SC24; revision 3f). Every
+ * kernel entry ends here. With nothing RUNNING, one reaper chunk, then a
+ * dispatch: the run queue's head, or the idle thread, whose loop keeps
+ * reaping one chunk per pass and otherwise waits. */
 static __noreturn void schedule(void)
 {
-    struct percpu *cpu = this_cpu();
-    struct thread *t = cpu->current;
+    struct thread *t = sched_current();
 
-    if (t && t->state != THREAD_RUNNING)
+    if (t->state != THREAD_RUNNING)
         t = NULL;
     for (;;) {
         if (!t) {
-            cpu->current = NULL;
-            /* A scheduling boundary: one reaper chunk (SC24, R5). Until
-             * stage 5 brings per-CPU idle threads, this loop is also the
-             * idle loop: with nothing runnable, it keeps reaping, one
-             * chunk per pass, until the reaper is idle too (D5). */
-            reaper_run(REAP_CHUNK);
-            t = runq_pop();
-            if (!t && !reaper_idle())
+            unsigned done = reaper_run(REAP_CHUNK);
+            t = sched_dispatch();
+            /* SC2, at the boundary: `current` is what was dispatched,
+             * RUNNING or the idle thread, never NULL. */
+            KASSERT(t && sched_current() == t &&
+                    (t->state == THREAD_RUNNING || t->state == THREAD_IDLE));
+            if (t->state == THREAD_IDLE) {
+#ifdef TARKA_SELFTEST
+                if (done) {
+                    sched_idle_reap_passes++;
+                    if (done > sched_reap_max_pass)
+                        sched_reap_max_pass = done;
+                }
+#else
+                (void)done;
+#endif
+                if (reaper_idle())
+                    idle_wait();
+                t = NULL;
                 continue;
-            if (!t) {
-                vspace_activate_kernel();
-                kcont_resume(&idle_cont);
             }
-            t->state = THREAD_RUNNING;
-            cpu->current = t;
         }
         /* ADR 0010 SC16, E4: a thread with a continuation runs its next
          * chunk instead of entering user mode. */
@@ -195,7 +229,7 @@ static void user_fault(struct thread *t, const struct trap_frame *tf)
     /* ADR 0009 P69: a call to its handler, or FAULTED if it has none.
      * T29: the thread, never the kernel. */
     if (endpoint_fault(t) != T_OK)
-        t->state = THREAD_FAULTED;
+        KASSERT(sched_fault(t) == T_OK);
 }
 
 void entry_from_user(struct trap_frame *tf);

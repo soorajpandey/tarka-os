@@ -11,6 +11,7 @@
 #include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/sched.h>
 #include <tarka/string.h>
 
 #include "../arch/x86_64/percpu.h"
@@ -68,8 +69,8 @@ void waitq_block(struct thread *t, struct waitq *q)
 {
     KASSERT(t->state == THREAD_RUNNING && this_cpu()->current == t);
     KASSERT(blocked(q->kind) && q->kind != THREAD_BLOCKED_REPLY);
-    waitq_append(q, t);
-    t->state = q->kind;
+    waitq_append(q, t);                         /* IPC's queue (P9) */
+    KASSERT(sched_block(t, q->kind) == T_OK);   /* the state (ADR 0010 G1, G11) */
 }
 
 struct thread *waitq_first(const struct waitq *q)
@@ -112,7 +113,7 @@ void thread_wake(struct thread *t, int64_t rax)
     if (fault) {
         /* P70-P72: no register is written. */
         if (rax != T_OK) {
-            t->state = THREAD_FAULTED;   /* the record stays (P73) */
+            KASSERT(sched_fault(t) == T_OK);   /* the record stays (P73) */
             return;
         }
         memset(&t->fault, 0, sizeof(t->fault));
@@ -120,8 +121,7 @@ void thread_wake(struct thread *t, int64_t rax)
     } else {
         t->regs.rax = (uint64_t)rax;   /* P10: result, state and queue together */
     }
-    t->state = THREAD_RUNNABLE;
-    thread_enqueue(t);
+    KASSERT(sched_wake(t) == T_OK);   /* state and run queue together */
 }
 
 #ifdef TARKA_SELFTEST
@@ -144,7 +144,7 @@ void reply_link(struct thread *server, struct thread *caller, uint32_t flags)
     server->reply_state = REPLY_PENDING;
     server->reply_flags = flags;
     caller->reply_from = server;
-    caller->state = THREAD_BLOCKED_REPLY;
+    KASSERT(sched_block_reply(caller) == T_OK);
 }
 
 void ipc_call_link(struct thread *server, struct thread *caller, uint32_t reply_flags)
@@ -212,6 +212,8 @@ void ipc_detach(struct thread *t, bool destroying)
 
 static struct thread *registry;
 
+#define AUDIT_THREADS_MAX 65536   /* bounds the registry walk itself */
+
 void thread_registry_add(struct thread *t)
 {
     t->reg_prev = NULL;
@@ -246,55 +248,127 @@ static bool live(const struct thread *t)
 }
 
 /* A queue is a well-formed doubly linked list of live threads, each in
- * the queue's state and pointing back at it. */
-static bool queue_ok(const struct waitq *q)
+ * the queue's state and pointing back at it, no longer than the number of
+ * live threads (ADR 0010 SC29). */
+static bool queue_ok(const struct waitq *q, size_t nlive)
 {
     const struct thread *prev = NULL;
-    unsigned n = 0;
+    size_t n = 0;
 
     if (!blocked(q->kind) || q->kind == THREAD_BLOCKED_REPLY)
         return false;
     if (!q->head != !q->tail)
         return false;
     for (const struct thread *t = q->head; t; prev = t, t = t->wait_next) {
+        if (++n > nlive)
+            return false;   /* a repeat or a cycle */
         if (!live(t) || t->wait_q != q || t->wait_prev != prev || t->state != q->kind)
             return false;
-        if (++n > 100000)
-            return false;   /* a cycle */
     }
     return prev == q->tail && n == q->len;
 }
 
-static bool in_queue(const struct waitq *q, const struct thread *t)
+/* Occurrences of `t` in a wait queue, counted link by link (bounded). */
+static size_t count_in_queue(const struct waitq *q, const struct thread *t, size_t nlive)
 {
-    for (const struct thread *x = q->head; x; x = x->wait_next)
-        if (x == t)
-            return true;
-    return false;
+    size_t n = 0, seen = 0;
+
+    for (const struct thread *x = q->head; x && seen <= nlive; x = x->wait_next, seen++)
+        n += x == t;
+    return n;
+}
+
+/* ---- ADR 0010 G8: scheduler ownership, derived by walking ---- */
+
+/* Occurrences of `t` in this CPU's run queue, counted link by link. */
+static size_t count_on_runq(const struct thread *t, size_t nlive)
+{
+    size_t n = 0, seen = 0;
+
+    for (const struct thread *x = runq_first(); x && seen <= nlive; x = x->rq_next, seen++)
+        n += x == t;
+    return n;
+}
+
+/* The run queue is a well-formed doubly linked list of live threads, no
+ * longer than the number of them (SC29), its stored length that of the
+ * walk. Which thread belongs in it is checked per thread, by count. */
+static bool runq_ok(size_t nlive)
+{
+    const struct thread *prev = NULL;
+    size_t n = 0;
+
+    for (const struct thread *x = runq_first(); x; prev = x, x = x->rq_next) {
+        if (++n > nlive)
+            return false;
+        if (!live(x) || x->rq_prev != prev)
+            return false;
+    }
+    return prev == runq_last() && n == runq_len();
+}
+
+/* SC5, G3: the idle thread is zero but for its state and home CPU: no
+ * binding, no continuation, no reply authority, no link, zero registers. */
+static bool idle_ok(const struct thread *idle)
+{
+    const uint8_t *b = (const uint8_t *)idle;
+    const size_t st = offsetof(struct thread, state), hc = offsetof(struct thread, home_cpu);
+
+    if (idle->state != THREAD_IDLE || idle->home_cpu != this_cpu()->cpu_id || live(idle))
+        return false;
+    for (size_t i = 0; i < sizeof(*idle); i++) {
+        if ((i >= st && i < st + sizeof(idle->state)) ||
+            (i >= hc && i < hc + sizeof(idle->home_cpu)))
+            continue;
+        if (b[i])
+            return false;
+    }
+    return true;
 }
 
 bool ipc_audit(struct waitq *const *extra, size_t nextra)
 {
     const struct thread *cur = this_cpu()->current;
+    const struct thread *idle = sched_idle();
+    size_t nlive = 0;
 
+    for (const struct thread *t = registry; t; t = t->reg_next)
+        if (++nlive > AUDIT_THREADS_MAX)
+            return false;   /* the registry itself is broken */
     for (size_t i = 0; i < nextra; i++)
-        if (!queue_ok(extra[i]))
+        if (!queue_ok(extra[i], nlive))
             return false;
-    if (cur && !live(cur))
+    /* SC2: `current` is a live thread or this CPU's idle thread. SC5: the
+     * idle thread is clean and owned by nothing else. */
+    if (!cur || (cur != idle && !live(cur)) || !idle_ok(idle))
+        return false;
+    if (!runq_ok(nlive))
         return false;
 
     for (const struct thread *t = registry; t; t = t->reg_next) {
-        if (t->state >= THREAD_STATE_COUNT)
+        /* SC3: a home CPU that exists; runnable or running only there. */
+        if (t->state >= THREAD_STATE_COUNT || t->state == THREAD_IDLE ||
+            t->home_cpu >= SCHED_MAX_CPUS)
             return false;
-        /* 1 and 6: runnable iff queued to run; running iff current. */
-        if ((t->state == THREAD_RUNNABLE) != runq_contains(t))
+        /* 1 and 6 (SC1): the owner, derived from the walks, matches the
+         * state: RUNNABLE in its home run queue exactly once; RUNNING as
+         * `current` and queued nowhere; nothing else in the run queue. */
+        size_t on_rq = count_on_runq(t, nlive);
+        if (on_rq != (t->state == THREAD_RUNNABLE ? 1u : 0u))
             return false;
         if ((t->state == THREAD_RUNNING) != (t == cur))
             return false;
-        /* 2, 3, 5: in a wait queue iff blocked in one, and in that one. */
+        if ((t->state == THREAD_RUNNABLE || t->state == THREAD_RUNNING) &&
+            t->home_cpu != this_cpu()->cpu_id)
+            return false;
+        if (!on_rq && (t->rq_next || t->rq_prev))
+            return false;   /* a stale link */
+        /* 2, 3, 5: in a wait queue iff blocked in one, and in that one,
+         * exactly once. */
         bool queued_state = blocked(t->state) && t->state != THREAD_BLOCKED_REPLY;
         if (queued_state) {
-            if (!t->wait_q || !queue_ok(t->wait_q) || !in_queue(t->wait_q, t))
+            if (!t->wait_q || !queue_ok(t->wait_q, nlive) ||
+                count_in_queue(t->wait_q, t, nlive) != 1)
                 return false;
         } else if (t->wait_q || t->wait_next || t->wait_prev) {
             return false;

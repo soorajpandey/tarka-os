@@ -1,6 +1,6 @@
 # ADR 0010: Scheduler, timer preemption and bounded kernel work
 
-Status: accepted (revision 3f; step 6). Revision 3c was `2c517b1`.
+Status: accepted (revision 3f; step 6). Stages 1-5 implemented. Revision 3c was `2c517b1`.
 Revisions 3d, 3e and 3f (sections "Revision 3d", "Revision 3e" and
 "Revision 3f") amend it with the stage 3, 4 and 5 findings. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
@@ -195,21 +195,29 @@ path is always exercised.
 
 ## Transitions
 
-**SC6. One primitive per transition.** Thread state, run-queue membership
-and each CPU's `current` change only through these functions, each
-updating all three together and asserting its precondition:
+**SC6. One primitive per transition** (amended by revision 3f, G1 and
+G11). Thread state, run-queue membership and each CPU's `current`
+change only through these functions in `core/sched.c`. Each checks its
+from-state and the links the edge needs, returns `T_EINVAL` with
+nothing changed otherwise, and commits the state together with the
+scheduler-owned membership. Kernel callers assert success.
 
-| Primitive | From | To | Effect |
+| From | To | Primitive | Cause |
 |---|---|---|---|
-| `sched_make_runnable(t)` | INACTIVE, FAULTED, or BLOCKED (already unlinked by IPC) | RUNNABLE | appended to the home run queue |
-| `sched_dispatch(cpu)` | the queue head, or the idle thread if the queue is empty | RUNNING (or IDLE) | removed from the queue; becomes `cpu->current`; a user thread gets a fresh quantum (SC11) |
-| `sched_preempt(t)` | RUNNING | RUNNABLE | appended to the tail |
-| `sched_yield(t)` | RUNNING | RUNNABLE | as preemption, requested by the thread |
-| block (`waitq_block`, `reply_link`) | RUNNING | BLOCKED_* | `current` passes to the next dispatch |
-| stop (`thread_stop`, `exit`) | any but IDLE | INACTIVE or FAULTED | removed from what owned it; IPC detached (P64); continuation discarded (SC16) |
+| INACTIVE, FAULTED | RUNNABLE | `sched_start(t)` | resume (SC8) |
+| BLOCKED_* | RUNNABLE | `sched_wake(t)` | IPC wake (after IPC has unlinked it) |
+| RUNNABLE | RUNNING | `sched_dispatch()` | the scheduling boundary; the idle thread if the queue is empty |
+| RUNNING | RUNNABLE | `sched_yield(t)` | `yield`; a continuation chunk not finished (E4); preemption at stage 6 |
+| RUNNING | BLOCKED_SEND, BLOCKED_RECV, BLOCKED_NOTIF | `sched_block(t, kind)` | IPC wait (IPC links the queue first, P9) |
+| RUNNING, BLOCKED_SEND | BLOCKED_REPLY | `sched_block_reply(caller)` | a call rendezvous (P58) |
+| RUNNING, BLOCKED_SEND, BLOCKED_REPLY | FAULTED | `sched_fault(t)` | no handler, a failed fault call, a fault reply other than label 0, unsafe saved state |
+| any but IDLE | INACTIVE | `sched_stop(t, destroying)` | suspend, `exit`, destruction, binding loss: abandonment, IPC detach, the run queue, the state |
+| (none) | IDLE | `sched_boot()` | each CPU's idle thread, at boot only |
 
-The ADR 0009 IPC primitives call these. No other code writes `t->state`
-for a scheduling transition.
+Any pair not in the table is impossible. `sched_release_current(t)` hands
+a stopped `current` to the idle thread (G3). The build gate
+`scripts/check-sched.sh` fails if anything outside `sched.c` writes the
+state, the run-queue links, `home_cpu` or `current`.
 
 **SC7. Atomicity.** The kernel is not preemptible (SC9). Every transition
 completes within one kernel entry with interrupts disabled. The audit
@@ -2343,3 +2351,130 @@ the whole suite.
     continuation could adopt a later revocation's root in its own slot,
     giving two owners for one freeze. The test above now catches it.
   - The stage 2 and stage 3 sets were re-run against stage 4.
+
+**Stage 5 (done).** Revision 3f, G1-G11, in the order agreed at
+acceptance: primitives, idle and `current`, run queue, transition
+enforcement, dispatch and continuations, self-destruction, halt and
+wake, then the transition tests and the mutation audit.
+- **`core/sched.c`** holds the per-CPU run queue (FIFO, doubly linked
+  through the TCB), the idle thread and the SC6 primitives. It is the
+  only writer of `t->state`, the run-queue links, `home_cpu` and
+  `current`.
+  - Each primitive checks its from-state and the links its edge needs.
+    `sched_wake` and `sched_fault` need IPC to have unlinked the thread
+    first, `sched_block` needs it to be linked into a queue of that kind,
+    and `sched_block_reply` needs the reply link. Any other case returns
+    `T_EINVAL` with nothing changed. Kernel callers assert `T_OK`.
+  - `sched_start` also refuses a thread that is not runnable-safe (T4).
+    `thread_resume` keeps its `T_EPERM` for that case, so the primitive
+    refusal matters only to a kernel caller, and to a destroyed thread,
+    whose bindings are gone.
+  - `sched_stop` is the one funnel: `cont_abandon`, `ipc_detach`, off
+    the run queue, INACTIVE. `exit` now goes through it too.
+- **The gate** `scripts/check-sched.sh` (in `make test`) fails on an
+  assignment, a compound assignment, `++`/`--` or a taken address of
+  those fields outside `sched.c` and the self-test file. It was shown to
+  catch 13 write forms and to pass reads.
+- **The idle thread** is a static TCB per CPU: zero except its state
+  (IDLE) and home CPU, never registered, never queued, never named by a
+  capability. `sched_boot()` makes it `current`, so `current` is never
+  NULL after boot.
+  - `schedule()` asserts at every boundary that `current` is what was
+    dispatched, and that it is RUNNING or IDLE.
+  - A self-destroying thread is stopped, then `sched_release_current()`
+    hands `current` to idle, and only then does `tcb_teardown()` delete
+    its bindings. The syscall result is written only if `current` is
+    still the caller.
+- **The idle loop** (G4) does one reaper chunk per pass and, with the
+  reaper empty, halts with `sti; hlt; cli`.
+  - In test builds it may instead return to the driver, but only at
+    that pre-HLT boundary: the run queue and reaper are empty and
+    `current` is idle (asserted), and no wake source is armed.
+  - Armed, it always halts. `idle_hlt_resume` labels the instruction
+    after the HLT, and the kernel interrupt path records the interrupted
+    RIP, the vector and whether idle was `current`.
+- **The audit** (G8) adds to `ipc_audit()`:
+  - each thread's run-queue occurrences, counted link by link, are 1 for
+    RUNNABLE and 0 otherwise
+  - RUNNING exactly when `current`; no stale run-queue link
+  - each blocked thread exactly once in its wait queue
+  - the run queue well formed, its stored length equal to the walk
+  - every queue no longer than the live threads (SC29, replacing the
+    fixed loop limit)
+  - `home_cpu` valid and, for RUNNABLE and RUNNING, this CPU
+  - the idle thread byte-clean but for its state and home
+- **Tests changed by the stage:**
+  - `ipc_reply_links` built its callers by linking stopped threads, an
+    INACTIVE → BLOCKED_REPLY edge that the table does not have. Callers
+    are now started and dispatched first (`link_reply()`).
+  - `reaper_r6` read "the last stop of the run". Since `exit` goes
+    through the funnel, that is a waiter's exit, so the probe now
+    watches the deleter itself (`sched_stop_watch`). A first version
+    read the deleter's TCB pointer after its capability was gone and
+    watched nothing: the probe caught that by never firing.
+  - The snapshot helper walks the run queue read-only instead of
+    popping and re-pushing it.
+- **New tests:**
+  - `sched_edges`: a fixture with a thread in every state. Every
+    primitive is run against every thread, the idle thread included.
+    Each of the 87 refusals leaves every fixture TCB, the run queue's
+    ends and length, `current` and the IPC queues byte-for-byte
+    unchanged. The same holds for `current` while blocked or stopped
+    before its boundary, and for queue kinds that are not wait-queue
+    kinds. Then every edge, with its membership checked. Then SC8, a
+    destroyed thread, and `home_cpu`.
+  - `sched_current`: self-suspension, self-destruction (exactly one
+    handoff, no teardown while `current`), and outside destruction (no
+    handoff).
+  - `sched_halt_wake`: unarmed, no halt. Armed, a self-IPI pending
+    before the HLT and a LAPIC one-shot after it: one halt, one wake,
+    the interrupt at `idle_hlt_resume` in the idle thread.
+  - `sched_idle_reap`: a dying 32-slot CNode drained by the idle loop
+    in full `REAP_CHUNK` passes and no more.
+  - `sched_fair_cont`: a 64-child revocation and two yielding threads.
+    The dispatch trace is strict round robin up to the revocation's last
+    chunk.
+  - `sched_audit_detects`: ten corruptions, each noticed.
+- **Mutation testing (G10):** 31 stage 5 mutants, run twice: once as built, and once with every
+  assertion in `sched.c` and the boundary and escape assertions in
+  `schedule()` disabled, so that only the tests and the audit can catch
+  a mutant. All 31 are caught both times.
+  - **The mutants** cover the queues (duplicate insert, a blocked or
+    stopped thread left queued, a stale link, the wrong thread removed,
+    dispatch from the tail, a length not decremented), and the
+    transitions (wake without enqueue, start without a state change,
+    dispatch without `current`, a stop that skips abandonment or detach,
+    each precondition check dropped).
+  - They also cover idle and continuations (idle stoppable, enqueued,
+    registered or dirty; `current` left NULL; a continuation given
+    priority; `home_cpu` changed), a state write that only the gate can
+    see, teardown before the handoff and no handoff, the escape taken
+    while armed, an unbounded reaper pass, and the idle thread halting
+    with reaper work left.
+  - **Two survivors taught something.** `block_any_kind` (no check that
+    the kind is a wait-queue kind) and `yield_any_state` (yield checks
+    only `current`) survived the first run. The fixture had no thread
+    that was `current` without being RUNNING, and none linked to a
+    queue of the wrong kind. `sched_edges` now covers both.
+  - **One false kill:** `escape_while_armed` first "died" because the
+    compiler removed the unreachable HLT and its label, so the link
+    failed. It was rewritten to stay reachable, and the halt/wake test
+    kills it. The harness now counts a mutant as killed only if the
+    suite ran.
+  - The stage 2, 3 and 4 sets were re-run against stage 5: 73 caught.
+    `mark_copied` is still equivalent (stage 4 notes). Six stage 2
+    patterns had already been obsolete since stage 3. `no_abandon_funnel`
+    was retargeted to `sched_stop`, where the funnel now lives.
+- **Review:**
+  - The new TCB fields (`home_cpu`, `sched_reserved`) fill what would
+    otherwise be padding and are zeroed by retype. Every snapshot or view
+    struct has explicit padding and is cleared before it is filled.
+  - The idle TCB is static and cleared at boot. Test probes holding
+    thread pointers compare them only by value and are reset after use.
+  - All new frames are under the 1 KiB limit. The suite's measured
+    high-water marks after stage 5: boot stack 1,560 of 16,384 bytes,
+    CPU 0 kernel stack 1,320 of 8,192. An interrupt taken in the idle
+    loop runs on the stack `schedule()` runs on, within those marks.
+  - The release build is checked separately: `make test` builds only
+    the test kernel, and a test-only variable broke the release build
+    once during the stage.

@@ -9,6 +9,7 @@
 #include <tarka/endpoint.h>
 #include <tarka/errno.h>
 #include <tarka/kernel.h>
+#include <tarka/sched.h>
 #include <tarka/string.h>
 #include <tarka/syscall.h>
 #include <tarka/untyped.h>
@@ -39,8 +40,7 @@ static int64_t chunk(struct thread *t)
 
 static void yield(struct thread *t)
 {
-    t->state = THREAD_RUNNABLE;
-    thread_enqueue(t);
+    KASSERT(sched_yield(t) == T_OK);   /* to the tail, like any thread (G6) */
 }
 
 int64_t cont_after_first(struct thread *t, int64_t rc)

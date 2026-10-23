@@ -1,3 +1,4 @@
+#include <tarka/sched.h>
 #include <tarka/kernel.h>
 #include <tarka/pmm.h>
 #include <tarka/selftest.h>
@@ -86,6 +87,7 @@ __noreturn __no_canary void kmain(void)
     (void)lapic_init();     /* may map MMIO: before the first AddressSpace */
     vspace_boot();
     thread_boot();
+    sched_boot();           /* idle threads: `current` is never NULL from here */
     notification_boot();
     endpoint_boot();
     user_boot();
