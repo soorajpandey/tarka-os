@@ -212,7 +212,8 @@ before its subsystem is considered done.
    Frame objects; `map` / `unmap`. **Done**, specified in detail by
    [ADR 0007](0007-address-spaces.md).
 4. Thread objects, context switch, user-mode entry, syscall entry,
-   `copy_*_user`.
+   `copy_*_user`. **Done**, specified in detail by
+   [ADR 0008](0008-threads-user-entry-syscalls.md).
 5. Endpoints, Reply, Notifications; capability transfer.
 6. Fault delivery; the first user-space task (init); the first user-space
    driver (serial, behind `IoPorts`).

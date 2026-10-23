@@ -27,14 +27,19 @@
    - brings up the serial console
    - validates the bootloader responses
    - loads the GDT/TSS (IST stacks for #DF and NMI) and the IDT
-   - enables CPU hardening (WP, NX, SMEP, SMAP, UMIP)
+   - enables CPU hardening (WP, NX, SMEP, SMAP, UMIP; NX, SMEP and SMAP
+     are mandatory) and eager FPU/XSAVE state
+   - sets up per-CPU data through the GS base
    - unmaps the stack guard pages
    - seeds the stack canary from RDRAND
    - initialises the physical frame allocator
    - hands all usable memory except an 8 MiB kernel reserve to root
      Untyped capabilities
+   - enables the local APIC (mapping its MMIO page if needed)
    - records the master PML4 and clears the user bit on every kernel-half
      top-level entry
+   - registers thread finalisers, masks the legacy PIC and programs the
+     SYSCALL MSRs
 4. In `make test` builds, the self-tests then run and the result is reported
    to QEMU through the isa-debug-exit device.
 
@@ -51,8 +56,10 @@
 | Capabilities | `core/cap.c` | flat cspaces; cross-cspace derivation tree, resumable revocation, finalisers |
 | Untyped memory, retype | `core/untyped.c` | done ([ADR 0006](adr/0006-untyped-retype.md)): boot handoff, Frame/Endpoint/CNode/Untyped objects |
 | Address spaces, page tables | `arch/x86_64/vspace.c` | done ([ADR 0007](adr/0007-address-spaces.md)): install/map/unmap/protect, W^X across aliases, teardown in any order |
-| Threads, scheduler, faults | | next ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)) |
-| Syscalls, IPC, notifications | | planned (ADR 0003) |
+| Threads, user entry, syscalls, faults | `arch/x86_64/thread.c`, `user.c`, `isr.S`, `user_entry.S`, `core/syscall.c`, `core/uaccess.c` | done ([ADR 0008](adr/0008-threads-user-entry-syscalls.md)): ring 3 runs; 19 syscalls; FIFO run queue without preemption |
+| Local APIC | `arch/x86_64/lapic.c` | x2APIC or xAPIC (MMIO); self-IPI, self-NMI, one-shot timer |
+| IPC, notifications | | next (ADR 0003, step 5) |
+| Scheduler with timer preemption | | planned (step 6; gate for untrusted code, ADR 0008 T36) |
 | Entropy, random generator | | planned ([ADR 0004](adr/0004-entropy.md)) |
 | SMP, APIC, TLB shootdown | | planned ([ADR 0005](adr/0005-smp.md)) |
 | IOMMU, DMA domains | | planned ([ADR 0001](adr/0001-microkernel.md)) |

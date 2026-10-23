@@ -2,8 +2,8 @@
 
 Status: accepted
 
-Refines ADR 0003, step 4. This is the specification; nothing in step 4 is
-implemented until it is agreed. Rule numbers (T1..T36) are referenced from
+Refines ADR 0003, step 4. This is the specification; it is implemented
+(see "Implementation notes" at the end). Rule numbers (T1..T36) are referenced from
 `docs/SECURITY.md`.
 
 This step crosses from kernel infrastructure into running untrusted code.
@@ -558,3 +558,26 @@ Then, as before:
 5. Syscall table and the initial syscalls.
 6. Minimal run queue, `yield` and `exit`, then the test programs and the
    tests above.
+
+## Implementation notes
+
+Implemented in full. Deviations and findings during implementation:
+
+- **SMEP and SMAP are mandatory.** `clac`/`stac` raise #UD on CPUs without
+  SMAP and kernel text is read-only, so the kernel refuses to boot without
+  them rather than patching code.
+- **CR0.AM is set**, so user misalignment with AC set raises #AC. It never
+  applies in ring 0, where AC is always clear.
+- **Kernel-held frames are counted.** Mapping the xAPIC MMIO page takes
+  page-table frames from the kernel reserve; the ownership invariant (O1)
+  now checks three-way conservation.
+- **QEMU's software emulator** cannot produce several hardware behaviours
+  the tests target: #GP/#SS for non-canonical user accesses (it raises
+  #PF), #XM and #AC, and an NMI arriving in user mode. QEMU also emulates
+  SYSRET with AMD semantics. The tests accept the emulator's outcome for
+  these and print a note; they must be confirmed on real hardware or KVM.
+- **Equivalent mutants:** two deliberate bugs in thread code (dropping
+  bind's own GRANT check; not dequeuing a destroyed thread) are not
+  caught, because the same property is enforced on another path
+  (derivation checks GRANT; destroying a runnable thread deletes its
+  address-space binding, which already dequeues it).

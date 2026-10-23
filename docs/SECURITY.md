@@ -79,13 +79,13 @@ invariants and tests here.
 |---|---|---|---|
 | K1 | Kernel executable memory is never writable | self-test `w^x` (page-table walk); write injection faults | ✅ tested |
 | K2 | Kernel data and read-only data are never executable | self-test `w^x` | ✅ tested |
-| K3 | The kernel cannot execute or access user memory outside explicit copy routines | self-test `cpu_hardening` (SMEP/SMAP on) | ⚠️ enablement tested; copy routines planned |
+| K3 | The kernel cannot execute or access user memory outside explicit copy routines | SMEP/SMAP mandatory at boot; `scripts/check-stac.sh` (stac only in the copy routine); self-test `uaccess` | ✅ tested |
 | K4 | A kernel stack overflow faults; it never corrupts adjacent memory | self-test `stack_guards`; recursion injection gives a clean #DF | ✅ tested |
 | K5 | A stack buffer overflow is detected before the function returns | self-test `cpu_hardening` (canary is random); smash injection panics | ✅ tested |
 | M1 | Memory given to a new owner contains no data from a previous owner | self-test `pmm` (zero on alloc and free) | ✅ tested |
 | M2 | The allocator never releases memory it does not own, and detects double frees | self-test `pmm` | ✅ tested |
 | C1 | Rights can never increase through derivation | self-test `capabilities` | ✅ tested |
-| C2 | Every capability use is checked for bounds, type and rights | self-test `capabilities` | ✅ unit; syscall path planned |
+| C2 | Every capability use is checked for bounds, type and rights | self-tests `capabilities`, `syscalls` (from ring 3, incl. 64-bit slot aliasing) | ✅ tested |
 | C3 | A badge cannot change once set | self-test `capabilities` | ✅ tested |
 | C4 | Capability data given to user space contains no kernel pointers and no uninitialised bytes | `struct cap_info` + `_Static_assert`; self-test `capabilities` (`cap_identify`) | ✅ tested |
 | C5 | Revoking a capability removes every capability derived from it, in every cspace, including after intermediate deletions | self-test `cap_revoke` | ✅ tested |
@@ -95,19 +95,19 @@ invariants and tests here.
 | U2 | A task cannot map kernel memory or another task's memory without a frame capability. Structural: user leaves are only ever Frames, user intermediate entries only PageTables, the kernel half is supervisor-only at the top level (ADR 0007, V1–V4, V9) | self-tests `vspace_deputy`, `vspace_*` audits | ✅ tested |
 | U3 | No user mapping is both writable and executable, and no physical frame is writable through one mapping while executable through another; in-place changes only remove rights (ADR 0007, V5–V8) | self-tests `vspace_perms`, `vspace_alias` | ✅ tested |
 | U5 | Removing a mapping, table or address space leaves no stale entry, shadow pointer or record, and an uninstalled table carries no mappings (ADR 0007, V11, V12, V15) | self-test `vspace_teardown` + structural audit | ✅ tested |
-| U4 | A user-space fault never panics the kernel | | planned (ADR 0008, T29) |
-| T-A | Thread state is read or changed only with a Thread capability carrying the right | | planned (ADR 0008) |
-| T-B | A thread can be runnable only with a bound address space, a bound cspace, and valid entry state | | planned (ADR 0008) |
-| T-C | No user-controlled value reaches RIP, RSP, RFLAGS, CS, SS, FS or GS base, or XRSTOR without validation | | planned (ADR 0008) |
-| T-D | The complete thread context, including all extended (FPU/vector) state, is saved and restored on every switch; no thread observes another's registers | | planned (ADR 0008) |
-| T-E | Every kernel entry from user mode clears AC and swaps GS correctly; SMAP is never silently disabled | | planned (ADR 0008) |
-| T-F | SYSRET never runs with a non-canonical return address | | planned (ADR 0008) |
-| T-G | The kernel touches user memory only through the copy routines, reading each value once | | planned (ADR 0008; completes K3) |
-| T-H | Syscalls are authorised only by capabilities; the syscall layer adds no permission logic | | planned (ADR 0008) |
-| T-J | Every kernel entry (syscall, interrupt, exception, NMI, #MC, #DF) establishes the same sanitised state before common code runs | | planned (ADR 0008, T32) |
-| T-K | Worst-case kernel stack use is within an 8 KiB budget, measured in CI; no unbounded kernel recursion | | planned (ADR 0008, T33) |
-| T-L | A fault during a user-memory copy always returns `T_EFAULT` through the landing pad with SMAP restored; no other kernel fault is recovered | | planned (ADR 0008, T35) |
-| T-M | Physical, user and kernel addresses cannot be confused without a compile error | | planned (ADR 0008, T34) |
+| U4 | A user-space fault never panics the kernel | self-test `user_faults` (13 fault kinds, healthy thread keeps running) | ✅ tested |
+| T-A | Thread state is read or changed only with a Thread capability carrying the right | self-test `thread_lifecycle` (rights matrix from a second task) | ✅ tested |
+| T-B | A thread can be runnable only with a bound address space, a bound cspace, and valid entry state | self-tests `thread_lifecycle`, `syscall_lifecycle` (self-revoke, self-destroy) | ✅ tested |
+| T-C | No user-controlled value reaches RIP, RSP, RFLAGS, CS, SS, FS or GS base, or XRSTOR without validation | self-tests `thread_regs` (23 hostile values), `user_entry_state`, `user_sysret_edge` | ✅ tested |
+| T-D | The complete thread context, including all extended (FPU/vector) state, is saved and restored on every switch; no thread observes another's registers | self-test `user_basics` (fresh state, XMM/YMM/x87 isolation, 2000 randomised round trips) | ✅ tested |
+| T-E | Every kernel entry from user mode clears AC and swaps GS correctly; SMAP is never silently disabled | self-tests `user_entry_state`, `entry_paths` | ✅ tested |
+| T-F | SYSRET never runs with a non-canonical return address | self-test `user_sysret_edge` (syscall in the last two bytes of user space) | ✅ tested (QEMU emulates SYSRET with AMD semantics; the Intel ring-0 #GP path is prevented by construction, not observed) |
+| T-G | The kernel touches user memory only through the copy routines, reading each value once | `uaddr_t`; self-tests `uaccess`, `syscalls` (buffer rewritten after the copy) | ✅ tested |
+| T-H | Syscalls are authorised only by capabilities; the syscall layer adds no permission logic | self-test `syscalls` (28 cases from ring 3) | ✅ tested |
+| T-J | Every kernel entry (syscall, interrupt, exception, NMI, #MC, #DF) establishes the same sanitised state before common code runs | `entry_state_check()` on every user entry; self-tests `user_entry_state`, `entry_paths` | ⚠️ all paths tested except NMI arriving in user mode (not producible under QEMU TCG) |
+| T-K | Worst-case kernel stack use is within an 8 KiB budget, measured in CI; no unbounded kernel recursion | stack painting + budget check after the suite; self-test `cnode_chain` (1000 levels) | ✅ tested |
+| T-L | A fault during a user-memory copy always returns `T_EFAULT` through the landing pad with SMAP restored; no other kernel fault is recovered | self-tests `uaccess`, `entry_paths` (NMI inside the open-SMAP window) | ✅ tested |
+| T-M | Physical, user and kernel addresses cannot be confused without a compile error | `scripts/check-address-types.sh` (10 misuses must not compile) | ✅ tested |
 | O1 | Every physical frame has exactly one owner: the kernel allocator or one Untyped; total memory is conserved | self-test `untyped_ownership` | ✅ tested |
 | O2 | Memory authority is never duplicated: Untypeds cannot be copied | self-test `untyped_rules` | ✅ tested |
 | O3 | Retype never creates authority from nothing: it needs an Untyped with WRITE and free space in it | self-test `untyped_rules`, `untyped_exhaustion` | ✅ tested |
@@ -139,6 +139,11 @@ invariants and tests here.
 | Stack canaries, random per boot, low byte zero | `core/stack_protector.c` | K5 |
 | Zero on allocation and on free | `core/pmm.c` | M1 |
 | Untyped memory and retype; no kernel allocation on a task's behalf | `core/untyped.c` | O1–O11 |
+| One sanitised entry state for every vector, SYSCALL and NMI/#DF/#MC | `arch/x86_64/isr.S`, `user_entry.S`, `user.c` | T-E, T-J |
+| Validated return path; SYSRET only when provably safe | `arch/x86_64/user.c` | T-C, T-F |
+| Eager FPU/vector context switching; new threads start at the initial state | `arch/x86_64/cpu.c`, `thread.c` | T-D |
+| User memory only through exact-recovery copy routines; distinct address types | `core/uaccess.c`, `arch/x86_64/copy_user.S`, `include/tarka/types.h` | K3, T-G, T-L, T-M |
+| Every kernel stack guarded, painted and budgeted; no unbounded recursion | `arch/x86_64/stacks.c`, `core/untyped.c` | T-K |
 | Kernel half of every address space supervisor-only at the PML4 level | `arch/x86_64/vspace.c` | U2 |
 | Address spaces: user-half-only mapping, global W^X across aliases, shadow back-pointers, full user-TLB flush on every removal | `arch/x86_64/vspace.c` | U2, U3, U5, S1 |
 | Double-free and foreign-frame rejection | `pmm.c` | M2 |
@@ -158,12 +163,24 @@ invariants and tests here.
 - The stack canary is seeded directly from RDRAND, with a weak TSC fallback.
   ADR 0004 replaces this with a proper entropy subsystem.
 - The kernel is single-CPU. ADR 0005 defines the SMP model.
+- **No timer preemption yet (ADR 0008, T36):** a user thread runs until it
+  yields, faults, exits or makes a blocking call. Only the kernel's own
+  test programs run in ring 3 until the scheduler step adds preemption.
+- **Hardware behaviour not observable under QEMU's software emulator**,
+  still to be confirmed on real hardware or KVM: #GP/#SS (rather than
+  #PF) for non-canonical user accesses, #XM and #AC from user mode, an NMI
+  arriving while user code runs, and the Intel-specific SYSRET fault
+  (prevented by construction). The tests accept the emulator's outcome
+  for these and print a note.
+- SMEP and SMAP are required: the kernel refuses to boot without them, as
+  it does without NX.
 
 ## Roadmap
 
-1. **Kernel object model** (ADR 0003): threads, IPC (the derivation tree,
-   revocation, Untyped, retype and address spaces are done). Invariants
-   C6, U1, U4.
+1. **Kernel object model** (ADR 0003): IPC, then the scheduler with
+   timer preemption (the derivation tree, revocation, Untyped, retype,
+   address spaces, threads, user entry and syscalls are done). Invariants
+   C6, U1.
 2. **Entropy** (ADR 0004). Invariant R1.
 3. **SMP** (ADR 0005). Invariant S1.
 4. **Fuzzing:** machine-readable syscall descriptions, coverage-guided
