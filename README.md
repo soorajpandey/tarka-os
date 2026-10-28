@@ -24,8 +24,11 @@ memory the caller holds. Capabilities form a derivation tree with
 revocation. Address spaces are built from caller-owned page tables, with
 W^X enforced across every alias of a physical frame. Threads run in
 ring 3 behind a validated entry and exit boundary, and user programs act
-through 19 capability-checked syscalls. There is no IPC or timer
-preemption yet, so only the kernel's own test programs run in user mode. See
+through 28 capability-checked syscalls, including synchronous IPC
+(call/reply over endpoints) and notifications. The scheduler, idle
+threads and bounded kernel work are in place; timer preemption (ADR 0010
+stage 6) is in progress. Until it lands, ADR 0008 T36 allows only the
+kernel's own test programs to run in user mode. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the roadmap and
 [docs/SECURITY.md](docs/SECURITY.md) for the threat model and the security
 invariants, each with the test that proves it.

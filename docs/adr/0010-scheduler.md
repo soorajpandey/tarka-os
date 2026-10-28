@@ -5,6 +5,30 @@ Revisions 3d, 3e and 3f (sections "Revision 3d", "Revision 3e" and
 "Revision 3f") amend it with the stage 3, 4 and 5 findings; revision 3g with the stage 6 audit. Rule numbers SC1..SC32 are
 referenced from code, tests and other ADRs.
 
+## Decision in brief
+
+- Every CPU always has a `current` thread: a per-CPU idle thread runs
+  when nothing else can, so `current` is never NULL (SC1-SC8, SC29).
+- `core/sched.c` is the only writer of thread state, the run queue and
+  `current`, with one primitive per transition (gate
+  `scripts/check-sched.sh`). It is also the only code that programs the
+  LAPIC timer (revision 3g, A2).
+- A user thread runs for at most one quantum per dispatch, measured in
+  LAPIC ticks of elapsed time including kernel time; a thread that never
+  yields cannot keep the CPU from others (SC9-SC14, T36).
+- Every kernel entry does bounded work W. Long operations (revocation,
+  the receive drain, retype) run as resumable thread continuations
+  instead of unbounded loops (SC22, SC25, SC27, SC28).
+- The capability derivation tree is a bracket list with maintained
+  counters, so no operation walks every copy (SC17-SC20a). Dying objects
+  are reclaimed by a reaper (SC23, SC24).
+
+How to read this record: the sections from "Context" to
+"Implementation order" are the decision. The "Revision 3d" to
+"Revision 3g" sections at the end amend it with the findings of each
+implementation stage, newest first; where they differ from the earlier
+sections, the revision governs.
+
 History:
 - **Revision 3g** (this one): the stage 6 audit of SC9-SC14 and T36
   against the code and against themselves. Gaps H1-H7: timer ownership,
