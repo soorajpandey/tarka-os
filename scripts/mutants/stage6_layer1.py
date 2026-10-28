@@ -95,10 +95,13 @@ MUTANTS = [
          old="    if (this_sched()->timer.armed)\n        return T_EBUSY;\n    lapic_timer_stop();\n",
          new="    lapic_timer_stop();\n",
          expect="timer_hw (stop not refused while a quantum runs)"),
+    # The scheduler's check still runs but reports success. Deleting the
+    # check instead reaches lapic_timer_arm(0), whose KASSERT fires before
+    # any CHECK as built: assertion-only under SC31.6 (run 40611687286).
     dict(id="M19", name="test_arm_accepts_zero", file=SCHED,
          old="    if (count == 0)\n        return T_EINVAL;\n",
-         new="",
-         expect="timer_hw (arm(0) not refused); as built, lapic.c's assertion may fire first"),
+         new="    if (count == 0)\n        return T_OK;\n",
+         expect="timer_hw (arm(0) returns T_OK, not T_EINVAL)"),
     dict(id="M20", name="idle_wake_not_armed", file=SCHED,
          old="        lapic_timer_arm(c->test_wake);\n        c->test_wake = 0;\n",
          new="        c->test_wake = 0;\n",
