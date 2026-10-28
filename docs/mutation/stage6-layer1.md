@@ -1,16 +1,16 @@
 # Mutation results: stage6_layer1
 
-Recorded from GitHub Actions run 40611687286 (workflow `mutation`), on
-commit `9ad0820`; the kernel source is unchanged from layer 1 (`66c2a20`).
+Recorded from GitHub Actions run 40613288467 (workflow `mutation`), on
+commit `aaf08ef`; the kernel source is unchanged from layer 1 (`66c2a20`).
 Regenerate with `scripts/mutate.py stage6_layer1`.
 
-**Open finding, M19 (`test_arm_accepts_zero`).** As built, nothing in the
-suite fails: `lapic_timer_arm`'s own `KASSERT(count > 0)` panics first.
-Under SC31.6 that is not a kill. With the assertions disabled, `timer_hw`
-fails on `sched_test_timer_arm(0) == T_EINVAL`. So the suite does catch
-the behaviour, but the as-built run only shows the assertion. This is
-reported, not reclassified; the workflow fails on it by design.
-Commit `9ad0820`. Rule: ADR 0010 SC31.6. Blind mode disables KASSERT in: `kernel/core/sched.c`, `kernel/arch/x86_64/lapic.c`.
+**M19 history.** In the first run (40611687286) M19 deleted the
+scheduler's `count == 0` check. As built, `lapic_timer_arm`'s own
+`KASSERT(count > 0)` then fired before any CHECK: assertion-only, not a
+kill under SC31.6. On review, M19 was changed to keep the check and
+return `T_OK`, so the wrong result reaches the suite with no lower-level
+assertion in the way. It is now killed in both modes by `timer_hw`.
+Commit `aaf08ef`. Rule: ADR 0010 SC31.6. Blind mode disables KASSERT in: `kernel/core/sched.c`, `kernel/arch/x86_64/lapic.c`.
 
 | ID | Mutant | File | Normal | Blind | Expected catcher |
 |---|---|---|---|---|---|
@@ -32,7 +32,7 @@ Commit `9ad0820`. Rule: ADR 0010 SC31.6. Blind mode disables KASSERT in: `kernel
 | M16 | `dispatch_gen_counts_idle` | `sched.c` | KILLED | KILLED | timer_state (idle dispatches change dispatch_gen) |
 | M17 | `test_arm_ignores_armed` | `sched.c` | KILLED | KILLED | timer_hw (arm not refused while a quantum runs) |
 | M18 | `test_stop_ignores_armed` | `sched.c` | KILLED | KILLED | timer_hw (stop not refused while a quantum runs) |
-| M19 | `test_arm_accepts_zero` | `sched.c` | ASSERT-ONLY | KILLED | timer_hw (arm(0) not refused); as built, lapic.c's assertion may fire first |
+| M19 | `test_arm_accepts_zero` | `sched.c` | KILLED | KILLED | timer_hw (arm(0) returns T_OK, not T_EINVAL) |
 | M20 | `idle_wake_not_armed` | `sched.c` | KILLED | KILLED | sched_halt_wake (idle never wakes: hang) |
 | M21 | `wake_armed_by_caller` | `sched.c` | KILLED | KILLED | sched_halt_wake (timer running before the HLT) |
 | M22 | `audit_ignores_owner_gen` | `ipc.c` | KILLED | KILLED | sched_audit_detects (stale generation not detected) |
@@ -94,7 +94,7 @@ Commit `9ad0820`. Rule: ADR 0010 SC31.6. Blind mode disables KASSERT in: `kernel
   - normal: KILLED. test timer_hw: FAIL sched_test_timer_stop() == T_EBUSY (kernel/core/selftest.c:6867)
   - blind: KILLED. test timer_hw: FAIL sched_test_timer_stop() == T_EBUSY (kernel/core/selftest.c:6867)
 - **M19 `test_arm_accepts_zero`**
-  - normal: ASSERT-ONLY. in timer_hw: assertion failed: present && count > 0 (kernel/arch/x86_64/lapic.c:121)
+  - normal: KILLED. test timer_hw: FAIL sched_test_timer_arm(0) == T_EINVAL && lapic_timer_count() == 0 (kernel/core/selftest.c:6869)
   - blind: KILLED. test timer_hw: FAIL sched_test_timer_arm(0) == T_EINVAL && lapic_timer_count() == 0 (kernel/core/selftest.c:6869)
 - **M20 `idle_wake_not_armed`**
   - normal: KILLED. hang in sched_halt_wake (timeout)
@@ -106,6 +106,6 @@ Commit `9ad0820`. Rule: ADR 0010 SC31.6. Blind mode disables KASSERT in: `kernel
   - normal: KILLED. test sched_audit_detects: FAIL !AUDIT() (kernel/core/selftest.c:6717)
   - blind: KILLED. test sched_audit_detects: FAIL !AUDIT() (kernel/core/selftest.c:6717)
 
-normal: 20/22 killed, 1 equivalent, 1 other.
+normal: 21/22 killed, 1 equivalent, 0 other.
 
 blind: 21/22 killed, 1 equivalent, 0 other.
