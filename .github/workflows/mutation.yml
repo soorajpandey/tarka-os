@@ -1,0 +1,49 @@
+name: mutation
+
+# Mutation testing under ADR 0010 SC31.6: every mutant in a set, run as
+# built and with the set's assertions disabled, with a recorded verdict
+# and reason. Slow, so not on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      set:
+        description: mutant set (scripts/mutants/<set>.py)
+        required: true
+        default: stage6_layer1
+  push:
+    branches: ['mutation/**']
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      # Third-party actions are pinned to full commit SHAs, not tags.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential qemu-system-x86 xorriso
+
+      - name: Fetch bootloader
+        run: make limine
+
+      - name: Run mutants
+        env:
+          SET: ${{ github.event.inputs.set || 'stage6_layer1' }}
+        run: python3 scripts/mutate.py "$SET"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-report
+          path: build/mutation/
+          if-no-files-found: ignore
