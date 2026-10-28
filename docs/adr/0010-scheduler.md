@@ -1540,9 +1540,10 @@ interrupt exists yet, but the self-IPI does.
   does not run user code while its continuation is pending, and each
   chunk already ends at a boundary through `sched_yield` (G6).
 - **Each continuation dispatch gets a fresh quantum** (Q1, Q4). If it
-  runs out during the final chunk, the pending interrupt is taken at the
-  first user instruction after the return, and the thread is preempted
-  then. Q3 says that kernel time counts, so this is correct.
+  runs out during the final chunk, the expired quantum executes no
+  further user instruction before the scheduling boundary (A5), and the
+  thread is preempted then. Q3 says that kernel time counts, so this is
+  correct.
 - **A mutant** that lets the timer path touch `t->cont`, or skip
   `cont_run`, must be caught.
 
